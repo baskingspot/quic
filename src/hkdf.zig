@@ -8,8 +8,9 @@
 //!
 //! The hash is SHA-256. That covers TLS_AES_128_GCM_SHA256 and
 //! TLS_CHACHA20_POLY1305_SHA256, which are the two suites this package
-//! implements. TLS_AES_256_GCM_SHA384 would need a SHA-384 instantiation and is
-//! not here.
+//! implements. TLS_AES_256_GCM_SHA384 is a second instantiation:
+//! `std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384)` already
+//! exists, so adding that suite is plumbing, not a new primitive.
 
 const std = @import("std");
 const testing = std.testing;

@@ -6,7 +6,10 @@
 //! be written and tested before the handshake work lands.
 //!
 //! The AEAD is AES-128-GCM for Initial packets (§5.3, and §5.5 says AES header
-//! protection applies until TLS picks a suite). The header protection key
+//! protection applies until TLS picks a suite). TLS_AES_256_GCM_SHA384 is a
+//! later addition, not a missing primitive: std has the SHA-384 HMAC and
+//! AES-256-GCM, so it is a suite enum arm and a key schedule, not a cipher to
+//! write. The header protection key
 //! arrives with the label `quic hp` and masks the low four bits of the first
 //! byte of a long header and the packet number (§5.4.1), sampling the
 //! ciphertext four bytes past the packet number.
@@ -25,8 +28,8 @@ const packet_number = @import("packet_number.zig");
 
 const protection = @This();
 
-/// The two AEADs this package protects packets with. TLS_AES_256_GCM_SHA384
-/// needs SHA-384 and is not implemented.
+/// The AEADs this package protects packets with today. TLS_AES_256_GCM_SHA384
+/// is not wired up; its parts are in std.
 pub const Suite = enum {
     aes_128_gcm,
     chacha20_poly1305,
