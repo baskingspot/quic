@@ -21,12 +21,12 @@ test "RFC 9001 A.1, the Initial secrets come from the connection ID" {
     try testing.expectEqualSlices(u8, &data.client_initial_secret, &secrets.client);
     try testing.expectEqualSlices(u8, &data.server_initial_secret, &secrets.server);
 
-    const client = protection.deriveKeys(secrets.client, .aes_128_gcm);
+    const client = try protection.deriveKeys(&secrets.client, .aes_128_gcm);
     try testing.expectEqualSlices(u8, &data.client_key, client.keyBytes());
     try testing.expectEqualSlices(u8, &data.client_iv, &client.iv);
     try testing.expectEqualSlices(u8, &data.client_hp, client.headerKeyBytes());
 
-    const server = protection.deriveKeys(secrets.server, .aes_128_gcm);
+    const server = try protection.deriveKeys(&secrets.server, .aes_128_gcm);
     try testing.expectEqualSlices(u8, &data.server_key, server.keyBytes());
     try testing.expectEqualSlices(u8, &data.server_iv, &server.iv);
     try testing.expectEqualSlices(u8, &data.server_hp, server.headerKeyBytes());
@@ -34,7 +34,7 @@ test "RFC 9001 A.1, the Initial secrets come from the connection ID" {
 
 test "RFC 9001 A.2, the client Initial seals to the printed packet" {
     const secrets = protection.initialSecrets(&data.dcid);
-    const client = protection.deriveKeys(secrets.client, .aes_128_gcm);
+    const client = try protection.deriveKeys(&secrets.client, .aes_128_gcm);
 
     // A.2 prints a 22-byte header with a 4-byte packet number, so the number
     // starts at offset 18, and a 1162-byte payload.
@@ -63,7 +63,7 @@ test "RFC 9001 A.2, the client Initial seals to the printed packet" {
 
 test "RFC 9001 A.2, the client Initial the RFC printed opens back" {
     const secrets = protection.initialSecrets(&data.dcid);
-    const client = protection.deriveKeys(secrets.client, .aes_128_gcm);
+    const client = try protection.deriveKeys(&secrets.client, .aes_128_gcm);
 
     var packet: [1200]u8 = undefined;
     @memcpy(&packet, &data.client_packet);
@@ -78,7 +78,7 @@ test "RFC 9001 A.2, the client Initial the RFC printed opens back" {
 
 test "RFC 9001 A.3, the server Initial seals and opens" {
     const secrets = protection.initialSecrets(&data.dcid);
-    const server = protection.deriveKeys(secrets.server, .aes_128_gcm);
+    const server = try protection.deriveKeys(&secrets.server, .aes_128_gcm);
 
     // A.3: a 20-byte header with a 2-byte packet number of 1, and 99 bytes of
     // frames.
@@ -110,7 +110,7 @@ test "RFC 9001 A.3, the server Initial seals and opens" {
 }
 
 test "RFC 9001 A.5, the ChaCha20 short header packet" {
-    const keys = protection.deriveKeys(data.chacha_secret, .chacha20_poly1305);
+    const keys = try protection.deriveKeys(&data.chacha_secret, .chacha20_poly1305);
     try testing.expectEqualSlices(u8, &data.chacha_key, keys.keyBytes());
     try testing.expectEqualSlices(u8, &data.chacha_iv, &keys.iv);
     try testing.expectEqualSlices(u8, &data.chacha_hp, keys.headerKeyBytes());
@@ -159,7 +159,7 @@ test "RFC 9001 A.5, the ChaCha20 short header packet" {
 
 test "RFC 9001 A.2, one bit of the packet and the tag does not verify" {
     const secrets = protection.initialSecrets(&data.dcid);
-    const client = protection.deriveKeys(secrets.client, .aes_128_gcm);
+    const client = try protection.deriveKeys(&secrets.client, .aes_128_gcm);
 
     // The payload is changed: the tag covers it.
     {
@@ -197,7 +197,7 @@ test "RFC 9001 A.2, one bit of the packet and the tag does not verify" {
     // header protection key also garbles the packet number length, so the
     // ciphertext may appear longer than the real payload.
     {
-        const server = protection.deriveKeys(secrets.server, .aes_128_gcm);
+        const server = try protection.deriveKeys(&secrets.server, .aes_128_gcm);
         var packet: [1200]u8 = undefined;
         @memcpy(&packet, &data.client_packet);
         var plaintext: [1200]u8 = undefined;

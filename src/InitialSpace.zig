@@ -98,8 +98,10 @@ pub fn secrets(original_destination_connection_id: []const u8) protection.Initia
 /// `original_destination_connection_id` and mirrored IDs.
 pub fn init(config: Config) InitialSpace {
     const initial = secrets(config.original_destination_connection_id);
-    const client_keys = protection.deriveKeys(initial.client, suite);
-    const server_keys = protection.deriveKeys(initial.server, suite);
+    // An Initial secret is always SHA-256 (RFC 9001 §5.2), so the length check
+    // inside `deriveKeys` cannot fail here.
+    const client_keys = protection.deriveKeys(&initial.client, suite) catch unreachable;
+    const server_keys = protection.deriveKeys(&initial.server, suite) catch unreachable;
 
     return .{
         .send_keys = if (config.side == .client) client_keys else server_keys,

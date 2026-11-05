@@ -34,6 +34,16 @@ pub const Suite = enum {
     aes_128_gcm,
     chacha20_poly1305,
 
+    /// The size of the traffic secret the suite's KDF produces. Both suites
+    /// here are SHA-256, so 32 bytes. A 48-byte secret is
+    /// TLS_AES_256_GCM_SHA384, which this package does not implement, and
+    /// `deriveKeys` says so by returning an error rather than reading the first
+    /// 32 bytes of a longer secret.
+    pub fn secretLength(self: Suite) usize {
+        _ = self;
+        return hkdf.secret_length;
+    }
+
     /// The AEAD key and header protection key length for the suite (§5.1).
     pub fn keyLength(self: Suite) usize {
         return switch (self) {
@@ -66,6 +76,9 @@ pub const Error = error{
     NoSpace,
     /// The packet ended inside its tag or its header.
     Truncated,
+    /// A traffic secret whose length does not match the suite: 48 bytes means a
+    /// SHA-384 suite, which this package does not implement.
+    SecretLengthMismatch,
 };
 
 /// The three keys one direction uses (§5.1). `key` and `hp` are used up to
@@ -103,24 +116,31 @@ pub fn initialSecrets(destination_connection_id: []const u8) InitialSecrets {
 }
 
 /// §5.1: the AEAD key, the IV, and the header protection key from a secret.
-pub fn deriveKeys(secret: [secret_length]u8, suite: Suite) Keys {
+///
+/// The secret is a slice because its length is the suite's, not ours: TLS 1.3
+/// hands out 32-byte secrets for SHA-256 suites and 48-byte ones for SHA-384,
+/// and a 48-byte secret is refused here instead of being truncated to 32.
+pub fn deriveKeys(secret: []const u8, suite: Suite) Error!Keys {
+    if (secret.len != suite.secretLength()) return error.SecretLengthMismatch;
+
     var keys: Keys = .{
         .suite = suite,
         .key = @splat(0),
         .iv = @splat(0),
         .hp = @splat(0),
     };
-    keys.iv = hkdf.expandLabel(nonce_length, secret, "quic iv", "");
+    const sha256_secret: [secret_length]u8 = secret[0..secret_length].*;
+    keys.iv = hkdf.expandLabel(nonce_length, sha256_secret, "quic iv", "");
     switch (suite) {
         .aes_128_gcm => {
-            const key = hkdf.expandLabel(16, secret, "quic key", "");
-            const hp = hkdf.expandLabel(16, secret, "quic hp", "");
+            const key = hkdf.expandLabel(16, sha256_secret, "quic key", "");
+            const hp = hkdf.expandLabel(16, sha256_secret, "quic hp", "");
             @memcpy(keys.key[0..16], &key);
             @memcpy(keys.hp[0..16], &hp);
         },
         .chacha20_poly1305 => {
-            keys.key = hkdf.expandLabel(32, secret, "quic key", "");
-            keys.hp = hkdf.expandLabel(32, secret, "quic hp", "");
+            keys.key = hkdf.expandLabel(32, sha256_secret, "quic key", "");
+            keys.hp = hkdf.expandLabel(32, sha256_secret, "quic hp", "");
         },
     }
     return keys;
@@ -357,7 +377,7 @@ test "RFC 9001 Appendix A.1, the client and server keys from the Initial secret"
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     const secrets = initialSecrets(&dcid);
 
-    const client = deriveKeys(secrets.client, .aes_128_gcm);
+    const client = try deriveKeys(&secrets.client, .aes_128_gcm);
     try testing.expectEqualSlices(u8, &.{
         0x1f, 0x36, 0x96, 0x13, 0xdd, 0x76, 0xd5, 0x46,
         0x77, 0x30, 0xef, 0xcb, 0xe3, 0xb1, 0xa2, 0x2d,
@@ -370,7 +390,7 @@ test "RFC 9001 Appendix A.1, the client and server keys from the Initial secret"
         0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2,
     }, client.headerKeyBytes());
 
-    const server = deriveKeys(secrets.server, .aes_128_gcm);
+    const server = try deriveKeys(&secrets.server, .aes_128_gcm);
     try testing.expectEqualSlices(u8, &.{
         0xcf, 0x3a, 0x53, 0x31, 0x65, 0x3c, 0x36, 0x4c,
         0x88, 0xf0, 0xf3, 0x79, 0xb6, 0x06, 0x7e, 0x37,
@@ -392,14 +412,16 @@ test "RFC 9001 Appendix A.2 and A.3, the header protection masks" {
         0xd1, 0xb1, 0xc9, 0x8d, 0xd7, 0x68, 0x9f, 0xb8,
         0xec, 0x11, 0xd2, 0x42, 0xb1, 0x23, 0xdc, 0x9b,
     };
-    const client_mask = mask(&deriveKeys(secrets.client, .aes_128_gcm), sample);
+    const client_keys = try deriveKeys(&secrets.client, .aes_128_gcm);
+    const client_mask = mask(&client_keys, sample);
     try testing.expectEqualSlices(u8, &.{ 0x43, 0x7b, 0x9a, 0xec, 0x36 }, &client_mask);
 
     const server_sample = [_]u8{
         0x2c, 0xd0, 0x99, 0x1c, 0xd2, 0x5b, 0x0a, 0xac,
         0x40, 0x6a, 0x58, 0x16, 0xb6, 0x39, 0x41, 0x00,
     };
-    const server_mask = mask(&deriveKeys(secrets.server, .aes_128_gcm), server_sample);
+    const server_keys = try deriveKeys(&secrets.server, .aes_128_gcm);
+    const server_mask = mask(&server_keys, server_sample);
     try testing.expectEqualSlices(u8, &.{ 0x2e, 0xc0, 0xd8, 0x35, 0x6a }, &server_mask);
 }
 
@@ -410,7 +432,7 @@ test "RFC 9001 Appendix A.5, the ChaCha20 header protection mask and the nonce" 
         0x54, 0x43, 0xf1, 0x82, 0x03, 0xa0, 0x7d, 0x60,
         0x60, 0xf6, 0x88, 0xf3, 0x0f, 0x21, 0x63, 0x2b,
     };
-    const keys = deriveKeys(secret, .chacha20_poly1305);
+    const keys = try deriveKeys(&secret, .chacha20_poly1305);
 
     try testing.expectEqualSlices(u8, &.{
         0xc6, 0xd9, 0x8f, 0xf3, 0x44, 0x1c, 0x3f, 0xe1,
@@ -431,8 +453,28 @@ test "RFC 9001 Appendix A.5, the ChaCha20 header protection mask and the nonce" 
     try testing.expectEqualSlices(u8, &.{ 0xae, 0xfe, 0xfe, 0x7d, 0x03 }, &mask(&keys, sample));
 }
 
+test "RFC 9001 §5.1, a secret of the wrong length is refused, not truncated" {
+    // A SHA-384 suite hands out a 48-byte secret. This package implements the
+    // two SHA-256 suites, so the answer is an error that says so, not the first
+    // 32 bytes of somebody else's secret.
+    const sha384_secret: [48]u8 = @splat(0x5a);
+    try testing.expectError(
+        error.SecretLengthMismatch,
+        deriveKeys(&sha384_secret, .aes_128_gcm),
+    );
+    try testing.expectError(
+        error.SecretLengthMismatch,
+        deriveKeys(&sha384_secret, .chacha20_poly1305),
+    );
+
+    // And one byte short is the same mistake.
+    const short: [31]u8 = @splat(0);
+    try testing.expectError(error.SecretLengthMismatch, deriveKeys(&short, .aes_128_gcm));
+}
+
 test "RFC 9001 §5.4.2, a packet too short for a sample is discarded" {
-    const keys = deriveKeys(@splat(0), .aes_128_gcm);
+    const zero: [secret_length]u8 = @splat(0);
+    const keys = try deriveKeys(&zero, .aes_128_gcm);
     // A sample is 16 bytes from four past the packet number, so a packet with
     // fewer than 20 bytes after `pn_offset` has no complete sample.
     var packet = [_]u8{0xc0} ++ @as([18]u8, @splat(0));
@@ -441,7 +483,8 @@ test "RFC 9001 §5.4.2, a packet too short for a sample is discarded" {
 }
 
 test "RFC 9001 §5.3, a flipped tag fails to verify" {
-    const keys = deriveKeys(@splat(7), .aes_128_gcm);
+    const seven: [secret_length]u8 = @splat(7);
+    const keys = try deriveKeys(&seven, .aes_128_gcm);
     var plaintext = [_]u8{ 1, 2, 3, 4 };
     var sealed: [plaintext.len + tag_length]u8 = undefined;
     const header = [_]u8{ 0xc3, 0, 0, 0, 1 };
@@ -469,7 +512,8 @@ test "RFC 9001 §5.3, a flipped tag fails to verify" {
 
 test "a sealed packet opens back to what it held" {
     inline for (.{ .aes_128_gcm, .chacha20_poly1305 }) |suite| {
-        const keys = deriveKeys(@splat(0x2a), suite);
+        const secret: [secret_length]u8 = @splat(0x2a);
+        const keys = try deriveKeys(&secret, suite);
         const payload = "a payload long enough for the sample";
         const pn: u64 = 42;
 
@@ -507,9 +551,9 @@ test "fuzz the unprotect path" {
             smith.bytes(dcid_buf[0..dcid_len]);
             const secrets = initialSecrets(dcid_buf[0..dcid_len]);
 
-            var keys = deriveKeys(secrets.client, .aes_128_gcm);
+            var keys = try deriveKeys(&secrets.client, .aes_128_gcm);
             // Half the time, use whatever key a peer would have.
-            if (smith.value(bool)) keys = deriveKeys(secrets.server, .aes_128_gcm);
+            if (smith.value(bool)) keys = try deriveKeys(&secrets.server, .aes_128_gcm);
 
             var packet_buf: [512]u8 = undefined;
             const len = smith.slice(&packet_buf);
