@@ -33,6 +33,12 @@ Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix deve
 - Initial keys come from the connection ID, not from TLS (RFC 9001 §5.2), so
   Initial protection is testable against Appendix A with no handshake. The TLS
   handshake itself, and the traffic secrets it produces, are a separate gate.
+- Streams are two halves, not one type: `SendStream` and `ReceiveStream`. A
+  bidirectional stream holds one of each, and a unidirectional stream holds the
+  one its role uses. Neither allocates: the send buffer and the receive ring are
+  the caller's. Flow control is enforced where the bytes arrive, so a peer over
+  the limit is `error.FlowControl` (FLOW_CONTROL_ERROR) and never a silent
+  truncation.
 - `Congestion.zig` is the correctness half of RFC 9002 §7 only: window, bytes
   in flight, slow start, congestion avoidance, the recovery period, and
   persistent congestion handed in by `Recovery`. Pacing, application-limited

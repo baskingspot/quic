@@ -27,6 +27,15 @@ All notable changes to quic are recorded here. The format follows
 - `InitialSpace` is no longer exported from the package. It is an Initial-level
   prototype, and the per-space type that replaces it will own the state
   `Recovery` already has.
+- `SendStream` is the §3.1 sending state machine over caller storage: it hands
+  out segments bounded by the peer's limit, emits the zero-length FIN at the
+  final size, tracks out-of-order acknowledgments to a contiguous offset, and
+  answers a STOP_SENDING with a reset when §3.5 requires one.
+- `ReceiveStream` reassembles out-of-order data into a contiguous stream in a
+  ring the caller owns, enforces the §4.1 stream limit as FLOW_CONTROL_ERROR,
+  pins the §4.5 final size, and reports the MAX_STREAM_DATA it owes.
+- `FlowControl` is the connection-level §4.1 counter for both directions, and
+  `stream_id` is the §2.1 arithmetic for the four stream kinds.
 - `Congestion` is the NewReno part of RFC 9002 §7 that is about correctness:
   bytes in flight, the §7.2 initial and minimum window, slow start, congestion
   avoidance with a carried residue, and one window reduction per recovery

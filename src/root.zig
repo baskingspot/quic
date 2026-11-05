@@ -23,6 +23,7 @@ pub const Cursor = @import("Cursor.zig");
 pub const Writer = @import("Writer.zig");
 pub const Congestion = @import("Congestion.zig");
 pub const error_code = @import("error_code.zig");
+pub const stream_id = @import("stream_id.zig");
 pub const hkdf = @import("hkdf.zig");
 pub const protection = @import("protection.zig");
 pub const Recovery = @import("Recovery.zig");
@@ -32,11 +33,16 @@ pub const packet_number = @import("packet_number.zig");
 pub const TransportParameters = @import("TransportParameters.zig");
 pub const varint = @import("varint.zig");
 
+pub const SendStream = @import("SendStream.zig");
+pub const ReceiveStream = @import("ReceiveStream.zig");
+pub const FlowControl = @import("FlowControl.zig");
+
 test {
     _ = @import("Cursor.zig");
     _ = @import("Writer.zig");
     _ = Congestion;
     _ = error_code;
+    _ = stream_id;
     _ = frame;
     _ = hkdf;
     _ = @import("InitialSpace.zig");
@@ -46,4 +52,7 @@ test {
     _ = packet_number;
     _ = TransportParameters;
     _ = varint;
+    _ = SendStream;
+    _ = ReceiveStream;
+    _ = FlowControl;
 }
