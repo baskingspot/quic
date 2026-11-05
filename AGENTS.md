@@ -33,6 +33,10 @@ Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix deve
 - Initial keys come from the connection ID, not from TLS (RFC 9001 §5.2), so
   Initial protection is testable against Appendix A with no handshake. The TLS
   handshake itself, and the traffic secrets it produces, are a separate gate.
+- `InitialSpace.zig` is the driver, not a connection: keys, packet numbers,
+  and the received ranges an ACK frame needs, for the Initial level only. When
+  a change would need a timer, a retransmission, a stream, or a handshake, it
+  belongs in a later module and not there.
 - The TLS handshake is not in this repo. HTTP/3 and QPACK are not either.
   This is RFC 9000: packets, frames, transport parameters, and the loss
   recovery loop.

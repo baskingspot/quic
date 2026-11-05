@@ -32,6 +32,17 @@ pub fn build(b: *std.Build) void {
     const run_vector_tests = b.addRunArtifact(vector_tests);
     test_step.dependOn(&run_vector_tests.step);
 
+    // The pipe test: one client and one server exchanging Initial packets over
+    // a buffer. Also outside the package.
+    const loopback_mod = b.createModule(.{
+        .root_source_file = b.path("tests/loopback.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "quic", .module = mod }},
+    });
+    const loopback_tests = b.addTest(.{ .root_module = loopback_mod });
+    test_step.dependOn(&b.addRunArtifact(loopback_tests).step);
+
     // Fuzzing is driven by the build runner: `zig build test --fuzz=10M`. The
     // `fuzz` module option segfaults in the test runner on Zig 0.17.0, so the
     // module here stays plain and the flag does the work.

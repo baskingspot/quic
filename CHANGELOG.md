@@ -24,6 +24,10 @@ All notable changes to quic are recorded here. The format follows
 - `error_code` has the RFC 9000 §20.1 transport codes, the CRYPTO_ERROR block,
   and `error_code.forFrameError`, which names the code that closes a connection
   over a frame that will not decode.
+- `InitialSpace` is the Initial-level driver: it derives both Initial keys from
+  the connection ID, seals and opens Initial packets, tracks the packet number
+  in each direction, and turns what it received into an ACK frame. It is not a
+  connection: no handshake, no retransmission, no loss recovery, no Retry.
 - `protection` seals and opens RFC 9001 §5 packets: Initial keys from the
   connection ID (§5.2), the AEAD nonce (§5.3), and AES or ChaCha20 header
   protection (§5.4). `protection.Suite` covers AES-128-GCM and
