@@ -22,6 +22,7 @@
 pub const Cursor = @import("Cursor.zig");
 pub const Writer = @import("Writer.zig");
 pub const Congestion = @import("Congestion.zig");
+pub const connection_setup = @import("connection_setup.zig");
 pub const error_code = @import("error_code.zig");
 pub const stream_id = @import("stream_id.zig");
 pub const hkdf = @import("hkdf.zig");
@@ -41,6 +42,7 @@ test {
     _ = @import("Cursor.zig");
     _ = @import("Writer.zig");
     _ = Congestion;
+    _ = connection_setup;
     _ = error_code;
     _ = stream_id;
     _ = frame;

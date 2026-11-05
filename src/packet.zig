@@ -389,6 +389,10 @@ pub const RetryToWrite = struct {
     destination_connection_id: []const u8,
     source_connection_id: []const u8,
     token: []const u8,
+    /// §17.2.5: the four unused bits are arbitrary. Zero by default; the value
+    /// is inside the scope of the retry integrity tag, so a sender that changes
+    /// it changes the tag.
+    unused: u4 = 0,
 };
 
 pub const RetryOffsets = struct {
@@ -405,7 +409,7 @@ pub fn writeRetry(writer: *Writer, retry: RetryToWrite) Error!RetryOffsets {
 
     // §17.2.5: the unused bits are arbitrary; zero keeps them out of the way of
     // the tag the caller computes over these bytes.
-    try writer.putByte(0x80 | 0x40 | (@as(u8, @backingInt(Kind.retry)) << 4));
+    try writer.putByte(0x80 | 0x40 | (@as(u8, @backingInt(Kind.retry)) << 4) | @as(u8, retry.unused));
     try writeVersion(writer, retry.version);
     try writeConnectionId(writer, retry.destination_connection_id);
     try writeConnectionId(writer, retry.source_connection_id);

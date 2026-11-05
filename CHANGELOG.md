@@ -27,6 +27,12 @@ All notable changes to quic are recorded here. The format follows
 - `InitialSpace` is no longer exported from the package. It is an Initial-level
   prototype, and the per-space type that replaces it will own the state
   `Recovery` already has.
+- `connection_setup` is RFC 9000 §6: a server builds a Version Negotiation
+  packet by echoing the connection IDs it saw, a client's handling of one can
+  never return a different version (the §6.2 rule, expressed as the return
+  type), and a Retry is built and validated with the RFC 9001 §5.8 integrity
+  tag. `connection_setup.Client` is the client side of "one Retry, only before
+  the first response".
 - `SendStream` is the §3.1 sending state machine over caller storage: it hands
   out segments bounded by the peer's limit, emits the zero-length FIN at the
   final size, tracks out-of-order acknowledgments to a contiguous offset, and
