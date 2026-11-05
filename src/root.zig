@@ -13,6 +13,8 @@
 pub const Cursor = @import("Cursor.zig");
 pub const Writer = @import("Writer.zig");
 pub const error_code = @import("error_code.zig");
+pub const hkdf = @import("hkdf.zig");
+pub const protection = @import("protection.zig");
 pub const frame = @import("frame.zig");
 pub const packet = @import("packet.zig");
 pub const packet_number = @import("packet_number.zig");
@@ -24,6 +26,8 @@ test {
     _ = @import("Writer.zig");
     _ = error_code;
     _ = frame;
+    _ = hkdf;
+    _ = protection;
     _ = packet;
     _ = packet_number;
     _ = TransportParameters;

@@ -13,7 +13,18 @@ test:
 [doc("Fuzz the codecs with an iteration budget, for example `just fuzz 50M`. A budget is required: without one the build runner opens a web UI and waits")]
 [group("test")]
 fuzz LIMIT="10M":
-    zig build test -Doptimize=ReleaseSafe --fuzz={{ LIMIT }}
+    #!/usr/bin/env bash
+    # Zig 0.17.0's build runner exits 0 when a fuzz target fails, so the
+    # failure has to be read out of the output. Without this, a crash in CI
+    # would look like a pass.
+    set -uo pipefail
+    output=$(zig build test -Doptimize=ReleaseSafe --fuzz={{ LIMIT }} 2>&1)
+    status=$?
+    printf '%s\n' "$output"
+    if [ "$status" -ne 0 ] || printf '%s' "$output" | grep -q "exited with code"; then
+        echo "fuzz: a target found a failure" >&2
+        exit 1
+    fi
 
 [doc("Lint Zig, Nix, Markdown, the workflows, and this justfile: ziglint, zig fmt, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]

@@ -22,10 +22,17 @@ Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix deve
 - The writer hands back offsets. A packet header's Length field sits before
   the payload it counts, so a header writer returns the offset of that field
   and the caller patches it with `Writer.patch` once the payload exists.
-- Plaintext only. Packet protection is RFC 9001, it lives in
-  `baskingspot/tls`, and every codec here reads and writes unprotected bytes.
-  Do not stub a crypto path, and do not add one: header protection and AEAD
-  come from tls or std, never from a new implementation here.
+- Packet protection is RFC 9001 and it lives in `protection.zig`, behind
+  `protection.sealPacket` and `protection.openPacket`. The header codecs and
+  the frame codec still read and write plaintext; a caller protects a packet
+  after building it and unprotects one before parsing its frames.
+- No hand-rolled cipher, MAC, or constant-time comparison, ever. The AEADs,
+  AES-ECB, ChaCha20, and HKDF are `std.crypto`. A suite std does not provide is
+  a missing feature, not an invitation: TLS_AES_256_GCM_SHA384 is absent
+  because it needs SHA-384, and it says so in the doc comment.
+- Initial keys come from the connection ID, not from TLS (RFC 9001 §5.2), so
+  Initial protection is testable against Appendix A with no handshake. The TLS
+  handshake itself, and the traffic secrets it produces, are a separate gate.
 - The TLS handshake is not in this repo. HTTP/3 and QPACK are not either.
   This is RFC 9000: packets, frames, transport parameters, and the loss
   recovery loop.
@@ -59,6 +66,9 @@ Two traps on Zig 0.17.0, both hit while wiring this up:
 - Do not set `.fuzz = true` on the module. That path segfaults in the runner
   (`fuzzer_new_input` reads uninitialized state) even on a trivial project.
   `zig build test --fuzz=N` sets what the runner needs.
+- `zig build test --fuzz=N` exits 0 when a fuzz target fails. The `just fuzz`
+  recipe reads the "exited with code" line out of the output and fails on it,
+  because otherwise a crash reads as a pass in CI.
 
 ## Rules
 

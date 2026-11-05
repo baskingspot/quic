@@ -14,9 +14,23 @@ pub fn build(b: *std.Build) void {
 
     if (b.pkg_hash.len != 0) return;
 
+    const test_step = b.step("test", "Run the unit tests");
+
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
-    b.step("test", "Run the unit tests").dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_mod_tests.step);
+
+    // The RFC 9001 Appendix A vectors live outside `src/`, so the package a
+    // consumer fetches does not carry them.
+    const vector_mod = b.createModule(.{
+        .root_source_file = b.path("tests/rfc9001.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "quic", .module = mod }},
+    });
+    const vector_tests = b.addTest(.{ .root_module = vector_mod });
+    const run_vector_tests = b.addRunArtifact(vector_tests);
+    test_step.dependOn(&run_vector_tests.step);
 
     // Fuzzing is driven by the build runner: `zig build test --fuzz=10M`. The
     // `fuzz` module option segfaults in the test runner on Zig 0.17.0, so the

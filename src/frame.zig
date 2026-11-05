@@ -810,6 +810,7 @@ test "fuzz the frame parser" {
 
             var cursor: Cursor = .init(input);
             while (true) {
+                const start = cursor.pos;
                 const value = read(&cursor) catch |err| {
                     // The only acceptable reasons are a short buffer, a bad
                     // type, or a value the frame cannot carry.
@@ -826,9 +827,9 @@ test "fuzz the frame parser" {
                     });
                     break;
                 };
-                // A parsed frame re-encodes into a buffer no larger than the
-                // bytes it came from plus its type byte.
-                try expect(encodedSize(value) >= cursor.pos);
+                // A parsed frame re-encodes into no more bytes than it came
+                // from, so a size estimate that is too small is a bad estimate.
+                try expect(encodedSize(value) >= cursor.pos - start);
                 if (cursor.atEnd()) break;
             }
         }
@@ -839,7 +840,8 @@ test "fuzz the frame parser" {
             return switch (value) {
                 .padding => |count| count,
                 .ping, .handshake_done => 1,
-                .ack => |ack| 40 + ack.bytes.len,
+                // Five varints and the encoded ranges, plus the type byte.
+                .ack => |ack| 57 + ack.bytes.len,
                 .reset_stream, .stop_sending => 25,
                 .crypto => |crypto| 17 + crypto.data.len,
                 .new_token => |token| 9 + token.len,

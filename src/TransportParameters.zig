@@ -662,9 +662,11 @@ test "fuzz the transport parameter decoder" {
             };
 
             // Whatever parsed re-encodes and parses back to the same values.
+            // The encode is as a server: a client reading a server's
+            // parameters would answer with its own, not echo them back.
             var out: [512]u8 = undefined;
             var writer: Writer = .init(&out);
-            try encode(&writer, params, role);
+            try encode(&writer, params, .server);
             var again: TransportParameters = .{};
             try decode(writer.written(), role, &again);
             try expectEqual(params.max_idle_timeout, again.max_idle_timeout);

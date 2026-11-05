@@ -24,6 +24,12 @@ All notable changes to quic are recorded here. The format follows
 - `error_code` has the RFC 9000 §20.1 transport codes, the CRYPTO_ERROR block,
   and `error_code.forFrameError`, which names the code that closes a connection
   over a frame that will not decode.
+- `protection` seals and opens RFC 9001 §5 packets: Initial keys from the
+  connection ID (§5.2), the AEAD nonce (§5.3), and AES or ChaCha20 header
+  protection (§5.4). `protection.Suite` covers AES-128-GCM and
+  ChaCha20-Poly1305; TLS_AES_256_GCM_SHA384 needs SHA-384 and is not there.
+- `hkdf.expandLabel` is the TLS 1.3 derivation with the `quic key`, `quic iv`,
+  `quic hp`, and `quic ku` labels.
 - `TransportParameters` reads and writes every RFC 9000 §18.2 parameter,
   including `preferred_address`. It refuses a duplicate, an out-of-range value,
   and a server-only parameter sent by a client, and it ignores a parameter this
