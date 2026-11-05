@@ -12,6 +12,8 @@
 
 pub const Cursor = @import("Cursor.zig");
 pub const Writer = @import("Writer.zig");
+pub const error_code = @import("error_code.zig");
+pub const frame = @import("frame.zig");
 pub const packet = @import("packet.zig");
 pub const packet_number = @import("packet_number.zig");
 pub const varint = @import("varint.zig");
@@ -19,6 +21,8 @@ pub const varint = @import("varint.zig");
 test {
     _ = @import("Cursor.zig");
     _ = @import("Writer.zig");
+    _ = error_code;
+    _ = frame;
     _ = packet;
     _ = packet_number;
     _ = varint;

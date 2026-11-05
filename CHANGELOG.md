@@ -18,3 +18,9 @@ All notable changes to quic are recorded here. The format follows
   header without keys, which is what answering with version negotiation needs.
 - `packet_number` picks the width of the truncated packet number and recovers
   it at the receiver (§17.1).
+- `frame` reads and writes every RFC 9000 §19 frame. `Ack.ranges` walks the
+  Gap and ACK Range Length pairs without copying them, a run of PADDING is one
+  frame, and `frame.read` rejects a frame type that is not one byte (§12.4).
+- `error_code` has the RFC 9000 §20.1 transport codes, the CRYPTO_ERROR block,
+  and `error_code.forFrameError`, which names the code that closes a connection
+  over a frame that will not decode.
