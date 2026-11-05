@@ -103,22 +103,28 @@ pub const Timeout = struct {
     probes: u8 = 0,
 };
 
-/// The sent packets a call reported, with their numbers and byte counts. The
-/// byte totals are what a congestion controller needs and are not derivable from
-/// the numbers.
+/// The sent packets a call reported. The records carry what a congestion
+/// controller needs, because the packets are gone from the space by the time the
+/// caller sees them.
 pub const Events = struct {
-    acked: [64]u64 = @splat(0),
+    acked: [64]SentPacket = undefined,
     acked_len: usize = 0,
     acked_bytes: u32 = 0,
-    lost: [64]u64 = @splat(0),
+    lost: [64]SentPacket = undefined,
     lost_len: usize = 0,
     lost_bytes: u32 = 0,
+    /// The send time of the largest lost packet, which is what a controller
+    /// compares against its recovery period (§7.3.2).
+    largest_lost_sent_time: Duration = 0,
+    /// §7.6.2: this acknowledgment established persistent congestion. The
+    /// controller sets its window to the floor when it sees this.
+    persistent_congestion: bool = false,
 
-    pub fn ackedPackets(self: *const Events) []const u64 {
+    pub fn ackedPackets(self: *const Events) []const SentPacket {
         return self.acked[0..self.acked_len];
     }
 
-    pub fn lostPackets(self: *const Events) []const u64 {
+    pub fn lostPackets(self: *const Events) []const SentPacket {
         return self.lost[0..self.lost_len];
     }
 
@@ -127,20 +133,23 @@ pub const Events = struct {
         self.acked_bytes = 0;
         self.lost_len = 0;
         self.lost_bytes = 0;
+        self.largest_lost_sent_time = 0;
+        self.persistent_congestion = false;
     }
 
     fn pushAcked(self: *Events, packet: SentPacket) void {
         std.debug.assert(self.acked_len < self.acked.len);
-        self.acked[self.acked_len] = packet.packet_number;
+        self.acked[self.acked_len] = packet;
         self.acked_len += 1;
         self.acked_bytes += packet.sent_bytes;
     }
 
     fn pushLost(self: *Events, packet: SentPacket) void {
         std.debug.assert(self.lost_len < self.lost.len);
-        self.lost[self.lost_len] = packet.packet_number;
+        self.lost[self.lost_len] = packet;
         self.lost_len += 1;
         self.lost_bytes += packet.sent_bytes;
+        self.largest_lost_sent_time = packet.time_sent;
     }
 };
 
@@ -166,10 +175,20 @@ pub const Rtt = struct {
     /// §5.2: the smallest sample seen. `first` says whether one exists.
     min_rtt: Duration = 0,
     first: bool = false,
+    /// When the first sample was taken. §7.6.2 requires a prior RTT sample to
+    /// have existed when the packets that established persistent congestion
+    /// were sent, so the time is needed, not only the fact.
+    first_sample_time: Duration = 0,
 
     /// §5.3 read through A.7's pseudocode. `ack_delay` is already scaled by the
     /// peer's `ack_delay_exponent`; the caller decodes it from the ACK frame.
-    pub fn onSample(self: *Rtt, latest: Duration, ack_delay: Duration, options: Options) void {
+    pub fn onSample(
+        self: *Rtt,
+        now: Duration,
+        latest: Duration,
+        ack_delay: Duration,
+        options: Options,
+    ) void {
         if (!self.first) {
             // §5.3: "On the first RTT sample after initialization, the
             // estimator is reset using that sample", and the acknowledgment
@@ -179,6 +198,7 @@ pub const Rtt = struct {
             self.smoothed = latest;
             self.variance = latest / 2;
             self.first = true;
+            self.first_sample_time = now;
             return;
         }
 
@@ -223,6 +243,18 @@ pub const Rtt = struct {
     }
 };
 
+/// §7.6.1: `(smoothed_rtt + max(4*rttvar, kGranularity) + max_ack_delay) *
+/// kPersistentCongestionThreshold`, with the threshold fixed at 3 by the
+/// recommendation in the same section.
+///
+/// Unlike the PTO period, this always includes `max_ack_delay`, whatever space
+/// the loss was established in, which is why it is computed here rather than
+/// from the PTO.
+pub fn persistentPeriod(rtt: *const Rtt, max_ack_delay: Duration) Duration {
+    const threshold: u64 = 3;
+    return (rtt.smoothed + @max(4 * rtt.variance, granularity) + max_ack_delay) * threshold;
+}
+
 /// The connection-wide half of loss recovery: everything the RFC measures per
 /// path rather than per packet number space (A.2, A.8).
 rtt: Rtt = .{},
@@ -252,6 +284,10 @@ pub const Space = struct {
     /// When the last ack-eliciting packet in flight in this space was sent
     /// (§6.2.1).
     last_ack_eliciting: Duration = 0,
+    /// The run of consecutive lost ack-eliciting packets, for §7.6.2.
+    run_start: Duration = 0,
+    run_last: u64 = 0,
+    run_eliciting: u32 = 0,
 
     pub fn rtt(self: *const Space) *const Rtt {
         return &self.shared.rtt;
@@ -330,10 +366,10 @@ pub const Space = struct {
         // when at least one newly acknowledged packet was ack-eliciting.
         if (largest_was_new and acked_largest_eliciting) {
             const latest = if (now >= largest_send_time) now - largest_send_time else 0;
-            self.shared.rtt.onSample(latest, ack.delay, options);
+            self.shared.rtt.onSample(now, latest, ack.delay, options);
         }
 
-        self.detectLost(now, events);
+        self.detectLost(now, events, options);
 
         // §6.2.1: an acknowledgment resets the PTO backoff, unless this is a
         // client that does not know the server has validated its address.
@@ -342,7 +378,7 @@ pub const Space = struct {
 
     /// §6.1 and A.10: the packets this space now calls lost, and the time the
     /// rest become lost if nothing else is acknowledged.
-    fn detectLost(self: *Space, now: Duration, events: *Events) void {
+    fn detectLost(self: *Space, now: Duration, events: *Events, options: Options) void {
         self.loss_time = 0;
         const largest = self.largest_acked orelse return;
 
@@ -361,6 +397,7 @@ pub const Space = struct {
             const lost_by_time = packet.time_sent <= lost_send_time and now >= delay;
             const lost_by_packet = largest >= packet.packet_number + packet_threshold;
             if (lost_by_time or lost_by_packet) {
+                self.noteLost(packet, events, options);
                 events.pushLost(packet);
                 self.remove(index);
                 continue;
@@ -369,6 +406,40 @@ pub const Space = struct {
             if (self.loss_time == 0 or candidate < self.loss_time) self.loss_time = candidate;
             index += 1;
         }
+    }
+
+    /// §7.6.2: persistent congestion needs two ack-eliciting packets declared
+    /// lost, no acknowledged packet between them, a duration between their send
+    /// times above the §7.6.1 threshold, and a prior RTT sample when they were
+    /// sent.
+    ///
+    /// The run is tracked over packets lost in this one event, in packet number
+    /// order, and it breaks when the packet numbers are not consecutive. That is
+    /// stricter than the RFC: a packet that is still in flight between two lost
+    /// ones is not an acknowledged packet, but treating it as a break can only
+    /// miss a declaration, never invent one.
+    fn noteLost(self: *Space, packet: SentPacket, events: *Events, options: Options) void {
+        if (!packet.ack_eliciting) {
+            self.run_start = 0;
+            self.run_last = 0;
+            self.run_eliciting = 0;
+            return;
+        }
+        const continues = self.run_last != 0 and packet.packet_number == self.run_last + 1;
+        if (!continues) {
+            self.run_start = packet.time_sent;
+            self.run_eliciting = 0;
+        }
+        self.run_last = packet.packet_number;
+        self.run_eliciting += 1;
+        if (self.run_eliciting < 2) return;
+
+        // §7.6.2: a prior RTT sample must have existed when the run was sent.
+        const estimate = &self.shared.rtt;
+        if (!estimate.first or self.run_start < estimate.first_sample_time) return;
+
+        const period = persistentPeriod(estimate, options.max_ack_delay);
+        if (packet.time_sent - self.run_start > period) events.persistent_congestion = true;
     }
 
     /// The timer the caller should set after any event (§6.1.2 and §6.2.1, A.8).
@@ -401,7 +472,7 @@ pub const Space = struct {
         events.clear();
 
         if (self.loss_time != 0) {
-            self.detectLost(now, events);
+            self.detectLost(now, events, options);
             return .{ .kind = .loss };
         }
 
@@ -454,6 +525,11 @@ fn ackedBy(ack: *const frame.Ack, packet_number: u64) bool {
     return false;
 }
 
+fn expectNumbers(records: []const SentPacket, expected: []const u64) !void {
+    try testing.expectEqual(expected.len, records.len);
+    for (records, expected) |record, number| try testing.expectEqual(number, record.packet_number);
+}
+
 const Harness = struct {
     conn: Recovery = .{},
     sent: [64]SentPacket = undefined,
@@ -470,7 +546,7 @@ test "RFC 9002 §5.3, one sample initializes the estimator and ignores the delay
 
     // A first sample of 80ms with a reported delay of 20ms: the delay plays no
     // part in the reset.
-    rtt.onSample(ms(80), ms(20), .{ .max_ack_delay = ms(25), .handshake_confirmed = true });
+    rtt.onSample(0, ms(80), ms(20), .{ .max_ack_delay = ms(25), .handshake_confirmed = true });
     try testing.expectEqual(ms(80), rtt.smoothed);
     try testing.expectEqual(ms(40), rtt.variance);
     try testing.expectEqual(ms(80), rtt.min_rtt);
@@ -481,16 +557,16 @@ test "RFC 9002 Appendix A.7, three samples move the average and the variance" {
     var rtt: Rtt = .{};
 
     // First sample 80ms: smoothed 80, variance 40, min 80.
-    rtt.onSample(ms(80), 0, .{});
+    rtt.onSample(0, ms(80), 0, .{});
     // Second sample 96ms, no delay: variance = (3*40 + |80-96|)/4 = 34,
     // smoothed = (7*80 + 96)/8 = 82.
-    rtt.onSample(ms(96), 0, .{});
+    rtt.onSample(0, ms(96), 0, .{});
     try testing.expectEqual(ms(34), rtt.variance);
     try testing.expectEqual(ms(82), rtt.smoothed);
     try testing.expectEqual(ms(80), rtt.min_rtt);
     // Third sample 64ms: variance = (3*34 + |82-64|)/4 = 30,
     // smoothed = (7*82 + 64)/8 = 79.75.
-    rtt.onSample(ms(64), 0, .{});
+    rtt.onSample(0, ms(64), 0, .{});
     try testing.expectEqual(ms(30), rtt.variance);
     try testing.expectEqual(ms(79) + 750_000, rtt.smoothed);
     try testing.expectEqual(ms(64), rtt.min_rtt);
@@ -498,51 +574,51 @@ test "RFC 9002 Appendix A.7, three samples move the average and the variance" {
 
 test "RFC 9002 §5.3, a delay is subtracted only when it is plausible" {
     var rtt: Rtt = .{};
-    rtt.onSample(ms(80), 0, .{});
+    rtt.onSample(0, ms(80), 0, .{});
 
     // 100ms with a 10ms delay, handshake confirmed and max_ack_delay 25ms: the
     // delay is subtracted from an adjusted sample of 90ms. Variance becomes
     // (3*40 + |80-90|)/4 = 32.5ms, smoothed (7*80 + 90)/8 = 81.25ms.
-    rtt.onSample(ms(100), ms(10), .{ .max_ack_delay = ms(25), .handshake_confirmed = true });
+    rtt.onSample(0, ms(100), ms(10), .{ .max_ack_delay = ms(25), .handshake_confirmed = true });
     try testing.expectEqual(ms(32) + 500_000, rtt.variance);
     try testing.expectEqual(ms(81) + 250_000, rtt.smoothed);
 
     // A delay that would take the sample below min_rtt is not subtracted:
     // 60ms with a 50ms delay stays 60ms.
     var second: Rtt = .{};
-    second.onSample(ms(80), 0, .{});
-    second.onSample(ms(60), ms(50), .{ .max_ack_delay = ms(25), .handshake_confirmed = true });
+    second.onSample(0, ms(80), 0, .{});
+    second.onSample(0, ms(60), ms(50), .{ .max_ack_delay = ms(25), .handshake_confirmed = true });
     try testing.expectEqual(ms(60), second.min_rtt);
     try testing.expectEqual((7 * ms(80) + ms(60)) / 8, second.smoothed);
 
     // Before the handshake is confirmed, max_ack_delay does not clamp the
     // delay, so a 200ms delay on a 300ms sample is subtracted in full.
     var unconfirmed: Rtt = .{};
-    unconfirmed.onSample(ms(80), 0, .{});
-    unconfirmed.onSample(ms(300), ms(200), .{ .max_ack_delay = ms(25) });
+    unconfirmed.onSample(0, ms(80), 0, .{});
+    unconfirmed.onSample(0, ms(300), ms(200), .{ .max_ack_delay = ms(25) });
     try testing.expectEqual((7 * ms(80) + ms(100)) / 8, unconfirmed.smoothed);
 }
 
 test "RFC 9002 §6.1.2, the loss delay is 9/8 of the larger RTT and never rounds down" {
     var rtt: Rtt = .{};
-    rtt.onSample(ms(80), 0, .{});
+    rtt.onSample(0, ms(80), 0, .{});
     // smoothed 80, latest 80, so 9/8 of 80 is 90.
     try testing.expectEqual(ms(90), rtt.lossDelay());
 
-    rtt.onSample(ms(96), 0, .{});
+    rtt.onSample(0, ms(96), 0, .{});
     // max(82, 96) = 96, 9/8 of it is 108.
     try testing.expectEqual(ms(108), rtt.lossDelay());
 
     // A 1ns RTT scales to 1.125ns, which rounds up to 2, but the threshold
     // never goes below the 1ms timer granularity (§6.1.2).
     var tiny: Rtt = .{};
-    tiny.onSample(1, 0, .{});
+    tiny.onSample(0, 1, 0, .{});
     try testing.expectEqual(granularity, tiny.lossDelay());
 
     // 1_000_003ns scales to 1_125_003.375ns. Truncating gives 1_125_003, which
     // would let a loss timer fire early; rounding up gives 1_125_004.
     var awkward: Rtt = .{};
-    awkward.onSample(1_000_003, 0, .{});
+    awkward.onSample(0, 1_000_003, 0, .{});
     try testing.expectEqual(@as(Duration, 1_125_004), awkward.lossDelay());
 }
 
@@ -565,9 +641,9 @@ test "RFC 9002 §6.1.1, the packet threshold declares three older packets lost" 
     var events: Events = .{};
     try sp.onAckReceived(&ack, ms(20), .{}, &events);
 
-    try testing.expectEqualSlices(u64, &.{5}, events.ackedPackets());
+    try expectNumbers(events.ackedPackets(), &.{5});
     // 5 >= 0+3, 5 >= 1+3, 5 >= 2+3; but 5 < 3+3 and 5 < 4+3.
-    try testing.expectEqualSlices(u64, &.{ 0, 1, 2 }, events.lostPackets());
+    try expectNumbers(events.lostPackets(), &.{ 0, 1, 2 });
     // §7.1: the lost bytes are what a congestion controller reacts to.
     try testing.expectEqual(@as(u32, 3 * 1200), events.lost_bytes);
     try testing.expectEqual(@as(u32, 1200), events.acked_bytes);
@@ -596,7 +672,7 @@ test "RFC 9002 §6.1.2, a gap is lost only by time" {
     // 100ms and the variance to 50ms, so the loss delay is 9/8 of 100ms.
     var events: Events = .{};
     try sp.onAckReceived(&only_one, ms(100), .{}, &events);
-    try testing.expectEqualSlices(u64, &.{1}, events.ackedPackets());
+    try expectNumbers(events.ackedPackets(), &.{1});
     // One packet newer is acked, but the packet threshold needs three, and too
     // little time has passed for the time threshold.
     try testing.expectEqual(@as(usize, 0), events.lost_len);
@@ -610,7 +686,7 @@ test "RFC 9002 §6.1.2, a gap is lost only by time" {
     var timeout_events: Events = .{};
     const fired = try sp.onTimeout(.client, timer.at, .{}, &timeout_events);
     try testing.expectEqual(TimeoutKind.loss, fired.kind);
-    try testing.expectEqualSlices(u64, &.{0}, timeout_events.lostPackets());
+    try expectNumbers(timeout_events.lostPackets(), &.{0});
     try testing.expectEqual(@as(usize, 0), sp.sent_len);
     try testing.expectEqual(TimerKind.none, sp.nextTimer(.{}).kind);
 }
@@ -632,7 +708,7 @@ test "RFC 9002 §6.1, a reordered ACK supersedes nothing and samples nothing" {
     };
     var events: Events = .{};
     try sp.onAckReceived(&ack2, ms(200), .{}, &events);
-    try testing.expectEqualSlices(u64, &.{ 0, 1, 2 }, events.ackedPackets());
+    try expectNumbers(events.ackedPackets(), &.{ 0, 1, 2 });
     try testing.expectEqual(@as(u64, 2), sp.largest_acked.?);
     try testing.expectEqual(ms(190), h.conn.rtt.latest);
 
@@ -656,7 +732,7 @@ test "RFC 9002 §6.1, a reordered ACK supersedes nothing and samples nothing" {
 test "RFC 9002 §6.2.1, the PTO period, its backoff, and its reset" {
     var h: Harness = .{};
     var sp = h.space();
-    h.conn.rtt.onSample(ms(80), 0, .{}); // smoothed 80, variance 40
+    h.conn.rtt.onSample(0, ms(80), 0, .{}); // smoothed 80, variance 40
     try sp.onPacketSent(0, ms(10), true, true, 1200);
 
     // 80 + max(4*40, 1) = 240ms after the packet was sent.
@@ -789,8 +865,8 @@ test "a fixed event sequence produces exactly one loss set" {
     };
     var events: Events = .{};
     try sp.onAckReceived(&ack5, ms(110), .{}, &events);
-    try testing.expectEqualSlices(u64, &.{5}, events.ackedPackets());
-    try testing.expectEqualSlices(u64, &.{ 0, 1, 2 }, events.lostPackets());
+    try expectNumbers(events.ackedPackets(), &.{5});
+    try expectNumbers(events.lostPackets(), &.{ 0, 1, 2 });
     try testing.expectEqual(@as(u32, 1000 + 1001 + 1002), events.lost_bytes);
 
     // A reordered ACK for 3 and 4 arrives: one range covering both.
@@ -804,7 +880,7 @@ test "a fixed event sequence produces exactly one loss set" {
     };
     var second: Events = .{};
     try sp.onAckReceived(&ack34, ms(150), .{}, &second);
-    try testing.expectEqualSlices(u64, &.{ 3, 4 }, second.ackedPackets());
+    try expectNumbers(second.ackedPackets(), &.{ 3, 4 });
     try testing.expectEqual(@as(usize, 0), second.lost_len);
     try testing.expectEqual(@as(usize, 0), sp.sent_len);
 
@@ -850,4 +926,92 @@ test "RFC 9000 §19.3.1, an ACK is read through its ranges" {
     try testing.expect(ackedBy(&ack, 5));
     try testing.expect(!ackedBy(&ack, 4));
     try testing.expect(!ackedBy(&ack, 11));
+}
+
+test "RFC 9002 §7.6.1, the persistent congestion duration always includes max_ack_delay" {
+    var rtt: Rtt = .{};
+    rtt.smoothed = ms(1);
+    rtt.variance = 0;
+    // 1ms + max(0, 1ms granularity) + 1ms, times the threshold of 3.
+    try testing.expectEqual(ms(9), persistentPeriod(&rtt, ms(1)));
+    // With no delay it is the PTO base without the space's own max_ack_delay
+    // exemption: 2ms * 3.
+    try testing.expectEqual(ms(6), persistentPeriod(&rtt, 0));
+}
+
+test "RFC 9002 §7.6.3, the worked example declares persistent congestion" {
+    var h: Harness = .{};
+    var sp = h.space();
+
+    // The example assumes smoothed_rtt + max(4*rttvar, kGranularity) +
+    // max_ack_delay = 2ms. Pin that: smoothed 1ms, no variance, and the 1ms
+    // granularity fills the rest.
+    h.conn.rtt.smoothed = ms(1);
+    h.conn.rtt.variance = 0;
+    h.conn.rtt.latest = ms(1);
+    h.conn.rtt.first = true;
+    h.conn.rtt.first_sample_time = 0;
+
+    // Packets #1 through #9 at the table's send times.
+    const times = [_]u64{ 0, 1, 2, 3, 4, 5, 6, 8, 12 };
+    for (times, 0..) |time, i| try sp.onPacketSent(i, ms(time), true, true, 1200);
+
+    // t=1.2: #1 is acknowledged.
+    const ack1: frame.Ack = .{
+        .largest = 0,
+        .delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .bytes = &.{},
+        .ecn = null,
+    };
+    var events: Events = .{};
+    try sp.onAckReceived(&ack1, ms(1) + 200_000, .{}, &events);
+    try testing.expect(!events.persistent_congestion);
+
+    // t=12.2: #9 is acknowledged, and #2 through #8 are declared lost.
+    const ack9: frame.Ack = .{
+        .largest = 8,
+        .delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .bytes = &.{},
+        .ecn = null,
+    };
+    try sp.onAckReceived(&ack9, ms(12) + 200_000, .{}, &events);
+    try expectNumbers(events.ackedPackets(), &.{8});
+    try expectNumbers(events.lostPackets(), &.{ 1, 2, 3, 4, 5, 6, 7 });
+    // The period is 8 - 1 = 7ms, and the §7.6.1 duration is 6ms at most.
+    try testing.expect(events.persistent_congestion);
+}
+
+test "RFC 9002 §7.6.2, a run that is too quick is not persistent congestion" {
+    var h: Harness = .{};
+    var sp = h.space();
+    h.conn.rtt.smoothed = ms(1);
+    h.conn.rtt.variance = 0;
+    h.conn.rtt.latest = ms(1);
+    h.conn.rtt.first = true;
+    h.conn.rtt.first_sample_time = 0;
+
+    // Four packets a millisecond apart. The acknowledgment arrives one
+    // millisecond after the newest was sent, so the estimator is a fixed point
+    // at 1ms, the loss delay is 1.125ms, and the ack at 4ms declares the first
+    // three lost by time. Their span is 2ms; the duration is
+    // (1 + 1 + 0) * 3 = 6ms.
+    var i: u64 = 0;
+    while (i < 4) : (i += 1) try sp.onPacketSent(i, ms(i), true, true, 1200);
+
+    const ack: frame.Ack = .{
+        .largest = 3,
+        .delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .bytes = &.{},
+        .ecn = null,
+    };
+    var events: Events = .{};
+    try sp.onAckReceived(&ack, ms(4), .{}, &events);
+    try expectNumbers(events.lostPackets(), &.{ 0, 1, 2 });
+    try testing.expect(!events.persistent_congestion);
 }

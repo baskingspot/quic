@@ -27,6 +27,11 @@ All notable changes to quic are recorded here. The format follows
 - `InitialSpace` is no longer exported from the package. It is an Initial-level
   prototype, and the per-space type that replaces it will own the state
   `Recovery` already has.
+- `Congestion` is the NewReno part of RFC 9002 §7 that is about correctness:
+  bytes in flight, the §7.2 initial and minimum window, slow start, congestion
+  avoidance with a carried residue, and one window reduction per recovery
+  period. `onPacketsLost` returns the recovery period's start, so a test can
+  assert one loss episode halves the window once instead of inferring it.
 - `Recovery` splits into the connection-wide state (`rtt`, `pto_count`) and a
   `Space` per packet number space, over caller-owned sent-packet storage, so a
   full table is `error.NoSpace` and never a forgotten packet.
@@ -34,8 +39,11 @@ All notable changes to quic are recorded here. The format follows
   estimation with the A.7 update order, the packet and time thresholds, and the
   probe timeout with backoff and the client's two-probe rule. No congestion
   control (§7), no timers of its own, no I/O. `SentPacket` carries
-  `sent_bytes` and the events carry byte totals, which is what a controller
-  reads.
+  `sent_bytes`, and the events carry the records plus byte totals, which is what
+  a controller reads.
+- `Recovery` now decides persistent congestion (RFC 9002 §7.6.2) and reports it
+  with the loss event, using the §7.6.1 duration that always includes
+  `max_ack_delay`.
 - `InitialSpace` is the Initial-level driver: it derives both Initial keys from
   the connection ID, seals and opens Initial packets, tracks the packet number
   in each direction, and turns what it received into an ACK frame. It is not a
