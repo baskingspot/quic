@@ -41,7 +41,7 @@ pub const Suite = enum {
     /// 32 bytes of a longer secret.
     pub fn secretLength(self: Suite) usize {
         _ = self;
-        return hkdf.secret_length;
+        return secret_length;
     }
 
     /// The AEAD key and header protection key length for the suite (§5.1).
