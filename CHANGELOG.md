@@ -24,3 +24,7 @@ All notable changes to quic are recorded here. The format follows
 - `error_code` has the RFC 9000 §20.1 transport codes, the CRYPTO_ERROR block,
   and `error_code.forFrameError`, which names the code that closes a connection
   over a frame that will not decode.
+- `TransportParameters` reads and writes every RFC 9000 §18.2 parameter,
+  including `preferred_address`. It refuses a duplicate, an out-of-range value,
+  and a server-only parameter sent by a client, and it ignores a parameter this
+  version does not define.

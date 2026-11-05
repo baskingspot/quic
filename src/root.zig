@@ -16,6 +16,7 @@ pub const error_code = @import("error_code.zig");
 pub const frame = @import("frame.zig");
 pub const packet = @import("packet.zig");
 pub const packet_number = @import("packet_number.zig");
+pub const TransportParameters = @import("TransportParameters.zig");
 pub const varint = @import("varint.zig");
 
 test {
@@ -25,5 +26,6 @@ test {
     _ = frame;
     _ = packet;
     _ = packet_number;
+    _ = TransportParameters;
     _ = varint;
 }
