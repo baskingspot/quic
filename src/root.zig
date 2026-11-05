@@ -6,9 +6,18 @@
 //! own. Nothing here opens a socket, keeps a clock, or allocates: an
 //! allocator never enters the API, so a caller sees every byte it pays for.
 //!
-//! This is RFC 9000, the transport. Packet protection is RFC 9001 and lives in
-//! `baskingspot/tls`; every codec here reads and writes plaintext, so a caller
-//! does the unprotect step before handing bytes over.
+//! This is RFC 9000, the transport, plus the Initial half of RFC 9001. The
+//! codecs read and write plaintext and know nothing about keys; `protection`
+//! is the layer that seals a packet, masks its header, and opens the other
+//! side's, and it is in this package rather than in `baskingspot/tls` because
+//! Initial keys come from the connection ID and need no handshake. The traffic
+//! secrets for every other encryption level come from tls, and the handshake
+//! that produces them is a separate gate.
+//!
+//! The two layers compose in one direction only: build frames, seal them, mask
+//! the header; then unmask, open, and read frames. `Recovery` sits beside them
+//! with the packet numbers, the RTT, and the loss set, and takes its clock from
+//! the caller.
 
 pub const Cursor = @import("Cursor.zig");
 pub const Writer = @import("Writer.zig");

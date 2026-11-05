@@ -190,6 +190,34 @@ loss event (quinn's shape), or `Congestion` takes the raw fields and decides.
 quinn's split is better because the RTT estimator and the sent packets are
 already there.
 
+## Scope options
+
+Three sizes. The middle one is what I would build.
+
+| | Contains | Excludes | Size |
+| --- | --- | --- | --- |
+| **Minimum** | bytes in flight, recovery period on sent time, `cwnd = max(cwnd/2, 2*mds)`, slow start, congestion avoidance with a residue | persistent congestion, pacing, app-limited | ~120 lines, ~8 tests |
+| **Recommended** | the above, plus persistent congestion decided in `Recovery` and handed to the controller as a boolean (§7.6), with the run starting after the first RTT sample and the connection's PTO used as the period | pacing, app-limited, ECN | ~180 lines, ~14 tests |
+| **Full** | the above, plus a `pacingRate()` the caller may use (3/2 in slow start, 5/4 in avoidance, `rate = gain * cwnd / smoothed_rtt`), an `app_limited` flag the caller sets, and an `onEcnCe()` hook | a send loop, a clock, ECN validation, BBR, PRR | ~260 lines, ~20 tests |
+
+What no option includes, because we own no socket and no clock: a send loop, a
+pacer's timers, ECN validation state, or HyStart++. The Full option computes a
+rate; it does not act on one.
+
+Two decisions the lead should make explicitly:
+
+1. **Persistent congestion or not.** Two of the four stacks surveyed skip it.
+   Including it means a blackout recovers to the initial window instead of
+   staying at the floor forever; excluding it is defensible and halves the
+   surface. I recommend including it, in `Recovery`, because the sent times and
+   the PTO are already there.
+2. **Where `bytes_in_flight` lives.** A controller that owns a counter and a
+   `Recovery.Space` that owns sent packets can disagree. Either the controller
+   is handed the number by whoever owns the packets, or it keeps its own and we
+   accept two counters. I recommend the first: the connection passes
+   `bytes_in_flight` into `onPacketSent`/`onAck`/`onLoss`, exactly as quiche's
+   `CongestionControlOps` does.
+
 ## 4. ECN
 
 Who actually implements it:
