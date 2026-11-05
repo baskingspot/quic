@@ -10,6 +10,11 @@ default:
 test:
     zig build test --summary all
 
+[doc("Fuzz the codecs with an iteration budget, for example `just fuzz 50M`. A budget is required: without one the build runner opens a web UI and waits")]
+[group("test")]
+fuzz LIMIT="10M":
+    zig build test -Doptimize=ReleaseSafe --fuzz={{ LIMIT }}
+
 [doc("Lint Zig, Nix, Markdown, the workflows, and this justfile: ziglint, zig fmt, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]
 lint:

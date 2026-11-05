@@ -8,7 +8,57 @@ QUIC in Zig: sans-I/O packet and frame codecs, transport parameters, and the los
 
 ## Environment
 
-Zig 0.16 only. The flake is the tool contract, from `baskingspot/nix`: `nix develop` provides Zig, `ziglint`, and the base tools, and nothing comes from the system PATH. The justfile is the command interface: `just test`, `just lint`, `just ci`. Run `just fmt` before you commit.
+Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix develop` provides Zig, `ziglint`, and the base tools, and nothing comes from the system PATH. The justfile is the command interface: `just test`, `just lint`, `just fuzz`, `just ci`. Run `just fmt` before you commit.
+
+## Design
+
+- Sans-I/O, no allocator. Nothing here opens a socket, holds a clock, or
+  allocates. A decoder takes bytes and returns borrowed slices or fills
+  caller-owned storage; an encoder fills a caller-owned buffer. An allocator
+  never appears in the API, so a caller sees every byte it pays for.
+- Two byte walkers and only two. `src/Cursor.zig` reads, `src/Writer.zig`
+  writes, both over caller storage with a `u32` position. Every codec uses
+  them. Do not add a third or a local position type.
+- The writer hands back offsets. A packet header's Length field sits before
+  the payload it counts, so a header writer returns the offset of that field
+  and the caller patches it with `Writer.patch` once the payload exists.
+- Plaintext only. Packet protection is RFC 9001, it lives in
+  `baskingspot/tls`, and every codec here reads and writes unprotected bytes.
+  Do not stub a crypto path, and do not add one: header protection and AEAD
+  come from tls or std, never from a new implementation here.
+- The TLS handshake is not in this repo. HTTP/3 and QPACK are not either.
+  This is RFC 9000: packets, frames, transport parameters, and the loss
+  recovery loop.
+- Error sets are explicit and per codec. A decoder distinguishes `Truncated`
+  (the buffer ended inside a field) from a protocol violation (`NonMinimal`,
+  `InvalidAckRange`), because the caller's response differs: one waits for
+  more bytes, the other closes the connection.
+- A parse leaves the cursor where it found it on every error. Partial reads
+  that move the position are how a caller ends up retrying from the middle of
+  a varint.
+- Tests cite the RFC section they pin, in the comment above the test. A
+  codec with a loop gets a `std.testing.fuzz` target with a corpus. Rejecting
+  hostile input is the job, not a hardening pass: a 62-bit length field, a
+  zero-length connection ID, or an ACK range that underflows is an error path
+  with a test.
+- RFC text lives in `docs/research/rfcs/`. When the code and the RFC seem to
+  disagree, read the RFC again before changing the code.
+
+## Fuzzing
+
+`just fuzz 5M` runs every `std.testing.fuzz` target under the build runner's
+fuzz mode with an iteration budget. The budget is required: without one the
+runner opens a web UI and waits.
+
+Two traps on Zig 0.17.0, both hit while wiring this up:
+
+- Do not call `Run.addPassthruArgs` on the test step. It forwards `--fuzz=`
+  to the test runner, which rejects it with `panic: reached unreachable code`
+  and no stack trace. `b.args` is gone in 0.17, so the fuzz step simply does
+  not forward arguments.
+- Do not set `.fuzz = true` on the module. That path segfaults in the runner
+  (`fuzzer_new_input` reads uninitialized state) even on a trivial project.
+  `zig build test --fuzz=N` sets what the runner needs.
 
 ## Rules
 
