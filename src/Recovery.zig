@@ -1,16 +1,27 @@
 //! Loss detection and round-trip estimation, RFC 9002 §5 and §6.
 //!
-//! Two things live here: the RTT estimator from §5, and per-packet-number-space
-//! loss detection from §6, for one space. There is no congestion control (§7),
-//! no stream or connection state, and no I/O: the caller supplies the clock as
-//! a `Duration` and the events as packet numbers.
+//! Two levels of state, because the RFC has two: `Recovery` holds what belongs
+//! to the connection, and `Space` holds what belongs to one packet number sp.
+//!
+//! - The RTT estimator is a property of the path, not of a space: Appendix A.2
+//!   lists `latest_rtt`, `smoothed_rtt` and `rttvar` as connection variables.
+//!   It lives in `Recovery`.
+//! - `pto_count` is also connection-wide. A.8 doubles the timeout on every
+//!   expiry and says the exponential increase "occurs across all spaces", so two
+//!   spaces sharing a connection share one backoff, not two.
+//! - Sent packets, `largest_acked`, the time threshold and the time of the last
+//!   ack-eliciting packet are per space (A.1, A.8).
+//!
+//! The sent-packet storage is the caller's. `Space` keeps a slice the caller
+//! supplies at `Recovery.space`, so the capacity is the connection's decision
+//! and a full table is an error the caller sees, not a packet silently forgotten.
 //!
 //! The order of operations follows the pseudocode in Appendix A, which is the
 //! normative form: A.7 for an acknowledgment, A.8 for the timer, A.9 for a
 //! timeout, A.10 for the loss set. Where §5.3 lists the smoothed-RTT update
 //! before the variance update and A.7 lists it after, this follows A.7, so the
 //! variance is computed from the previous smoothed RTT. That is also what
-//! RFC 6298 does, and it is what every implementation in the field computes.
+//! RFC 6298 does.
 //!
 //! Durations are nanoseconds in a `u64`. The RTT smoothing divides by 8 and the
 //! variance by 4, so a measurement that is not a multiple of those loses
@@ -50,18 +61,13 @@ pub const granularity: Duration = ms(1);
 /// be set to 333 milliseconds."
 pub const initial_rtt: Duration = ms(333);
 
-/// How many sent packets this driver tracks. Enough for the Initial level; past
-/// it, the oldest unacknowledged packet is forgotten, which is the same thing
-/// as declaring it lost without reporting it.
-pub const max_in_flight = 64;
-
 /// Which endpoint is asking, for the two places §6.2 treats them differently.
 pub const Side = enum { client, server };
 
 pub const Options = struct {
     /// The peer's `max_ack_delay`. §6.2.1 sets it to zero for the Initial and
-    /// Handshake spaces and this driver only has the Initial space, so the PTO
-    /// ignores it; the RTT estimator uses it after handshake confirmation.
+    /// Handshake spaces, so a space's PTO ignores it; the RTT estimator uses it
+    /// after handshake confirmation.
     max_ack_delay: Duration = 0,
     /// §5.3: the peer's `max_ack_delay` limits a reported delay only after the
     /// handshake is confirmed.
@@ -71,12 +77,42 @@ pub const Options = struct {
     peer_address_validated: bool = true,
 };
 
-/// The sent packets a call reported, with their numbers.
+pub const Error = error{
+    /// The caller's sent-packet storage has no room for another packet. The
+    /// caller owns that storage and must size it for the connection.
+    NoSpace,
+    /// §19.3.1 of RFC 9000: the ACK's ranges do not describe packet numbers.
+    InvalidAckRange,
+};
+
+pub const TimerKind = enum { none, loss, probe };
+pub const TimeoutKind = enum { loss, probe };
+
+/// A timer the caller should set, or the absence of one.
+pub const Timer = struct {
+    kind: TimerKind,
+    /// When it should fire. Meaningless when `kind` is `.none`.
+    at: Duration = 0,
+};
+
+/// What a timeout asked for.
+pub const Timeout = struct {
+    kind: TimeoutKind,
+    /// How many ack-eliciting packets to send for a probe (§6.2.4). Zero for a
+    /// loss timeout, whose packets are in `Events.lost`.
+    probes: u8 = 0,
+};
+
+/// The sent packets a call reported, with their numbers and byte counts. The
+/// byte totals are what a congestion controller needs and are not derivable from
+/// the numbers.
 pub const Events = struct {
-    acked: [max_in_flight]u64 = @splat(0),
+    acked: [64]u64 = @splat(0),
     acked_len: usize = 0,
-    lost: [max_in_flight]u64 = @splat(0),
+    acked_bytes: u32 = 0,
+    lost: [64]u64 = @splat(0),
     lost_len: usize = 0,
+    lost_bytes: u32 = 0,
 
     pub fn ackedPackets(self: *const Events) []const u64 {
         return self.acked[0..self.acked_len];
@@ -88,19 +124,23 @@ pub const Events = struct {
 
     fn clear(self: *Events) void {
         self.acked_len = 0;
+        self.acked_bytes = 0;
         self.lost_len = 0;
+        self.lost_bytes = 0;
     }
 
-    fn pushAcked(self: *Events, pn: u64) void {
+    fn pushAcked(self: *Events, packet: SentPacket) void {
         std.debug.assert(self.acked_len < self.acked.len);
-        self.acked[self.acked_len] = pn;
+        self.acked[self.acked_len] = packet.packet_number;
         self.acked_len += 1;
+        self.acked_bytes += packet.sent_bytes;
     }
 
-    fn pushLost(self: *Events, pn: u64) void {
+    fn pushLost(self: *Events, packet: SentPacket) void {
         std.debug.assert(self.lost_len < self.lost.len);
-        self.lost[self.lost_len] = pn;
+        self.lost[self.lost_len] = packet.packet_number;
         self.lost_len += 1;
+        self.lost_bytes += packet.sent_bytes;
     }
 };
 
@@ -110,6 +150,9 @@ pub const SentPacket = struct {
     time_sent: Duration,
     ack_eliciting: bool,
     in_flight: bool,
+    /// §7.1 counts bytes in flight, and a congestion controller needs the size
+    /// of the packet it is being told about.
+    sent_bytes: u32,
 };
 
 /// The RTT estimator of §5.
@@ -126,12 +169,7 @@ pub const Rtt = struct {
 
     /// §5.3 read through A.7's pseudocode. `ack_delay` is already scaled by the
     /// peer's `ack_delay_exponent`; the caller decodes it from the ACK frame.
-    pub fn onSample(
-        self: *Rtt,
-        latest: Duration,
-        ack_delay: Duration,
-        options: Options,
-    ) void {
+    pub fn onSample(self: *Rtt, latest: Duration, ack_delay: Duration, options: Options) void {
         if (!self.first) {
             // §5.3: "On the first RTT sample after initialization, the
             // estimator is reset using that sample", and the acknowledgment
@@ -185,216 +223,217 @@ pub const Rtt = struct {
     }
 };
 
-pub const TimerKind = enum { none, loss, probe };
-pub const TimeoutKind = enum { loss, probe };
-
-/// A timer the caller should set, or the absence of one.
-pub const Timer = struct {
-    kind: TimerKind,
-    /// When it should fire. Meaningless when `kind` is `.none`.
-    at: Duration = 0,
-};
-
-/// What a timeout asked for.
-pub const Timeout = struct {
-    kind: TimeoutKind,
-    /// How many ack-eliciting packets to send for a probe (§6.2.4). Zero for a
-    /// loss timeout, whose packets are in `Events.lost`.
-    probes: u8 = 0,
-};
-
+/// The connection-wide half of loss recovery: everything the RFC measures per
+/// path rather than per packet number space (A.2, A.8).
 rtt: Rtt = .{},
-sent: [max_in_flight]SentPacket = undefined,
-sent_len: usize = 0,
-largest_acked: ?u64 = null,
-/// §6.2.1: doubles the PTO period on each timeout and resets on an
-/// acknowledgment that validates the peer's address.
+/// §6.2.1: doubles the PTO period on each timeout, across every space, and
+/// resets on an acknowledgment that validates the peer's address.
 pto_count: u5 = 0,
-/// §6.1.2: the earliest time an unacknowledged packet becomes lost, once a
-/// later packet is acknowledged. Zero means none.
-loss_time: Duration = 0,
-/// When the last ack-eliciting packet in flight was sent (§6.2.1).
-last_ack_eliciting: Duration = 0,
 
-/// Note a packet that was sent. `in_flight` is false for a packet that carries
-/// only frames congestion control does not count; this driver still tracks it
-/// for loss detection, because §6.1 only exempts it from the loss set when it
-/// is not in flight.
-pub fn onPacketSent(
-    self: *Recovery,
-    packet_number: u64,
-    now: Duration,
-    ack_eliciting: bool,
-    in_flight: bool,
-) void {
-    if (self.sent_len == self.sent.len) {
-        // Forget the oldest; it is the one already past every threshold.
-        @memmove(self.sent[0 .. self.sent.len - 1], self.sent[1..]);
+/// A per-space loss detector over caller-owned sent-packet storage.
+///
+/// `sent` must outlive the sp. Size it for the connection: a packet that
+/// cannot be recorded is a packet whose frames are never retransmitted, so this
+/// returns `error.NoSpace` rather than dropping one.
+pub fn space(self: *Recovery, sent: []SentPacket) Space {
+    return .{ .shared = self, .sent = sent };
+}
+
+/// The per-space half of loss recovery: the sent packets, the largest number
+/// acknowledged, and the timers that depend on them.
+pub const Space = struct {
+    shared: *Recovery,
+    sent: []SentPacket,
+    sent_len: usize = 0,
+    largest_acked: ?u64 = null,
+    /// §6.1.2: the earliest time an unacknowledged packet becomes lost, once a
+    /// later packet is acknowledged. Zero means none.
+    loss_time: Duration = 0,
+    /// When the last ack-eliciting packet in flight in this space was sent
+    /// (§6.2.1).
+    last_ack_eliciting: Duration = 0,
+
+    pub fn rtt(self: *const Space) *const Rtt {
+        return &self.shared.rtt;
+    }
+
+    /// The packet numbers this space is still accounting for.
+    pub fn inFlight(self: *const Space) []const SentPacket {
+        return self.sent[0..self.sent_len];
+    }
+
+    /// Note a packet that was sent. `in_flight` is false for a packet that
+    /// carries only frames congestion control does not count; this driver still
+    /// tracks it for loss detection, because §6.1 only exempts it from the loss
+    /// set when it is not in flight.
+    pub fn onPacketSent(
+        self: *Space,
+        packet_number: u64,
+        now: Duration,
+        ack_eliciting: bool,
+        in_flight: bool,
+        sent_bytes: u32,
+    ) Error!void {
+        if (self.sent_len == self.sent.len) return error.NoSpace;
+        self.sent[self.sent_len] = .{
+            .packet_number = packet_number,
+            .time_sent = now,
+            .ack_eliciting = ack_eliciting,
+            .in_flight = in_flight,
+            .sent_bytes = sent_bytes,
+        };
+        self.sent_len += 1;
+        if (ack_eliciting and in_flight) self.last_ack_eliciting = now;
+    }
+
+    /// Handle an acknowledgment: the RTT sample, the newly acknowledged
+    /// packets, and the packets the acknowledgment declares lost (§6.1, A.7).
+    ///
+    /// The caller has already refused an ACK that names a packet never sent, and
+    /// has scaled the ACK's delay field by its own `ack_delay_exponent`.
+    pub fn onAckReceived(
+        self: *Space,
+        ack: *const frame.Ack,
+        now: Duration,
+        options: Options,
+        events: *Events,
+    ) Error!void {
+        events.clear();
+
+        self.largest_acked = if (self.largest_acked) |largest|
+            @max(largest, ack.largest)
+        else
+            ack.largest;
+
+        var index: usize = 0;
+        var acked_largest_eliciting = false;
+        var largest_was_new = false;
+        var largest_send_time: Duration = 0;
+        while (index < self.sent_len) {
+            const packet = self.sent[index];
+            if (!ackedBy(ack, packet.packet_number)) {
+                index += 1;
+                continue;
+            }
+            if (packet.ack_eliciting) acked_largest_eliciting = true;
+            if (packet.packet_number == ack.largest) {
+                largest_was_new = true;
+                largest_send_time = packet.time_sent;
+            }
+            events.pushAcked(packet);
+            self.remove(index);
+        }
+
+        if (events.acked_len == 0) return;
+
+        // §5.1: a sample only from a newly acknowledged largest packet, and only
+        // when at least one newly acknowledged packet was ack-eliciting.
+        if (largest_was_new and acked_largest_eliciting) {
+            const latest = if (now >= largest_send_time) now - largest_send_time else 0;
+            self.shared.rtt.onSample(latest, ack.delay, options);
+        }
+
+        self.detectLost(now, events);
+
+        // §6.2.1: an acknowledgment resets the PTO backoff, unless this is a
+        // client that does not know the server has validated its address.
+        if (options.peer_address_validated) self.shared.pto_count = 0;
+    }
+
+    /// §6.1 and A.10: the packets this space now calls lost, and the time the
+    /// rest become lost if nothing else is acknowledged.
+    fn detectLost(self: *Space, now: Duration, events: *Events) void {
+        self.loss_time = 0;
+        const largest = self.largest_acked orelse return;
+
+        const delay = self.shared.rtt.lossDelay();
+        // A.10: "Packets sent before this time are deemed lost."
+        const lost_send_time = if (now > delay) now - delay else 0;
+
+        var index: usize = 0;
+        while (index < self.sent_len) {
+            const packet = self.sent[index];
+            if (packet.packet_number > largest) {
+                index += 1;
+                continue;
+            }
+            // A.10: the time threshold, or three packets newer already acked.
+            const lost_by_time = packet.time_sent <= lost_send_time and now >= delay;
+            const lost_by_packet = largest >= packet.packet_number + packet_threshold;
+            if (lost_by_time or lost_by_packet) {
+                events.pushLost(packet);
+                self.remove(index);
+                continue;
+            }
+            const candidate = packet.time_sent + delay;
+            if (self.loss_time == 0 or candidate < self.loss_time) self.loss_time = candidate;
+            index += 1;
+        }
+    }
+
+    /// The timer the caller should set after any event (§6.1.2 and §6.2.1, A.8).
+    pub fn nextTimer(self: *Space, options: Options) Timer {
+        if (self.loss_time != 0) return .{ .kind = .loss, .at = self.loss_time };
+
+        // A.8: with nothing ack-eliciting in flight, and a peer whose address is
+        // validated, there is nothing to time out.
+        if (!self.ackElicitingInFlight() and options.peer_address_validated) {
+            return .{ .kind = .none };
+        }
+
+        // §6.2.1: the period doubles with each timeout. The count is the
+        // connection's, so a timeout in one space lengthens the next in every
+        // other one.
+        const backoff: u64 = @as(u64, 1) << @intCast(self.shared.pto_count);
+        const duration = self.shared.rtt.ptoBase() * backoff;
+        return .{ .kind = .probe, .at = self.last_ack_eliciting + duration };
+    }
+
+    /// Handle the timer firing (§6.2, A.9). Either the time threshold declared
+    /// packets lost, or this is a probe timeout.
+    pub fn onTimeout(
+        self: *Space,
+        side: Side,
+        now: Duration,
+        options: Options,
+        events: *Events,
+    ) Error!Timeout {
+        events.clear();
+
+        if (self.loss_time != 0) {
+            self.detectLost(now, events);
+            return .{ .kind = .loss };
+        }
+
+        // A.9: a client with nothing in flight arms a probe anyway, to unblock a
+        // server that may be waiting on its address validation.
+        const anti_deadlock = !self.ackElicitingInFlight() and !options.peer_address_validated;
+
+        // §6.2.4: two ack-eliciting packets are allowed, and a client that has
+        // not confirmed the handshake sends two to survive one more loss.
+        const probes: u8 = if (anti_deadlock)
+            1
+        else if (side == .client and !options.handshake_confirmed)
+            2
+        else
+            1;
+
+        self.shared.pto_count +|= 1;
+        return .{ .kind = .probe, .probes = probes };
+    }
+
+    fn ackElicitingInFlight(self: *const Space) bool {
+        for (self.sent[0..self.sent_len]) |packet| {
+            if (packet.ack_eliciting and packet.in_flight) return true;
+        }
+        return false;
+    }
+
+    fn remove(self: *Space, index: usize) void {
+        @memmove(self.sent[index .. self.sent_len - 1], self.sent[index + 1 .. self.sent_len]);
         self.sent_len -= 1;
     }
-    self.sent[self.sent_len] = .{
-        .packet_number = packet_number,
-        .time_sent = now,
-        .ack_eliciting = ack_eliciting,
-        .in_flight = in_flight,
-    };
-    self.sent_len += 1;
-    if (ack_eliciting and in_flight) self.last_ack_eliciting = now;
-}
-
-/// Handle an acknowledgment: the RTT sample, the newly acknowledged packets,
-/// and the packets the acknowledgment declares lost (§6.1, A.7).
-///
-/// The caller has already refused an ACK that names a packet never sent, and
-/// has scaled the ACK's delay field by its own `ack_delay_exponent`.
-pub fn onAckReceived(
-    self: *Recovery,
-    ack: *const frame.Ack,
-    now: Duration,
-    options: Options,
-    events: *Events,
-) Error!void {
-    events.clear();
-
-    self.largest_acked = if (self.largest_acked) |largest|
-        @max(largest, ack.largest)
-    else
-        ack.largest;
-
-    // Newly acknowledged: everything in the ranges the caller sent.
-    var index: usize = 0;
-    var acked_largest_eliciting = false;
-    var largest_was_new = false;
-    var largest_send_time: Duration = 0;
-    while (index < self.sent_len) {
-        const packet = self.sent[index];
-        if (!ackedBy(ack, packet.packet_number)) {
-            index += 1;
-            continue;
-        }
-        if (packet.ack_eliciting) acked_largest_eliciting = true;
-        if (packet.packet_number == ack.largest) {
-            largest_was_new = true;
-            largest_send_time = packet.time_sent;
-        }
-        events.pushAcked(packet.packet_number);
-        remove(self, index);
-    }
-
-    if (events.acked_len == 0) return;
-
-    // §5.1: a sample only from a newly acknowledged largest packet, and only
-    // when at least one newly acknowledged packet was ack-eliciting.
-    if (largest_was_new and acked_largest_eliciting) {
-        const latest = if (now >= largest_send_time) now - largest_send_time else 0;
-        self.rtt.onSample(latest, ack.delay, options);
-    }
-
-    self.detectLost(now, events);
-
-    // §6.2.1: an acknowledgment resets the PTO backoff, unless this is a client
-    // that does not know the server has validated its address.
-    if (options.peer_address_validated) self.pto_count = 0;
-}
-
-/// §6.1 and A.10: the packets this side now calls lost, and the time the rest
-/// become lost if nothing else is acknowledged.
-fn detectLost(self: *Recovery, now: Duration, events: *Events) void {
-    self.loss_time = 0;
-    const largest = self.largest_acked orelse return;
-
-    const delay = self.rtt.lossDelay();
-    // A.10: "Packets sent before this time are deemed lost."
-    const lost_send_time = if (now > delay) now - delay else 0;
-
-    var index: usize = 0;
-    while (index < self.sent_len) {
-        const packet = self.sent[index];
-        if (packet.packet_number > largest) {
-            index += 1;
-            continue;
-        }
-        // A.10: the time threshold, or three packets newer already acked.
-        const lost_by_time = packet.time_sent <= lost_send_time and now >= delay;
-        const lost_by_packet = largest >= packet.packet_number + packet_threshold;
-        if (lost_by_time or lost_by_packet) {
-            events.pushLost(packet.packet_number);
-            remove(self, index);
-            continue;
-        }
-        const candidate = packet.time_sent + delay;
-        if (self.loss_time == 0 or candidate < self.loss_time) self.loss_time = candidate;
-        index += 1;
-    }
-}
-
-/// The timer the caller should set after any event (§6.1.2 and §6.2.1, A.8).
-pub fn nextTimer(self: *Recovery, options: Options) Timer {
-    if (self.loss_time != 0) return .{ .kind = .loss, .at = self.loss_time };
-
-    // A.8: with nothing ack-eliciting in flight, and a peer whose address is
-    // validated, there is nothing to time out.
-    if (!self.ackElicitingInFlight() and options.peer_address_validated) {
-        return .{ .kind = .none };
-    }
-
-    // §6.2.1: the period doubles with each timeout.
-    const backoff: u64 = @as(u64, 1) << self.pto_count;
-    const duration = self.rtt.ptoBase() * backoff;
-    return .{ .kind = .probe, .at = self.last_ack_eliciting + duration };
-}
-
-/// Handle the timer firing (§6.2, A.9). Either the time threshold declared
-/// packets lost, or this is a probe timeout.
-pub fn onTimeout(
-    self: *Recovery,
-    side: Side,
-    now: Duration,
-    options: Options,
-    events: *Events,
-) Error!Timeout {
-    events.clear();
-
-    if (self.loss_time != 0) {
-        self.detectLost(now, events);
-        return .{ .kind = .loss };
-    }
-
-    // A.9: a client with nothing in flight arms a probe anyway, to unblock a
-    // server that may be waiting on its address validation.
-    const anti_deadlock = !self.ackElicitingInFlight() and !options.peer_address_validated;
-
-    // §6.2.4: two ack-eliciting packets are allowed, and a client that has not
-    // confirmed the handshake sends two to survive one more loss.
-    const probes: u8 = if (anti_deadlock)
-        1
-    else if (side == .client and !options.handshake_confirmed)
-        2
-    else
-        1;
-
-    self.pto_count +|= 1;
-    return .{ .kind = .probe, .probes = probes };
-}
-
-fn ackElicitingInFlight(self: *const Recovery) bool {
-    for (self.sent[0..self.sent_len]) |packet| {
-        if (packet.ack_eliciting and packet.in_flight) return true;
-    }
-    return false;
-}
-
-fn sendTimeOf(self: *const Recovery, packet_number: u64) ?Duration {
-    for (self.sent[0..self.sent_len]) |packet| {
-        if (packet.packet_number == packet_number) return packet.time_sent;
-    }
-    return null;
-}
-
-fn remove(self: *Recovery, index: usize) void {
-    @memmove(self.sent[index .. self.sent_len - 1], self.sent[index + 1 .. self.sent_len]);
-    self.sent_len -= 1;
-}
+};
 
 /// Whether an ACK frame acknowledges `packet_number`, walking its ranges.
 fn ackedBy(ack: *const frame.Ack, packet_number: u64) bool {
@@ -415,9 +454,13 @@ fn ackedBy(ack: *const frame.Ack, packet_number: u64) bool {
     return false;
 }
 
-pub const Error = error{
-    /// §19.3.1 of RFC 9000: the ACK's ranges do not describe packet numbers.
-    InvalidAckRange,
+const Harness = struct {
+    conn: Recovery = .{},
+    sent: [64]SentPacket = undefined,
+
+    fn space(self: *Harness) Space {
+        return self.conn.space(&self.sent);
+    }
 };
 
 test "RFC 9002 §5.3, one sample initializes the estimator and ignores the delay" {
@@ -504,17 +547,11 @@ test "RFC 9002 §6.1.2, the loss delay is 9/8 of the larger RTT and never rounds
 }
 
 test "RFC 9002 §6.1.1, the packet threshold declares three older packets lost" {
-    const Harness = struct {
-        fn send(recovery: *Recovery, first: u64, count: u64, now: Duration) void {
-            var i: u64 = 0;
-            while (i < count) : (i += 1) {
-                recovery.onPacketSent(first + i, now, true, true);
-            }
-        }
-    };
+    var h: Harness = .{};
+    var sp = h.space();
 
-    var recovery: Recovery = .{};
-    Harness.send(&recovery, 0, 6, ms(10));
+    var i: u64 = 0;
+    while (i < 6) : (i += 1) try sp.onPacketSent(i, ms(10), true, true, 1200);
 
     // Acknowledge nothing but packet 5, one RTT later.
     const ack: frame.Ack = .{
@@ -526,21 +563,25 @@ test "RFC 9002 §6.1.1, the packet threshold declares three older packets lost" 
         .ecn = null,
     };
     var events: Events = .{};
-    try recovery.onAckReceived(&ack, ms(20), .{}, &events);
+    try sp.onAckReceived(&ack, ms(20), .{}, &events);
 
     try testing.expectEqualSlices(u64, &.{5}, events.ackedPackets());
     // 5 >= 0+3, 5 >= 1+3, 5 >= 2+3; but 5 < 3+3 and 5 < 4+3.
     try testing.expectEqualSlices(u64, &.{ 0, 1, 2 }, events.lostPackets());
-    try testing.expectEqual(@as(usize, 2), recovery.sent_len);
+    // §7.1: the lost bytes are what a congestion controller reacts to.
+    try testing.expectEqual(@as(u32, 3 * 1200), events.lost_bytes);
+    try testing.expectEqual(@as(u32, 1200), events.acked_bytes);
+    try testing.expectEqual(@as(usize, 2), sp.sent_len);
     // §6.1.2: the rest become lost a loss delay after they were sent, and the
     // timer carries the earliest of them.
-    try testing.expectEqual(ms(10) + recovery.rtt.lossDelay(), recovery.loss_time);
+    try testing.expectEqual(ms(10) + h.conn.rtt.lossDelay(), sp.loss_time);
 }
 
 test "RFC 9002 §6.1.2, a gap is lost only by time" {
-    var recovery: Recovery = .{};
-    recovery.onPacketSent(0, 0, true, true);
-    recovery.onPacketSent(1, 0, true, true);
+    var h: Harness = .{};
+    var sp = h.space();
+    try sp.onPacketSent(0, 0, true, true, 1200);
+    try sp.onPacketSent(1, 0, true, true, 1200);
 
     const only_one: frame.Ack = .{
         .largest = 1,
@@ -554,31 +595,32 @@ test "RFC 9002 §6.1.2, a gap is lost only by time" {
     // Acknowledged 100ms after it was sent: the first sample sets smoothed to
     // 100ms and the variance to 50ms, so the loss delay is 9/8 of 100ms.
     var events: Events = .{};
-    try recovery.onAckReceived(&only_one, ms(100), .{}, &events);
+    try sp.onAckReceived(&only_one, ms(100), .{}, &events);
     try testing.expectEqualSlices(u64, &.{1}, events.ackedPackets());
     // One packet newer is acked, but the packet threshold needs three, and too
     // little time has passed for the time threshold.
     try testing.expectEqual(@as(usize, 0), events.lost_len);
-    try testing.expectEqual(ms(112) + 500_000, recovery.loss_time);
+    try testing.expectEqual(ms(112) + 500_000, sp.loss_time);
 
     // The timer carries that time, and firing it declares the gap lost.
-    const timer = recovery.nextTimer(.{});
+    const timer = sp.nextTimer(.{});
     try testing.expectEqual(TimerKind.loss, timer.kind);
-    try testing.expectEqual(recovery.loss_time, timer.at);
+    try testing.expectEqual(sp.loss_time, timer.at);
 
     var timeout_events: Events = .{};
-    const fired = try recovery.onTimeout(.client, timer.at, .{}, &timeout_events);
+    const fired = try sp.onTimeout(.client, timer.at, .{}, &timeout_events);
     try testing.expectEqual(TimeoutKind.loss, fired.kind);
     try testing.expectEqualSlices(u64, &.{0}, timeout_events.lostPackets());
-    try testing.expectEqual(@as(usize, 0), recovery.sent_len);
-    try testing.expectEqual(TimerKind.none, recovery.nextTimer(.{}).kind);
+    try testing.expectEqual(@as(usize, 0), sp.sent_len);
+    try testing.expectEqual(TimerKind.none, sp.nextTimer(.{}).kind);
 }
 
 test "RFC 9002 §6.1, a reordered ACK supersedes nothing and samples nothing" {
-    var recovery: Recovery = .{};
-    recovery.onPacketSent(0, ms(10), true, true);
-    recovery.onPacketSent(1, ms(10), true, true);
-    recovery.onPacketSent(2, ms(10), true, true);
+    var h: Harness = .{};
+    var sp = h.space();
+    try sp.onPacketSent(0, ms(10), true, true, 1200);
+    try sp.onPacketSent(1, ms(10), true, true, 1200);
+    try sp.onPacketSent(2, ms(10), true, true, 1200);
 
     const ack2: frame.Ack = .{
         .largest = 2,
@@ -589,10 +631,10 @@ test "RFC 9002 §6.1, a reordered ACK supersedes nothing and samples nothing" {
         .ecn = null,
     };
     var events: Events = .{};
-    try recovery.onAckReceived(&ack2, ms(200), .{}, &events);
+    try sp.onAckReceived(&ack2, ms(200), .{}, &events);
     try testing.expectEqualSlices(u64, &.{ 0, 1, 2 }, events.ackedPackets());
-    try testing.expectEqual(@as(u64, 2), recovery.largest_acked.?);
-    try testing.expectEqual(ms(190), recovery.rtt.latest);
+    try testing.expectEqual(@as(u64, 2), sp.largest_acked.?);
+    try testing.expectEqual(ms(190), h.conn.rtt.latest);
 
     // An ACK that arrives later and acknowledges less is not new information:
     // it must not move largest_acked and must not produce an RTT sample.
@@ -605,28 +647,29 @@ test "RFC 9002 §6.1, a reordered ACK supersedes nothing and samples nothing" {
         .ecn = null,
     };
     var late_events: Events = .{};
-    try recovery.onAckReceived(&late, ms(500), .{}, &late_events);
+    try sp.onAckReceived(&late, ms(500), .{}, &late_events);
     try testing.expectEqual(@as(usize, 0), late_events.acked_len);
-    try testing.expectEqual(@as(u64, 2), recovery.largest_acked.?);
-    try testing.expectEqual(ms(190), recovery.rtt.latest);
+    try testing.expectEqual(@as(u64, 2), sp.largest_acked.?);
+    try testing.expectEqual(ms(190), h.conn.rtt.latest);
 }
 
 test "RFC 9002 §6.2.1, the PTO period, its backoff, and its reset" {
-    var recovery: Recovery = .{};
-    recovery.rtt.onSample(ms(80), 0, .{}); // smoothed 80, variance 40
-    recovery.onPacketSent(0, ms(10), true, true);
+    var h: Harness = .{};
+    var sp = h.space();
+    h.conn.rtt.onSample(ms(80), 0, .{}); // smoothed 80, variance 40
+    try sp.onPacketSent(0, ms(10), true, true, 1200);
 
     // 80 + max(4*40, 1) = 240ms after the packet was sent.
-    var timer = recovery.nextTimer(.{});
+    var timer = sp.nextTimer(.{});
     try testing.expectEqual(TimerKind.probe, timer.kind);
     try testing.expectEqual(ms(10) + ms(240), timer.at);
 
     // A timeout doubles it.
     var events: Events = .{};
-    const probe = try recovery.onTimeout(.client, timer.at, .{}, &events);
+    const probe = try sp.onTimeout(.client, timer.at, .{}, &events);
     try testing.expectEqual(TimeoutKind.probe, probe.kind);
     try testing.expectEqual(@as(u8, 2), probe.probes);
-    timer = recovery.nextTimer(.{});
+    timer = sp.nextTimer(.{});
     try testing.expectEqual(ms(10) + ms(480), timer.at);
 
     // An acknowledgment resets the backoff, and with everything acknowledged
@@ -639,18 +682,54 @@ test "RFC 9002 §6.2.1, the PTO period, its backoff, and its reset" {
         .bytes = &.{},
         .ecn = null,
     };
-    try recovery.onAckReceived(&ack, ms(300), .{}, &events);
-    try testing.expectEqual(@as(u5, 0), recovery.pto_count);
-    try testing.expectEqual(TimerKind.none, recovery.nextTimer(.{}).kind);
+    try sp.onAckReceived(&ack, ms(300), .{}, &events);
+    try testing.expectEqual(@as(u5, 0), h.conn.pto_count);
+    try testing.expectEqual(TimerKind.none, sp.nextTimer(.{}).kind);
+}
+
+test "RFC 9002 Appendix A.2 and A.8, two spaces share one estimator and one backoff" {
+    var h: Harness = .{};
+    var sent_initial: [8]SentPacket = undefined;
+    var sent_handshake: [8]SentPacket = undefined;
+    var initial = h.conn.space(&sent_initial);
+    var handshake = h.conn.space(&sent_handshake);
+
+    try initial.onPacketSent(0, ms(10), true, true, 1200);
+    try handshake.onPacketSent(0, ms(20), true, true, 1200);
+
+    // A sample from one space is the connection's sample.
+    const ack: frame.Ack = .{
+        .largest = 0,
+        .delay = 0,
+        .first_range = 0,
+        .range_count = 0,
+        .bytes = &.{},
+        .ecn = null,
+    };
+    var events: Events = .{};
+    try initial.onAckReceived(&ack, ms(110), .{}, &events);
+    try testing.expectEqual(ms(100), h.conn.rtt.latest);
+    try testing.expectEqual(ms(100), handshake.rtt().latest);
+
+    // A PTO in the handshake space doubles the period in the initial space too,
+    // because the backoff is the connection's.
+    try handshake.onPacketSent(1, ms(120), true, true, 1200);
+    _ = try handshake.onTimeout(.server, ms(400), .{}, &events);
+    try testing.expectEqual(@as(u5, 1), h.conn.pto_count);
+
+    try initial.onPacketSent(1, ms(500), true, true, 1200);
+    const timer = initial.nextTimer(.{});
+    try testing.expectEqual(ms(500) + 2 * h.conn.rtt.ptoBase(), timer.at);
 }
 
 test "RFC 9002 §6.2.1, a client keeps its backoff while it doubts the address" {
-    var recovery: Recovery = .{};
-    recovery.onPacketSent(0, 0, true, true);
+    var h: Harness = .{};
+    var sp = h.space();
+    try sp.onPacketSent(0, 0, true, true, 1200);
 
     var events: Events = .{};
-    _ = try recovery.onTimeout(.client, ms(1000), .{}, &events);
-    try testing.expectEqual(@as(u5, 1), recovery.pto_count);
+    _ = try sp.onTimeout(.client, ms(1000), .{}, &events);
+    try testing.expectEqual(@as(u5, 1), h.conn.pto_count);
 
     // An ACK that cannot be honoured does not reset the backoff for a client
     // that has not seen the server validate its address.
@@ -662,40 +741,43 @@ test "RFC 9002 §6.2.1, a client keeps its backoff while it doubts the address" 
         .bytes = &.{},
         .ecn = null,
     };
-    recovery.sent_len = 1;
-    try recovery.onAckReceived(&ack, ms(2000), .{ .peer_address_validated = false }, &events);
-    try testing.expectEqual(@as(u5, 1), recovery.pto_count);
+    try sp.onAckReceived(&ack, ms(2000), .{ .peer_address_validated = false }, &events);
+    try testing.expectEqual(@as(u5, 1), h.conn.pto_count);
 }
 
 test "RFC 9002 §6.2.2.1, a client with nothing in flight still arms a probe" {
-    var recovery: Recovery = .{};
-    const timer = recovery.nextTimer(.{ .peer_address_validated = false });
+    var h: Harness = .{};
+    var sp = h.space();
+
+    const timer = sp.nextTimer(.{ .peer_address_validated = false });
     try testing.expectEqual(TimerKind.probe, timer.kind);
     // §6.2.1 with no sample yet: smoothed 333ms and variance 166.5ms, so the
     // period is 333 + 4*166.5 = 999ms, and nothing was sent, so it starts now.
-    try testing.expectEqual(recovery.rtt.ptoBase(), timer.at);
+    try testing.expectEqual(h.conn.rtt.ptoBase(), timer.at);
     try testing.expectEqual(ms(999), timer.at);
 
     var events: Events = .{};
-    const probe = try recovery.onTimeout(.client, timer.at, .{ .peer_address_validated = false }, &events);
+    const probe = try sp.onTimeout(.client, timer.at, .{ .peer_address_validated = false }, &events);
     try testing.expectEqual(TimeoutKind.probe, probe.kind);
     // One anti-deadlock packet, not the two of a real PTO.
     try testing.expectEqual(@as(u8, 1), probe.probes);
 
     // A server never arms it: it has nothing to unblock.
-    var server: Recovery = .{};
+    var server_harness: Harness = .{};
+    var server_space = server_harness.space();
     try testing.expectEqual(
         TimerKind.none,
-        server.nextTimer(.{ .peer_address_validated = true }).kind,
+        server_space.nextTimer(.{ .peer_address_validated = true }).kind,
     );
 }
 
 test "a fixed event sequence produces exactly one loss set" {
     // The sequence: six packets, then an ACK for 5 alone one RTT later, then an
     // ACK for 3 and 4 (a reordered pair), then silence.
-    var recovery: Recovery = .{};
+    var h: Harness = .{};
+    var sp = h.space();
     var i: u64 = 0;
-    while (i < 6) : (i += 1) recovery.onPacketSent(i, ms(10), true, true);
+    while (i < 6) : (i += 1) try sp.onPacketSent(i, ms(10), true, true, 1000 + @as(u32, @intCast(i)));
 
     const ack5: frame.Ack = .{
         .largest = 5,
@@ -706,9 +788,10 @@ test "a fixed event sequence produces exactly one loss set" {
         .ecn = null,
     };
     var events: Events = .{};
-    try recovery.onAckReceived(&ack5, ms(110), .{}, &events);
+    try sp.onAckReceived(&ack5, ms(110), .{}, &events);
     try testing.expectEqualSlices(u64, &.{5}, events.ackedPackets());
     try testing.expectEqualSlices(u64, &.{ 0, 1, 2 }, events.lostPackets());
+    try testing.expectEqual(@as(u32, 1000 + 1001 + 1002), events.lost_bytes);
 
     // A reordered ACK for 3 and 4 arrives: one range covering both.
     const ack34: frame.Ack = .{
@@ -720,13 +803,26 @@ test "a fixed event sequence produces exactly one loss set" {
         .ecn = null,
     };
     var second: Events = .{};
-    try recovery.onAckReceived(&ack34, ms(150), .{}, &second);
+    try sp.onAckReceived(&ack34, ms(150), .{}, &second);
     try testing.expectEqualSlices(u64, &.{ 3, 4 }, second.ackedPackets());
     try testing.expectEqual(@as(usize, 0), second.lost_len);
-    try testing.expectEqual(@as(usize, 0), recovery.sent_len);
+    try testing.expectEqual(@as(usize, 0), sp.sent_len);
 
     // Nothing is left to lose.
-    try testing.expectEqual(TimerKind.none, recovery.nextTimer(.{}).kind);
+    try testing.expectEqual(TimerKind.none, sp.nextTimer(.{}).kind);
+}
+
+test "the sent table is the caller's, and a full one is an error" {
+    var h: Harness = .{};
+    var small: [2]SentPacket = undefined;
+    var sp = h.conn.space(&small);
+
+    try sp.onPacketSent(0, 0, true, true, 1200);
+    try sp.onPacketSent(1, 0, true, true, 1200);
+    // The third is refused. A silently forgotten packet would be a packet whose
+    // frames are never retransmitted, with no signal to the caller.
+    try testing.expectError(error.NoSpace, sp.onPacketSent(2, 0, true, true, 1200));
+    try testing.expectEqual(@as(usize, 2), sp.sent_len);
 }
 
 test "RFC 9000 §19.3.1, an ACK is read through its ranges" {

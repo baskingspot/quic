@@ -14,7 +14,6 @@ pub const Cursor = @import("Cursor.zig");
 pub const Writer = @import("Writer.zig");
 pub const error_code = @import("error_code.zig");
 pub const hkdf = @import("hkdf.zig");
-pub const InitialSpace = @import("InitialSpace.zig");
 pub const protection = @import("protection.zig");
 pub const Recovery = @import("Recovery.zig");
 pub const frame = @import("frame.zig");
@@ -29,7 +28,7 @@ test {
     _ = error_code;
     _ = frame;
     _ = hkdf;
-    _ = InitialSpace;
+    _ = @import("InitialSpace.zig");
     _ = protection;
     _ = Recovery;
     _ = packet;

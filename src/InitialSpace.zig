@@ -14,11 +14,22 @@
 //! which frames to send, and parsing the frames a packet's payload holds. It
 //! writes and reads the packet, and returns bytes.
 //!
+//! Known gaps, and why they are not fixed here. This is an Initial-level
+//! prototype and not exported from the package:
+//!
+//! - `largest_acked` duplicates the one `Recovery` owns. The per-space type that
+//!   replaces this will hold a `Recovery.Space` and have one source of truth.
+//! - It never sees a datagram, so it cannot walk the coalesced Initial plus
+//!   Handshake flight a server sends. `open` takes one packet and reports where
+//!   it ended; a datagram loop is the connection's job.
+//! - It has no key-discard state, so nothing here implements §17.2.2.1.
+//!
 //! The connection IDs are borrowed. They must outlive the space, because every
 //! packet it builds names them.
 
 const std = @import("std");
 const testing = std.testing;
+const Cursor = @import("Cursor.zig");
 const Writer = @import("Writer.zig");
 const frame = @import("frame.zig");
 const packet = @import("packet.zig");
@@ -109,6 +120,16 @@ pub fn init(config: Config) InitialSpace {
         .destination_connection_id = config.destination_connection_id,
         .source_connection_id = config.source_connection_id,
     };
+}
+
+/// Address the packets this endpoint sends to a new connection ID.
+///
+/// RFC 9000 §7.2: once a client has the server's first Initial, it sends to the
+/// server's Source Connection ID, not to the original destination ID. That does
+/// not change the Initial keys, which come from the client's *original*
+/// destination ID (§5.2 of RFC 9001) and not from what we address now.
+pub fn setDestinationConnectionId(self: *InitialSpace, bytes: []const u8) void {
+    self.destination_connection_id = bytes;
 }
 
 /// The packet number the next packet will carry.
@@ -502,4 +523,177 @@ test "fuzz the driver's receive path" {
             }
         }
     }.run, .{ .corpus = &.{ "", "\xc0", "\xc0\x00\x00\x00\x01\x00\x00\x00\x00\x00" } });
+}
+
+// The loopback exchange lives here rather than in tests/ because the driver is
+// not public API: nothing outside this package can name it.
+
+/// The client's Destination Connection ID, which is what the Initial keys come
+/// from (RFC 9001 §5.2). Both sides derive the same secrets from it.
+const original_dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+
+test "RFC 9001 §5.2 with RFC 9000 §19.6 and §19.3, a loopback exchange" {
+    var client: InitialSpace = .init(.{
+        .side = .client,
+        .original_destination_connection_id = &original_dcid,
+        .destination_connection_id = &original_dcid,
+        .source_connection_id = &.{ 0xc1, 0xc2 },
+    });
+    var server: InitialSpace = .init(.{
+        .side = .server,
+        .original_destination_connection_id = &original_dcid,
+        .destination_connection_id = &.{ 0xc1, 0xc2 },
+        .source_connection_id = &.{ 0x5e, 0x5e, 0x5e },
+    });
+
+    // The client's first packet: one CRYPTO frame holding four bytes that mean
+    // nothing. This is not a handshake.
+    const handshake_bytes = "none";
+    var payload_buf: [128]u8 = undefined;
+    var payload_writer: Writer = .init(&payload_buf);
+    try frame.write(&payload_writer, .{
+        .crypto = .{ .offset = 0, .data = handshake_bytes },
+    });
+
+    var datagram: [512]u8 = undefined;
+    const packet_len = try client.seal(payload_writer.written(), &datagram);
+
+    // The server opens it without knowing anything but the connection ID.
+    var plaintext: [512]u8 = undefined;
+    const opened = try server.open(datagram[0..packet_len], &plaintext);
+    try testing.expectEqual(@as(u64, 0), opened.packet_number);
+    try testing.expectEqual(@as(u32, packet_len), opened.header_len + opened.payload.len + 16);
+
+    var cursor: Cursor = .init(opened.payload);
+    const first_frame = try frame.read(&cursor);
+    try testing.expectEqualStrings(handshake_bytes, first_frame.crypto.data);
+    try testing.expectEqual(@as(u64, 0), first_frame.crypto.offset);
+    try testing.expect(cursor.atEnd());
+
+    // The server answers with one ACK frame and nothing else.
+    var ack_scratch: [64]u8 = undefined;
+    const ack_frame = (try server.ackFrame(&ack_scratch)).?;
+    var reply_buf: [128]u8 = undefined;
+    var reply_writer: Writer = .init(&reply_buf);
+    try frame.write(&reply_writer, ack_frame);
+
+    var reply_datagram: [512]u8 = undefined;
+    const reply_len = try server.seal(reply_writer.written(), &reply_datagram);
+
+    // The client opens the acknowledgment and records it.
+    var client_plaintext: [512]u8 = undefined;
+    const client_opened = try client.open(reply_datagram[0..reply_len], &client_plaintext);
+    try testing.expectEqual(@as(u64, 0), client_opened.packet_number);
+
+    var client_cursor: Cursor = .init(client_opened.payload);
+    const ack = (try frame.read(&client_cursor)).ack;
+    try testing.expectEqual(@as(u64, 0), ack.largest);
+    try testing.expectEqual(@as(u64, 0), ack.first_range);
+    try testing.expectEqual(@as(u64, 0), ack.range_count);
+    try client.recordAck(&ack);
+    try testing.expectEqual(@as(?u64, 0), client.largest_acked);
+
+    // A second client packet continues the number, and the server's next ACK
+    // covers both: one range, so the second ACK is still a single pair.
+    const second_len = try client.seal(payload_writer.written(), &datagram);
+    const second = try server.open(datagram[0..second_len], &plaintext);
+    try testing.expectEqual(@as(u64, 1), second.packet_number);
+
+    var second_scratch: [64]u8 = undefined;
+    const second_ack = (try server.ackFrame(&second_scratch)).?.ack;
+    try testing.expectEqual(@as(u64, 1), second_ack.largest);
+    try testing.expectEqual(@as(u64, 1), second_ack.first_range);
+    try testing.expectEqual(@as(u64, 0), second_ack.range_count);
+
+    const second_reply_len = try server.seal(
+        blk: {
+            var wire: [64]u8 = undefined;
+            var writer: Writer = .init(&wire);
+            try frame.write(&writer, .{ .ack = second_ack });
+            break :blk writer.written();
+        },
+        &reply_datagram,
+    );
+    const acked = try client.open(reply_datagram[0..second_reply_len], &client_plaintext);
+    var second_cursor: Cursor = .init(acked.payload);
+    const ack2 = (try frame.read(&second_cursor)).ack;
+    try client.recordAck(&ack2);
+    try testing.expectEqual(@as(?u64, 1), client.largest_acked);
+}
+
+test "RFC 9000 §12.2, two Initial packets share a datagram" {
+    // A client sends two packets, the server opens them from one buffer in
+    // order, and both numbers land in the ACK.
+    var client: InitialSpace = .init(.{
+        .side = .client,
+        .original_destination_connection_id = &original_dcid,
+        .destination_connection_id = &original_dcid,
+        .source_connection_id = &.{0x11},
+    });
+    var server: InitialSpace = .init(.{
+        .side = .server,
+        .original_destination_connection_id = &original_dcid,
+        .destination_connection_id = &.{0x11},
+        .source_connection_id = &.{0x22},
+    });
+
+    const payload = "payload with enough bytes to be sampled";
+    var datagram: [512]u8 = undefined;
+    var cursor: Writer = .init(&datagram);
+
+    var single: [256]u8 = undefined;
+    var plaintext: [256]u8 = undefined;
+
+    const first_len = try client.seal(payload, &single);
+    try cursor.put(single[0..first_len]);
+    const second_len = try client.seal(payload, &single);
+    try cursor.put(single[0..second_len]);
+
+    var offset: usize = 0;
+    var expected: u64 = 0;
+    while (offset < datagram.len and offset < cursor.pos) {
+        const opened = try server.open(datagram[offset..cursor.pos], &plaintext);
+        try testing.expectEqual(expected, opened.packet_number);
+        offset += opened.packet_len;
+        expected += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), expected);
+    try testing.expectEqual(@as(u4, 1), server.range_count);
+    try testing.expectEqual(@as(u64, 1), server.ranges[0].largest);
+}
+
+test "RFC 9000 §7.2, a client addresses the server's ID without new keys" {
+    const original = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const server_id = [_]u8{ 0x5e, 0x5e, 0x5e, 0x5e };
+
+    var client: InitialSpace = .init(.{
+        .side = .client,
+        .original_destination_connection_id = &original,
+        .destination_connection_id = &original,
+        .source_connection_id = &.{ 0xc1, 0xc2 },
+    });
+    var server: InitialSpace = .init(.{
+        .side = .server,
+        .original_destination_connection_id = &original,
+        .destination_connection_id = &.{ 0xc1, 0xc2 },
+        .source_connection_id = &server_id,
+    });
+
+    // A first packet goes to the original destination ID; the server opens it.
+    const payload = "first flight, addressed to the original connection ID";
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    const first = try client.seal(payload, &datagram);
+    _ = try server.open(datagram[0..first], &plaintext);
+
+    // Now the client addresses the server's chosen ID. The keys do not move,
+    // because they come from the original ID, so the server still opens it.
+    client.setDestinationConnectionId(&server_id);
+    const second = try client.seal(payload, &datagram);
+    const opened = try server.open(datagram[0..second], &plaintext);
+    try testing.expectEqual(@as(u64, 1), opened.packet_number);
+
+    // And the header names the new ID, which is the point.
+    const long = try packet.parseLong(datagram[0..second]);
+    try testing.expectEqualSlices(u8, &server_id, long.destination_connection_id);
 }
