@@ -33,6 +33,10 @@ Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix deve
 - Initial keys come from the connection ID, not from TLS (RFC 9001 §5.2), so
   Initial protection is testable against Appendix A with no handshake. The TLS
   handshake itself, and the traffic secrets it produces, are a separate gate.
+- `Recovery.zig` is RFC 9002 §5 and §6 for one space and stops at the edge of
+  §7: it hands back the packets a timeout says to probe and never decides how
+  many bytes may be in flight. The caller owns the clock and calls it with
+  `Duration` values, so there is no timer, thread, or I/O in it.
 - `InitialSpace.zig` is the driver, not a connection: keys, packet numbers,
   and the received ranges an ACK frame needs, for the Initial level only. When
   a change would need a timer, a retransmission, a stream, or a handshake, it

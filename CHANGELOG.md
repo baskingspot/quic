@@ -24,6 +24,10 @@ All notable changes to quic are recorded here. The format follows
 - `error_code` has the RFC 9000 §20.1 transport codes, the CRYPTO_ERROR block,
   and `error_code.forFrameError`, which names the code that closes a connection
   over a frame that will not decode.
+- `Recovery` does RFC 9002 §5 and §6 for one packet number space: RTT
+  estimation with the A.7 update order, the packet and time thresholds, and the
+  probe timeout with backoff and the client's two-probe rule. No congestion
+  control (§7), no timers of its own, no I/O.
 - `InitialSpace` is the Initial-level driver: it derives both Initial keys from
   the connection ID, seals and opens Initial packets, tracks the packet number
   in each direction, and turns what it received into an ACK frame. It is not a

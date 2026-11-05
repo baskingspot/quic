@@ -16,6 +16,7 @@ pub const error_code = @import("error_code.zig");
 pub const hkdf = @import("hkdf.zig");
 pub const InitialSpace = @import("InitialSpace.zig");
 pub const protection = @import("protection.zig");
+pub const Recovery = @import("Recovery.zig");
 pub const frame = @import("frame.zig");
 pub const packet = @import("packet.zig");
 pub const packet_number = @import("packet_number.zig");
@@ -30,6 +31,7 @@ test {
     _ = hkdf;
     _ = InitialSpace;
     _ = protection;
+    _ = Recovery;
     _ = packet;
     _ = packet_number;
     _ = TransportParameters;
