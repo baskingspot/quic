@@ -7,10 +7,10 @@
 //! dropped and the walk continues (RFC 9001 §5.5).
 //!
 //! Initial keys come from the connection ID (§5.2 of RFC 9001), so they exist
-//! from `init`; the Handshake and application spaces stay empty until a TLS
-//! driver hands their traffic secrets over, and a packet for an empty space is
-//! `error.NoKeys` for the caller to drop. There is no second notion of "not
-//! ready": a space either has keys or it does not exist.
+//! from `init`; the Handshake and application spaces appear when a TLS driver
+//! reports their traffic secrets through the `handshake` seam, and a packet for
+//! an empty space is `error.NoKeys` for the caller to drop. There is no second
+//! notion of "not ready": a space either has keys or it does not exist.
 //!
 //! Every buffer is the caller's, the clock is a value the caller passes, and
 //! nothing allocates. The only frame this slice emits is an ACK, and it is
@@ -21,6 +21,7 @@ const std = @import("std");
 const testing = std.testing;
 const Cursor = @import("Cursor.zig");
 const frame = @import("frame.zig");
+const seam = @import("handshake.zig");
 const packet = @import("packet.zig");
 const packet_number = @import("packet_number.zig");
 const protection = @import("protection.zig");
@@ -49,7 +50,7 @@ pub const Role = enum { client, server };
 /// 1-RTT packets share the application data space.
 pub const SpaceId = enum { initial, handshake, app };
 
-pub const Error = protection.Error || packet.Error || frame.Error || error{
+pub const Error = protection.Error || packet.Error || frame.Error || seam.Error || error{
     /// No traffic keys are installed for the space. Handshake and application
     /// keys arrive from the TLS driver, and the space is absent until then.
     NoKeys,
@@ -70,6 +71,14 @@ pub const Config = struct {
     /// peer has acknowledged; until that lands, the caller picks, and four
     /// bytes is always legal.
     packet_number_len: u3 = 4,
+    /// The TLS driver, when this endpoint runs a handshake. Without one the
+    /// machine still parses, protects, and acknowledges Initial packets, which
+    /// is what the interop tool does.
+    tls: ?seam.Driver = null,
+    /// This endpoint's transport parameters, already encoded, which the driver
+    /// carries opaquely in the handshake (§8.2). Handed to the driver once,
+    /// before its first message.
+    transport_parameters: []const u8 = "",
 };
 
 pub const Opened = struct {
@@ -175,6 +184,13 @@ initial: ?Space,
 handshake: ?Space = null,
 /// 1-RTT keys, same.
 app: ?Space = null,
+/// The handshake driver, when there is one. The machine calls it; it never
+/// implements TLS.
+tls: ?seam.Driver,
+/// Encoded transport parameters for the driver, set before its first message.
+transport_parameters: []const u8,
+/// Whether the driver has them yet. One call, before the first flight.
+transport_parameters_set: bool = false,
 
 pub fn init(config: Config) Conn {
     std.debug.assert(config.packet_number_len >= 1);
@@ -190,6 +206,8 @@ pub fn init(config: Config) Conn {
         .packet_number_len = config.packet_number_len,
         .destination_connection_id = config.destination_connection_id,
         .source_connection_id = config.source_connection_id,
+        .tls = config.tls,
+        .transport_parameters = config.transport_parameters,
         .initial = .{
             .send_keys = if (config.role == .client) client else server,
             .receive_keys = if (config.role == .client) server else client,
@@ -201,10 +219,15 @@ pub fn init(config: Config) Conn {
 /// is none to act on. A handshake or application space appears when its driver
 /// does, and disappears when its keys are discarded; there is no third state.
 pub fn spaceFor(self: *Conn, id: SpaceId) Error!*Space {
+    return self.spaceMaybe(id) orelse error.NoKeys;
+}
+
+/// The same, for a caller that already knows a missing space is not an error.
+fn spaceMaybe(self: *Conn, id: SpaceId) ?*Space {
     switch (id) {
-        .initial => return if (self.initial) |*space| space else error.NoKeys,
-        .handshake => return if (self.handshake) |*space| space else error.NoKeys,
-        .app => return if (self.app) |*space| space else error.NoKeys,
+        .initial => return if (self.initial) |*space| space else null,
+        .handshake => return if (self.handshake) |*space| space else null,
+        .app => return if (self.app) |*space| space else null,
     }
 }
 
@@ -219,6 +242,18 @@ pub fn spaceFor(self: *Conn, id: SpaceId) Error!*Space {
 pub fn discard(self: *Conn, id: SpaceId) Error!void {
     const space = try self.spaceFor(id);
     space.discard();
+    self.clear(id);
+}
+
+/// The two moments §17.2.2.1 names can arrive in either order, so discarding a
+/// space that is already gone is not an error here.
+fn discardIfPresent(self: *Conn, id: SpaceId) void {
+    const space = self.spaceMaybe(id) orelse return;
+    space.discard();
+    self.clear(id);
+}
+
+fn clear(self: *Conn, id: SpaceId) void {
     switch (id) {
         .initial => self.initial = null,
         .handshake => self.handshake = null,
@@ -298,6 +333,11 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Opened {
         opened.packet_number;
     space.record(opened.packet_number);
 
+    // §17.2.2.1: a server lets its Initial keys go when it first processes a
+    // Handshake packet. A client's moment is the first Handshake packet it
+    // sends, which `writeHandshake` covers.
+    if (at.id == .handshake and self.role == .server) self.discardIfPresent(.initial);
+
     return .{
         .packet_number = opened.packet_number,
         .frames = opened.payload,
@@ -361,6 +401,88 @@ pub const Datagram = struct {
         return null;
     }
 };
+
+/// Drain one handshake message into a packet.
+///
+/// The machine's half of the TLS seam: it hands the driver its transport
+/// parameters once, installs the spaces the driver has reported secrets for,
+/// discards the Handshake keys once `confirmed` says to (§4.9.2 of RFC 9001),
+/// and writes the next message as a CRYPTO frame at the level the driver chose.
+/// The caller drains until this returns null, one packet per call.
+///
+/// `frames` is the caller's scratch for the CRYPTO frame and `out` the
+/// datagram, because the machine owns no buffer of its own. Null means the
+/// driver has nothing to send, which is also how a caller learns the handshake
+/// has no more bytes after the spaces were installed.
+pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8) Error!?u32 {
+    const tls = self.tls orelse return null;
+
+    if (!self.transport_parameters_set) {
+        // §8.2: ours go out in the first message, so the driver takes them
+        // before it produces one.
+        try tls.setTransportParameters(self.transport_parameters);
+        self.transport_parameters_set = true;
+    }
+    try self.installSecrets(tls);
+
+    if (tls.confirmed()) self.discardIfPresent(.handshake);
+
+    const message = (try tls.next()) orelse return null;
+    const id: SpaceId = switch (message.level) {
+        .initial => .initial,
+        .handshake => .handshake,
+        .app => .app,
+    };
+
+    const space = try self.spaceFor(id);
+    const offset = space.crypto_sent;
+
+    var writer: Writer = .init(frames);
+    try frame.write(&writer, .{ .crypto = .{ .offset = offset, .data = message.bytes } });
+
+    const total = try self.writeFrames(id, writer.written(), out);
+    space.crypto_sent = offset + message.bytes.len;
+
+    // §17.2.2.1: the client's Initial keys go when its first Handshake packet
+    // is sent. The packet is sealed; nothing needs them again.
+    if (id == .handshake and self.role == .client) self.discardIfPresent(.initial);
+
+    return total;
+}
+
+/// Install every space the driver can give secrets for, once each. A driver may
+/// report a level on every call; the machine asks only while a space is missing.
+fn installSecrets(self: *Conn, tls: seam.Driver) Error!void {
+    if (self.handshake == null) {
+        if (try tls.secrets(.handshake)) |secrets| try self.installSpace(.handshake, secrets);
+    }
+    if (self.app == null) {
+        if (try tls.secrets(.app)) |secrets| try self.installSpace(.app, secrets);
+    }
+}
+
+/// Build a space from the secrets a driver reported.
+///
+/// The suite is AES-128-GCM, the default §5.5 of RFC 9001 gives and the one the
+/// Initial space uses. A driver that negotiates ChaCha20-Poly1305 has no way to
+/// say so yet: the seam reports secrets and not the suite, so that is a vtable
+/// addition and not something to guess at here.
+fn installSpace(self: *Conn, id: SpaceId, secrets: seam.Secrets) Error!void {
+    std.debug.assert(id != .initial);
+    const client = try protection.deriveKeys(secrets.client, .aes_128_gcm);
+    const server = try protection.deriveKeys(secrets.server, .aes_128_gcm);
+    const space: Space = .{
+        .send_keys = if (self.role == .client) client else server,
+        .receive_keys = if (self.role == .client) server else client,
+    };
+    switch (id) {
+        // Initial keys are derived from the connection ID in `init`, and a
+        // driver never has them (§5.2).
+        .initial => unreachable,
+        .handshake => self.handshake = space,
+        .app => self.app = space,
+    }
+}
 
 /// The length of this endpoint's own connection ID: what the peer echoes as the
 /// destination of the packets it sends, and what a short header leaves off the
@@ -523,8 +645,9 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     try testing.expectEqualStrings("handshake bytes to sample", opened.frames);
     try testing.expectEqual(@as(u64, 0), opened.packet_number);
     try testing.expectEqual(@as(?u64, 0), server.handshake.?.largest_received);
-    // Not the Initial space, which received nothing.
-    try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
+    // Not the Initial space: a server that has processed a Handshake packet has
+    // let those keys go (§17.2.2.1).
+    try testing.expectEqual(@as(?Space, null), server.initial);
     try testing.expect(server.ackOwed(.handshake));
     try testing.expect(!server.ackOwed(.initial));
 
@@ -756,6 +879,171 @@ test "RFC 9000 §19.3, eight received ranges do not overflow the ACK path" {
     try testing.expectEqual(server.initial.?.ranges[0].largest, ack.largest);
 }
 
+test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
+    const dcid = [_]u8{ 0x71, 0x72 };
+    const client_secret: [protection.secret_length]u8 = @splat(0x5a);
+    const server_secret: [protection.secret_length]u8 = @splat(0x5b);
+    const app_client_secret: [protection.secret_length]u8 = @splat(0x5c);
+    const app_server_secret: [protection.secret_length]u8 = @splat(0x5d);
+
+    const hello = "ClientHello bytes in one CRYPTO frame";
+    const finished = "Finished bytes";
+
+    // The driver stands in for baskingspot/tls: two messages at two levels, and
+    // both levels' secrets reported from the start.
+    var stub: seam.Stub = .{
+        .outbox = &.{
+            .{ .level = .initial, .bytes = hello },
+            .{ .level = .handshake, .bytes = finished },
+        },
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+        .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
+        .alpn_protocol = "h3",
+    };
+
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x7a},
+        .tls = stub.driver(),
+        .transport_parameters = "our parameters",
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x7a},
+        // The same bytes the client puts in a destination: a short header
+        // carries no length, so the two ends have to agree on one (§17.3.1).
+        .source_connection_id = &dcid,
+    });
+
+    var datagram: [512]u8 = undefined;
+    var frames: [256]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+
+    // The ClientHello leaves in an Initial packet, and the driver had this
+    // endpoint's transport parameters before it produced that message (§8.2).
+    const first = (try client.writeHandshake(&frames, &datagram)) orelse return error.TestUnexpectedResult;
+    try testing.expect(stub.parameters_set);
+    try testing.expectEqualStrings("our parameters", stub.parameters[0..stub.parameters_len]);
+    // The stub reported both levels up front, so the machine installed them
+    // before it needed them; the Initial keys are still here, because no
+    // Handshake packet has gone out yet.
+    try testing.expect(client.initial != null);
+
+    const at_server = try server.feed(datagram[0..first], &plaintext);
+    var cursor = Cursor.init(at_server.frames);
+    const hello_frame = (try frame.read(&cursor)).crypto;
+    try testing.expectEqual(@as(u64, 0), hello_frame.offset);
+    try testing.expectEqualStrings(hello, hello_frame.data);
+
+    // The server's own driver is out of this test's scope, so its Handshake
+    // keys are planted; the client's come from the stub through the machine.
+    plantSpace(
+        &server,
+        .handshake,
+        try protection.deriveKeys(&server_secret, .aes_128_gcm),
+        try protection.deriveKeys(&client_secret, .aes_128_gcm),
+    );
+
+    // The Finished bytes go out in a Handshake packet, in a space the machine
+    // built from the driver's secrets. §17.2.2.1 then takes the client's
+    // Initial keys, because its first Handshake packet has been sent.
+    const second = (try client.writeHandshake(&frames, &datagram)) orelse return error.TestUnexpectedResult;
+    try testing.expect(client.handshake != null);
+    try testing.expectEqual(@as(?Space, null), client.initial);
+
+    const at_server_handshake = try server.feed(datagram[0..second], &plaintext);
+    var handshake_cursor = Cursor.init(at_server_handshake.frames);
+    const finished_frame = (try frame.read(&handshake_cursor)).crypto;
+    // A new level starts its CRYPTO stream at zero again (§19.6).
+    try testing.expectEqual(@as(u64, 0), finished_frame.offset);
+    try testing.expectEqualStrings(finished, finished_frame.data);
+    // And the server's Initial keys went when it processed that packet.
+    try testing.expectEqual(@as(?Space, null), server.initial);
+
+    // The driver has nothing left, but the application space it reported is
+    // installed anyway.
+    try testing.expect((try client.writeHandshake(&frames, &datagram)) == null);
+    try testing.expect(client.app != null);
+    try testing.expectEqualStrings("h3", client.tls.?.alpn().?);
+
+    plantSpace(
+        &server,
+        .app,
+        try protection.deriveKeys(&app_server_secret, .aes_128_gcm),
+        try protection.deriveKeys(&app_client_secret, .aes_128_gcm),
+    );
+    const app_packet = try client.writeFrames(.app, "one-rtt payload bytes", &datagram);
+    const opened_app = try server.feed(datagram[0..app_packet], &plaintext);
+    try testing.expectEqualStrings("one-rtt payload bytes", opened_app.frames);
+
+    // §4.9.2: confirmation takes the Handshake keys, and 1-RTT carries on.
+    stub.confirmed = true;
+    try testing.expect((try client.writeHandshake(&frames, &datagram)) == null);
+    try testing.expectEqual(@as(?Space, null), client.handshake);
+    try testing.expect(client.app != null);
+    try testing.expectError(error.NoKeys, client.writeFrames(.handshake, "x", &datagram));
+    _ = try client.writeFrames(.app, "still here", &datagram);
+}
+
+test "RFC 9000 §20.1, a driver failure carries the CRYPTO_ERROR to close with" {
+    const dcid = [_]u8{0x81};
+    var stub: seam.Stub = .{ .fail_next = true, .failure = 0x100 + 80 };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x8a},
+        .tls = stub.driver(),
+    });
+
+    var datagram: [512]u8 = undefined;
+    var frames: [256]u8 = undefined;
+    // The alert is one error, and the code the caller closes with is the
+    // CRYPTO_ERROR value the driver named, not a table of alerts here.
+    try testing.expectError(error.HandshakeFailed, client.writeHandshake(&frames, &datagram));
+    try testing.expectEqual(@as(u64, 0x150), client.tls.?.errorCode());
+}
+
+test "RFC 9001 §5.1, a driver's 48-byte secret is refused rather than truncated" {
+    const dcid = [_]u8{0x91};
+    const sha384: [48]u8 = @splat(0x33);
+    var stub: seam.Stub = .{
+        .handshake_secrets = .{ .client = &sha384, .server = &sha384 },
+    };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x9a},
+        .tls = stub.driver(),
+    });
+
+    var datagram: [512]u8 = undefined;
+    var frames: [256]u8 = undefined;
+    // TLS_AES_256_GCM_SHA384 hands out 48-byte secrets and this package does not
+    // implement it, so the space is not installed under a truncated key.
+    try testing.expectError(error.SecretLengthMismatch, client.writeHandshake(&frames, &datagram));
+    try testing.expectEqual(@as(?Space, null), client.handshake);
+    try testing.expectEqual(@as(?Space, null), client.app);
+}
+
+test "an endpoint with no driver has no handshake to write" {
+    const dcid = [_]u8{0xa1};
+    var conn: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xaa},
+    });
+
+    var datagram: [512]u8 = undefined;
+    var frames: [256]u8 = undefined;
+    try testing.expect((try conn.writeHandshake(&frames, &datagram)) == null);
+}
+
 test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram" {
     const dcid = [_]u8{ 0x0d, 0x0e };
     var client: Conn = .init(.{
@@ -959,9 +1247,10 @@ test "RFC 9001 §5.5, a packet that will not unprotect changes nothing" {
     try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
 }
 
-/// Stand in for the TLS driver: hand both endpoints a space, with the keys
-/// crossed the way the two roles need them.
-fn installSpace(conn: *Conn, id: SpaceId, send: protection.Keys, receive: protection.Keys) void {
+/// Stand in for the TLS driver: hand an endpoint a space directly, with the
+/// keys crossed the way its role needs them. Tests that run the seam use
+/// `handshake.Stub` instead and let the machine install the space.
+fn plantSpace(conn: *Conn, id: SpaceId, send: protection.Keys, receive: protection.Keys) void {
     std.debug.assert(id != .initial);
     // What a driver fills in: the keys for the level, and nothing else. The
     // counters and ranges start where `init` leaves them.
@@ -1003,6 +1292,6 @@ fn installPaired(
 ) void {
     const client_keys = protection.deriveKeys(&client_secret, .aes_128_gcm) catch unreachable;
     const server_keys = protection.deriveKeys(&server_secret, .aes_128_gcm) catch unreachable;
-    installSpace(client, id, client_keys, server_keys);
-    installSpace(server, id, server_keys, client_keys);
+    plantSpace(client, id, client_keys, server_keys);
+    plantSpace(server, id, server_keys, client_keys);
 }
