@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Lint at commit time, in the devshell because ziglint and friends come from it.
+# `just ci` runs the same lint plus the tests; it is for before the push, where
+# a few minutes is acceptable.
+set -uo pipefail
+if ! nix develop --command just lint >/tmp/quic-pre-commit.log 2>&1; then
+    echo "pre-commit: just lint failed; the commit is refused. Output:" >&2
+    tail -20 /tmp/quic-pre-commit.log >&2
+    exit 1
+fi

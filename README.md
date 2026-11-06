@@ -6,6 +6,8 @@ This project is incubating. It is unstable, its API will change, and it is not r
 
 ## Work on it
 
+Run `git config core.hooksPath .githooks` once, so the pre-commit hook runs `just lint`.
+
 `nix develop` provides the toolchain, and `just ci` runs what CI runs.
 
 ## License
