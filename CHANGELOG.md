@@ -27,6 +27,12 @@ All notable changes to quic are recorded here. The format follows
 - `InitialSpace` is no longer exported from the package. It is an Initial-level
   prototype, and the per-space type that replaces it will own the state
   `Recovery` already has.
+- `RecoveryDriver` is the timer side of RFC 9002: one deadline across every
+  packet number space (a due loss time beats a probe), and the event to service
+  when it passes. It holds no clock; the caller passes the time. Firing changes
+  the state the deadline is computed from, so two calls at the same instant
+  cannot both fire. `Recovery.Space.discard` implements the §6.4 cleanup that
+  keeps the path's RTT.
 - `connection_setup` is RFC 9000 §6: a server builds a Version Negotiation
   packet by echoing the connection IDs it saw, a client's handling of one can
   never return a different version (the §6.2 rule, expressed as the return

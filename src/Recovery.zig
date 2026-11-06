@@ -442,6 +442,19 @@ pub const Space = struct {
         if (packet.time_sent - self.run_start > period) events.persistent_congestion = true;
     }
 
+    /// §6.4: when the keys for this space are discarded, its sent packets, its
+    /// loss timer, and its claim on the next PTO go with them. The connection's
+    /// RTT estimate does not: it belongs to the path (A.2).
+    pub fn discard(self: *Space) void {
+        self.sent_len = 0;
+        self.largest_acked = null;
+        self.loss_time = 0;
+        self.last_ack_eliciting = 0;
+        self.run_start = 0;
+        self.run_last = 0;
+        self.run_eliciting = 0;
+    }
+
     /// The timer the caller should set after any event (§6.1.2 and §6.2.1, A.8).
     pub fn nextTimer(self: *Space, options: Options) Timer {
         if (self.loss_time != 0) return .{ .kind = .loss, .at = self.loss_time };

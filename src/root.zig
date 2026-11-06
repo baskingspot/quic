@@ -28,6 +28,7 @@ pub const stream_id = @import("stream_id.zig");
 pub const hkdf = @import("hkdf.zig");
 pub const protection = @import("protection.zig");
 pub const Recovery = @import("Recovery.zig");
+pub const RecoveryDriver = @import("RecoveryDriver.zig");
 pub const frame = @import("frame.zig");
 pub const packet = @import("packet.zig");
 pub const packet_number = @import("packet_number.zig");
@@ -50,6 +51,7 @@ test {
     _ = @import("InitialSpace.zig");
     _ = protection;
     _ = Recovery;
+    _ = RecoveryDriver;
     _ = packet;
     _ = packet_number;
     _ = TransportParameters;
