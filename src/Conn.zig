@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const Cursor = @import("Cursor.zig");
 const frame = @import("frame.zig");
 const packet = @import("packet.zig");
 const packet_number = @import("packet_number.zig");
@@ -256,7 +257,7 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     try testing.expect(!server.ackOwed());
 
     const at_client = try client.feed(datagram[0..ack_len], &plaintext);
-    var cursor = @import("Cursor.zig").init(at_client.frames);
+    var cursor = Cursor.init(at_client.frames);
     const ack = (try frame.read(&cursor)).ack;
     try testing.expectEqual(@as(u64, 0), ack.largest);
     try testing.expectEqual(@as(u64, 0), ack.first_range);
