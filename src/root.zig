@@ -31,6 +31,7 @@ pub const protection = @import("protection.zig");
 pub const Recovery = @import("Recovery.zig");
 pub const RecoveryDriver = @import("RecoveryDriver.zig");
 pub const frame = @import("frame.zig");
+pub const handshake = @import("handshake.zig");
 pub const packet = @import("packet.zig");
 pub const packet_number = @import("packet_number.zig");
 pub const TransportParameters = @import("TransportParameters.zig");
@@ -50,6 +51,7 @@ test {
     _ = error_code;
     _ = stream_id;
     _ = frame;
+    _ = handshake;
     _ = hkdf;
     _ = @import("InitialSpace.zig");
     _ = protection;
