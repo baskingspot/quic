@@ -27,6 +27,11 @@ All notable changes to quic are recorded here. The format follows
 - `InitialSpace` is no longer exported from the package. It is an Initial-level
   prototype, and the per-space type that replaces it will own the state
   `Recovery` already has.
+- `Conn` begins the connection machine: it derives the Initial keys, seals and
+  opens Initial packets, tracks packet numbers both ways, records the ranges it
+  received, and builds the ACK frame it owes. It has no handshake, streams,
+  congestion, coalescing, or timers yet, and the A.2 client Initial is its
+  golden test.
 - `just interop` builds `tools/interop.zig` and runs it against `quiche-client`:
   a Retry it must echo back, and a version list it must not negotiate. It skips
   with the build command when quiche-client is absent, which is the only path

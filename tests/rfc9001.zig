@@ -207,3 +207,21 @@ test "RFC 9001 A.2, one bit of the packet and the tag does not verify" {
         );
     }
 }
+
+test "RFC 9001 A.2, the machine reproduces the client Initial byte for byte" {
+    // The golden gate for the connection machine: given the RFC's own payload
+    // and packet number, its `writeFrames` must produce the printed packet.
+    var conn: quic.Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &data.dcid,
+        .destination_connection_id = &data.dcid,
+        .source_connection_id = &.{},
+        .packet_number_len = 4,
+    });
+    conn.next_packet_number = 2;
+
+    var out: [1200]u8 = undefined;
+    const length = try conn.writeFrames(&data.client_payload, &out);
+    try testing.expectEqual(@as(u32, data.client_packet.len), length);
+    try testing.expectEqualSlices(u8, &data.client_packet, out[0..length]);
+}
