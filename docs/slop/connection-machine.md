@@ -105,3 +105,27 @@ To be a QUIC endpoint a caller writes: a UDP socket, a monotonic clock, a
 resend queue, a TLS driver satisfying the seam above, a `Congestion`, and its
 application protocol. Those seven exist in `http` already or are the reason
 `http.h3` will be a separate module.
+
+## Size, in slices
+
+The number Matt asked for, as increments that each end green. Line counts are
+for `src/` plus their tests, which in this repo has run about 1:2.
+
+| slice | what it is | size |
+| --- | --- | --- |
+| 1 | `Conn` skeleton: config, storage, `feed` that only parses and drops, the event union, a close path | ~250 |
+| 2 | the three spaces: keys, packet numbers, protection in and out, ACK generation from `Recovery.Space` | ~400 |
+| 3 | coalescing and the datagram walk, undecryptable packets dropped per §5.5 | ~150 |
+| 4 | stream wiring: `StreamTable`, STREAM frames into `ReceiveStream`, segments out of `SendStream`, flow control counters | ~500 |
+| 5 | connection close, `connection_setup` wired for the server side, client Retry/VN state | ~250 |
+| 6 | key discard at the two moments, 1-RTT PTO arming, the `RecoveryDriver` loop in one place | ~200 |
+
+About 1,750 lines with tests, or five to six working sessions. Slices 1 through
+3 need no tls at all: a machine that parses, protects, and acknowledges can be
+tested against itself and against `quiche-server --dump-packets`. Slice 4 needs
+only stream state, which exists. Slices 5 and 6 are where the tls seam becomes
+load-bearing, so the seam list above is the critical path and the only part that
+can block everything after slice 4.
+
+What is not in the number: `http.h3`, QPACK, stream scheduling, pacing, ECN,
+PMTUD, key update, and the 0-RTT path. Each is its own note.
