@@ -142,28 +142,43 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 
 ## Where to resume
 
-State as of `Conn` slice one plus the `Space` struct, green at 160 tests.
+State as of slices two and three, green at 168 tests: the three packet number
+spaces, and the walk across a coalesced datagram.
 
-What exists: `src/Conn.zig` with `Conn.init` (Initial keys from the connection
-ID, by role), `feed` (one datagram, one packet, unprotect, recover the number
-from `largest_received`, record the range, return frames plus `packet_len`),
-`writeFrames` (header, number, seal), `writeAck` (an ACK for what was received,
-remembering what it covered), and `acked_through` so a machine does not
-acknowledge the same thing twice. The gate is in `tests/rfc9001.zig`: the A.2
-client Initial built through `Conn` and compared across all 1200 bytes.
+What exists in `src/Conn.zig`:
 
-What the struct gives the next agent: `Conn.Space` carries identity, keys,
-counters, and received ranges. `Conn` holds `initial: Space` and two optionals,
-`handshake` and `app`, that are null and stay null until the wiring fills them.
-Every method currently acts on `self.initial` explicitly, so the wiring is a
-matter of choosing the space and passing it, not of splitting anything.
+- `Conn.init` derives the Initial keys from the connection ID, by role.
+- A `Space` per packet number space: `Conn.SpaceId` is `initial`, `handshake`,
+  or `app`, and `Conn.spaceFor` returns the space or `error.NoKeys`. The
+  `handshake` and `app` optionals are the seam the TLS driver fills; there is
+  no third state next to them.
+- `Conn.feed` takes one packet and picks its space from the form and type
+  (§12.3): Initial and Handshake long headers, a short header for the
+  application space, 0-RTT folded into `app` because §12.3 shares the space
+  (this build has no 0-RTT keys, so such a packet fails to authenticate and is
+  dropped). It unprotects, recovers the number from the space's
+  `largest_received`, records the range, and returns frames plus `packet_len`.
+- `Conn.Datagram` walks a whole datagram: `next` returns each packet that
+  opened, skips one that will not unprotect or whose space has no keys (counted
+  in `dropped`, per §12.2 and RFC 9001 §5.5), stops at a short header, and stops
+  without an error at bytes with no readable end.
+- `Conn.writeFrames` writes in the space it is given: a long header for Initial
+  and Handshake, a short header for `app`. `Conn.writeAck` and `Conn.ackOwed`
+  likewise act per space, so each level is acknowledged in its own space
+  (§13.2.1).
 
-What is still unwired: the space selection in `feed` (`handshake` and `app`
-nothing reads yet), the TLS driver that populates them, coalescing across a
-datagram beyond the first packet, stream frames, `connection_setup`, key
-discard, and timers. The note's slice list is still the order.
+The gate is in `tests/rfc9001.zig`: the A.2 client Initial built through `Conn`
+and compared across all 1200 bytes.
 
-One thing the next agent should not re-derive: the `Space` optionals are the
-seam for slice two. `feed` should pick by packet kind and return
-`error.UnsupportedVersion` or a drop for a space that is still null, rather than
-inventing a second notion of "keys not available yet".
+What is still unwired: the TLS driver that populates `handshake` and `app`
+(there is no code path that does it outside tests), stream frames,
+`connection_setup`, key discard, congestion, and timers. The note's slice list
+is still the order; slice four is stream wiring.
+
+Two things the next agent should not re-derive:
+
+- The `Space` optionals are the seam for the driver, and `error.NoKeys` is the
+  only way a machine says a space is not there. Do not add a readiness flag.
+- `protection.openPacket` mutates the packet in place, so the datagram the
+  caller hands to `Datagram` is a receive buffer, not read-only bytes: header
+  protection is an XOR.

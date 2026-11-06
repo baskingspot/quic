@@ -45,6 +45,12 @@ Test to write when it lands: a server flight of Initial plus Handshake in one
 buffer, fully processed by the client; and a datagram whose first packet is
 corrupt, where the second is still processed.
 
+Both tests landed with `Conn.Datagram` in `src/Conn.zig`, along with the rest of
+the walk: a short header ends it, and bytes with no readable end stop it without
+an error. What remains of this section for later is 0-RTT arriving before the
+Initial it depends on (§17.2.3): this build has no 0-RTT keys, so the packet is
+dropped, which §12.2 allows.
+
 ## 2. Key discard: keys do not last forever
 
 RFC 9001 §4.9 and RFC 9000 §17.2.2.1.
