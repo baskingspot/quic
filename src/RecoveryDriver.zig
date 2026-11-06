@@ -14,6 +14,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Recovery = @import("Recovery.zig");
+const frame = @import("frame.zig");
 
 const RecoveryDriver = @This();
 
@@ -166,7 +167,7 @@ test "RFC 9002 §6.1.2, a loss deadline fires once" {
     try h.space_a.onPacketSent(0, 0, true, true, 1200);
     try h.space_a.onPacketSent(1, 0, true, true, 1200);
 
-    const ack: @import("frame.zig").Ack = .{
+    const ack: frame.Ack = .{
         .largest = 1,
         .delay = 0,
         .first_range = 0,
@@ -200,7 +201,7 @@ test "RFC 9002 Appendix A.8, a deadline that passes with nothing in flight does 
     try testing.expectEqual(Recovery.TimerKind.probe, armed.kind);
 
     // Everything is acknowledged before the timer fires.
-    const ack: @import("frame.zig").Ack = .{
+    const ack: frame.Ack = .{
         .largest = 0,
         .delay = 0,
         .first_range = 0,
