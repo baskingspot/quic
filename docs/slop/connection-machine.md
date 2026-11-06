@@ -21,7 +21,10 @@ Per call it provides `now` and, for input, exactly one datagram. It receives:
 - `events`: packets parsed, CRYPTO bytes per encryption level, stream bytes,
   acknowledgments requested, packets declared lost, a discarded space, a close
   with its code, and a timestamp-free deadline from `RecoveryDriver`.
-- `out`: datagrams to send, one at a time, built by `write(out)`.
+- `out`: datagrams to send, one at a time, built by `write(out)`. Each emitted
+  packet is described by the frames it carries: a stream ID and byte range, a
+  CRYPTO range at a level, an ACK, a reset. That description is what makes the
+  retransmission boundary below real rather than nominal.
 
 Everything is borrowed or caller-owned. `feed` never keeps a pointer into the
 datagram it was handed; a stream's bytes are copied into that stream's ring at
@@ -96,8 +99,15 @@ resource a library must not hold:
 - the socket, the clock value, and the send loop;
 - the congestion controller — `Congestion` exists, the machine calls it and reads
   `canSend`, and implements no policy of its own;
-- retransmission policy: the machine reports lost packets and acked ranges; what
-  to resend, and in which order, is the caller's queue;
+- retransmission policy, over facts it hands over in full. A loss event names
+  the frames that were in the lost packets, not a bare packet number: the caller
+  cannot resend a STREAM range it is never told about, and if the machine kept
+  the packet-to-frames mapping to itself every caller would maintain a parallel
+  copy of it. Acknowledgements come back the same way, as the frames that are
+  now known received. The caller owns a resend queue of frames it already has a
+  description of; the machine keeps no mapping beyond the sent-packet records
+  `Recovery.Space` already holds, and those exist for loss detection, not for
+  the caller to query.
 - pacing, ECN, PMTUD, stream scheduling, and any server policy with a clock in
   it (token minting, anti-amplification, idle timeout).
 
