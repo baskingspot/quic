@@ -27,6 +27,10 @@ All notable changes to quic are recorded here. The format follows
 - `InitialSpace` is no longer exported from the package. It is an Initial-level
   prototype, and the per-space type that replaces it will own the state
   `Recovery` already has.
+- `just interop` builds `tools/interop.zig` and runs it against `quiche-client`:
+  a Retry it must echo back, and a version list it must not negotiate. It skips
+  with the build command when quiche-client is absent, which is the only path
+  that has run here.
 - `StreamTable` is a fixed-capacity id-to-slot table over caller storage: it
   keeps slots sorted by stream ID for a binary lookup, refuses a stream past
   capacity with `error.TableFull`, and never evicts or owns a stream's buffers.

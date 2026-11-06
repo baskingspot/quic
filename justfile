@@ -26,11 +26,34 @@ fuzz LIMIT="10M":
         exit 1
     fi
 
+[doc("Answer a foreign client's first Initial with a Retry, then with version negotiation, and assert on the bytes it sends back. Needs quiche-client on PATH; skips with the exact command when it is absent")]
+[group("test")]
+interop:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! command -v quiche-client >/dev/null 2>&1; then
+        echo "interop: SKIP no quiche-client, so no foreign peer was reached."
+        echo "interop: it is not in nixpkgs. Build it from a checkout:"
+        echo "  git clone --depth 1 https://github.com/cloudflare/quiche"
+        echo "  cd quiche && cargo build --release --bin quiche-client"
+        echo 'interop: then: PATH="$PWD/target/release:$PATH" just interop'
+        exit 0
+    fi
+    zig build interop-bin
+    for mode in retry vn; do
+        port=$(( 40000 + RANDOM % 20000 ))
+        ./zig-out/bin/interop "$mode" "$port" &
+        pid=$!
+        sleep 0.3
+        timeout 10 quiche-client --no-verify --idle-timeout 3000 "https://127.0.0.1:$port/" >/dev/null 2>&1 || true
+        wait "$pid" || exit 1
+    done
+
 [doc("Lint Zig, Nix, Markdown, the workflows, and this justfile: ziglint, zig fmt, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]
 lint:
     ziglint
-    zig fmt --check src build.zig
+    zig fmt --check src tools build.zig
     nix fmt -- --ci
     oxfmt --check README.md AGENTS.md .github
     actionlint
@@ -40,7 +63,7 @@ lint:
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
-    zig fmt src build.zig
+    zig fmt src tools build.zig
     nix fmt
     oxfmt README.md AGENTS.md .github
     just --fmt
