@@ -1,13 +1,16 @@
-//! The connection machine, slice two: the three packet number spaces.
+//! The connection machine, slice three: the three packet number spaces and the
+//! datagram they arrive in.
 //!
-//! A caller feeds one datagram and gets the frames of one packet. The machine
-//! holds a `Space` per packet number space and picks one from the packet's form
-//! and type (RFC 9000 §12.3). Initial keys come from the connection ID (§5.2 of
-//! RFC 9001), so they exist from `init`; the Handshake and application spaces
-//! stay empty until a TLS driver hands their traffic secrets over, and a packet
-//! for an empty space is `error.NoKeys` for the caller to drop (RFC 9001 §5.5).
-//! There is no second notion of "not ready": a space either has keys or it does
-//! not exist.
+//! A caller hands over one datagram, and `Datagram` walks it: one datagram may
+//! carry several packets end to end (RFC 9000 §12.2), and each packet belongs to
+//! the space its form and type name (§12.3). A packet that will not open is
+//! dropped and the walk continues (RFC 9001 §5.5).
+//!
+//! Initial keys come from the connection ID (§5.2 of RFC 9001), so they exist
+//! from `init`; the Handshake and application spaces stay empty until a TLS
+//! driver hands their traffic secrets over, and a packet for an empty space is
+//! `error.NoKeys` for the caller to drop. There is no second notion of "not
+//! ready": a space either has keys or it does not exist.
 //!
 //! Every buffer is the caller's, the clock is a value the caller passes, and
 //! nothing allocates. The only frame this slice emits is an ACK, and it is
@@ -262,6 +265,62 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Opened {
         .packet_len = @intCast(at.bytes.len),
     };
 }
+
+/// A datagram, walked one packet at a time.
+///
+/// §12.2 shapes this in three ways. Long header packets delimit themselves with
+/// their Length field, so the next one starts where this one ended; a short
+/// header has no Length field, so it runs to the end of the datagram and must
+/// be the last packet in it. And a packet that cannot be processed is dropped
+/// rather than fatal, which RFC 9001 §5.5 repeats for one that will not
+/// unprotect: an attacker corrupting a datagram cannot kill the connection, so
+/// the walk goes on to the next packet.
+///
+/// Every `next` hands out the frames of one packet in the caller's `plaintext`
+/// buffer, which is why the caller pulls rather than receives a list: the frames
+/// of two packets cannot share one buffer.
+pub const Datagram = struct {
+    /// The caller's receive buffer, as it arrived. `next` unprotects in place,
+    /// because that is what removing header protection is: an XOR over these
+    /// bytes.
+    bytes: []u8,
+    /// The read position, through the one read walker in this package.
+    cursor: Cursor,
+    /// Packets that the datagram delimited and that did not open: a bad tag, a
+    /// space with no keys yet, or bytes with no readable end.
+    dropped: u16 = 0,
+
+    pub fn init(bytes: []u8) Datagram {
+        return .{ .bytes = bytes, .cursor = .init(bytes) };
+    }
+
+    /// The next packet that opened, or null when there is nothing left to
+    /// process. The frames are valid until the next call.
+    pub fn next(self: *Datagram, conn: *Conn, plaintext: []u8) Error!?Opened {
+        while (self.cursor.remaining() > 0) {
+            const rest = self.bytes[self.cursor.pos..];
+            const at = conn.locate(rest) catch {
+                // The packet has no readable end, so there is no boundary to
+                // find the next one at. The rest of the datagram goes with it.
+                self.dropped += 1;
+                self.cursor.pos = @intCast(self.bytes.len);
+                return null;
+            };
+            _ = self.cursor.skip(@intCast(at.bytes.len));
+
+            return conn.open(at, plaintext) catch |err| switch (err) {
+                // The plaintext buffer is the caller's to size, and running out
+                // of it is not the peer's doing: report it, do not drop it.
+                error.NoSpace => err,
+                else => {
+                    self.dropped += 1;
+                    continue;
+                },
+            };
+        }
+        return null;
+    }
+};
 
 /// The length of this endpoint's own connection ID: what the peer echoes as the
 /// destination of the packets it sends, and what a short header leaves off the
@@ -550,6 +609,154 @@ test "RFC 9000 §19.3, eight received ranges do not overflow the ACK path" {
     const ack = (try frame.read(&cursor)).ack;
     try testing.expectEqual(@as(u64, 7), ack.range_count);
     try testing.expectEqual(server.initial.ranges[0].largest, ack.largest);
+}
+
+test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram" {
+    const dcid = [_]u8{ 0x0d, 0x0e };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x0a},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x0a},
+        .source_connection_id = &.{0x0b},
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x77);
+    const server_secret: [protection.secret_length]u8 = @splat(0x88);
+    installHandshake(&client, &server, client_secret, server_secret);
+
+    // The flight the server cannot know the client can read: both levels in
+    // one datagram, because it is one datagram's worth of network.
+    var flight: [1024]u8 = undefined;
+    const initial_len = try server.writeFrames(.initial, "initial payload bytes", &flight);
+    const handshake_len = try server.writeFrames(.handshake, "handshake payload bytes", flight[initial_len..]);
+    var datagram: Datagram = .init(flight[0 .. initial_len + handshake_len]);
+
+    var plaintext: [512]u8 = undefined;
+
+    const first = (try datagram.next(&client, &plaintext)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("initial payload bytes", first.frames);
+    try testing.expectEqual(@as(?u64, 0), client.initial.largest_received);
+    try testing.expectEqual(@as(?u64, null), client.handshake.?.largest_received);
+
+    const second = (try datagram.next(&client, &plaintext)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("handshake payload bytes", second.frames);
+    try testing.expectEqual(@as(?u64, 0), client.handshake.?.largest_received);
+
+    try testing.expect((try datagram.next(&client, &plaintext)) == null);
+    try testing.expectEqual(@as(u16, 0), datagram.dropped);
+    // Both spaces are accounted for separately, which is what the client needs
+    // to answer each level with an ACK of its own (§13.2.1).
+    try testing.expect(client.ackOwed(.initial));
+    try testing.expect(client.ackOwed(.handshake));
+}
+
+test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next is processed" {
+    const dcid = [_]u8{ 0x1d, 0x1e };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x1a},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x1a},
+        .source_connection_id = &.{0x1b},
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x99);
+    const server_secret: [protection.secret_length]u8 = @splat(0xaa);
+    installHandshake(&client, &server, client_secret, server_secret);
+
+    var flight: [1024]u8 = undefined;
+    const initial_len = try server.writeFrames(.initial, "initial payload bytes", &flight);
+    const handshake_len = try server.writeFrames(.handshake, "handshake payload bytes", flight[initial_len..]);
+    var datagram: Datagram = .init(flight[0 .. initial_len + handshake_len]);
+
+    // A bit in the Initial's authentication tag. An attacker on the path can do
+    // this to any datagram, so it must cost exactly one packet.
+    datagram.bytes[initial_len - 8] ^= 0x01;
+
+    var plaintext: [512]u8 = undefined;
+    const opened = (try datagram.next(&client, &plaintext)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("handshake payload bytes", opened.frames);
+    try testing.expectEqual(@as(?u64, null), client.initial.largest_received);
+    try testing.expectEqual(@as(?u64, 0), client.handshake.?.largest_received);
+    try testing.expectEqual(@as(u16, 1), datagram.dropped);
+    try testing.expect(!client.ackOwed(.initial));
+    try testing.expect(client.ackOwed(.handshake));
+}
+
+test "RFC 9000 §12.2, a short header ends the datagram and nothing is read past it" {
+    const server_id = [_]u8{ 0x31, 0x32 };
+    const client_id = [_]u8{ 0x41, 0x42 };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &server_id,
+        .destination_connection_id = &server_id,
+        .source_connection_id = &client_id,
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &server_id,
+        .destination_connection_id = &client_id,
+        .source_connection_id = &server_id,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0xbb);
+    const server_secret: [protection.secret_length]u8 = @splat(0xcc);
+    installApp(&client, &server, client_secret, server_secret);
+
+    // A long header, then a short one: legal, and the short one is last
+    // because its length is the rest of the datagram.
+    var flight: [1024]u8 = undefined;
+    const initial_len = try client.writeFrames(.initial, "initial payload bytes", &flight);
+    const app_len = try client.writeFrames(.app, "one-rtt payload bytes", flight[initial_len..]);
+    var datagram: Datagram = .init(flight[0 .. initial_len + app_len]);
+
+    var plaintext: [512]u8 = undefined;
+    const initial = (try datagram.next(&server, &plaintext)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("initial payload bytes", initial.frames);
+    const app = (try datagram.next(&server, &plaintext)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("one-rtt payload bytes", app.frames);
+    // The whole tail of the datagram belonged to that packet.
+    try testing.expectEqual(@as(u32, @intCast(app_len)), app.packet_len);
+    try testing.expect((try datagram.next(&server, &plaintext)) == null);
+    try testing.expectEqual(@as(u16, 0), datagram.dropped);
+}
+
+test "RFC 9000 §12.2, bytes with no readable end stop the walk without an error" {
+    const dcid = [_]u8{0x5d};
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x5a},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x5a},
+        .source_connection_id = &.{0x5b},
+    });
+
+    var flight: [512]u8 = undefined;
+    const initial_len = try client.writeFrames(.initial, "initial payload bytes", &flight);
+    // A long header cut off inside its connection ID: no Length field, so
+    // nothing says where the packet would have ended.
+    const junk = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x01, 0x02 };
+    @memcpy(flight[initial_len..][0..junk.len], &junk);
+    var datagram: Datagram = .init(flight[0 .. initial_len + junk.len]);
+
+    var plaintext: [512]u8 = undefined;
+    const opened = (try datagram.next(&server, &plaintext)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("initial payload bytes", opened.frames);
+    try testing.expect((try datagram.next(&server, &plaintext)) == null);
+    try testing.expectEqual(@as(u16, 1), datagram.dropped);
 }
 
 test "RFC 9000 §12.2, coalesced packets: only the first is taken, the length says where it ends" {

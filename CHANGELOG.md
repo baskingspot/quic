@@ -97,6 +97,12 @@ All notable changes to quic are recorded here. The format follows
   and a server-only parameter sent by a client, and it ignores a parameter this
   version does not define.
 
+- `Conn.Datagram` walks one datagram packet by packet (RFC 9000 §12.2): long
+  headers delimit themselves with their Length field, a short header runs to the
+  end, a packet that will not open is counted in `dropped` and the walk
+  continues (RFC 9001 §5.5), and bytes with no readable end stop the walk. It
+  reuses one plaintext buffer, so the caller pulls each packet's frames in turn.
+
 ### Changed
 
 - `Conn` holds the three packet number spaces of RFC 9000 §12.3 and picks one
