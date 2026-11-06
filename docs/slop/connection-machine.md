@@ -67,6 +67,20 @@ record layer:
    §20.1 mapping needs no table in the machine.
 7. The same ownership rules: no I/O, no clock, caller buffers, explicit errors.
 
+This list is now a type: `src/handshake.zig` holds the vtable, and a driver
+implements it without importing the connection machine. Two things the list
+left open have an answer there. Alerts do not need a separate call: while the
+driver has failed, `errorCode` is `0x100 + alert`, so the machine closes with a
+number and keeps no table. And a vtable is what a repository boundary needs:
+`baskingspot/tls` implements the table, and `handshake.Stub` stands in for it in
+this package's tests.
+
+What the machine does with it so far is one direction and the two key-discard
+moments: `Conn.writeHandshake` installs the spaces the driver reports, writes
+its next message as a CRYPTO frame, hands over the transport parameters once,
+and discards the Handshake keys when the driver reports confirmation. The other
+direction waits for CRYPTO reassembly (below).
+
 ## The constraints already written down
 
 `connection-constraints.md` holds two, both of which the machine satisfies by
@@ -142,43 +156,52 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 
 ## Where to resume
 
-State as of slices two and three, green at 168 tests: the three packet number
-spaces, and the walk across a coalesced datagram.
+State as of the three spaces, the datagram walk, key discard, and the TLS seam:
+177 tests.
 
 What exists in `src/Conn.zig`:
 
-- `Conn.init` derives the Initial keys from the connection ID, by role.
-- A `Space` per packet number space: `Conn.SpaceId` is `initial`, `handshake`,
-  or `app`, and `Conn.spaceFor` returns the space or `error.NoKeys`. The
-  `handshake` and `app` optionals are the seam the TLS driver fills; there is
-  no third state next to them.
+- `Conn.init` derives the Initial keys from the connection ID, by role, and
+  holds the connection IDs itself: a space is keys, counters, and received
+  ranges, and a discarded space does not take the connection's identity away.
+- `Conn.SpaceId` is `initial`, `handshake`, or `app`; `Conn.spaceFor` returns
+  the space or `error.NoKeys`, and every space is optional. `Conn.discard`
+  zeroes a space's keys and removes it (RFC 9001 §4.9), and the two moments of
+  RFC 9000 §17.2.2.1 are wired: a client drops Initial keys when its first
+  Handshake packet goes out, a server when its first one arrives.
 - `Conn.feed` takes one packet and picks its space from the form and type
-  (§12.3): Initial and Handshake long headers, a short header for the
-  application space, 0-RTT folded into `app` because §12.3 shares the space
-  (this build has no 0-RTT keys, so such a packet fails to authenticate and is
-  dropped). It unprotects, recovers the number from the space's
-  `largest_received`, records the range, and returns frames plus `packet_len`.
-- `Conn.Datagram` walks a whole datagram: `next` returns each packet that
-  opened, skips one that will not unprotect or whose space has no keys (counted
-  in `dropped`, per §12.2 and RFC 9001 §5.5), stops at a short header, and stops
-  without an error at bytes with no readable end.
-- `Conn.writeFrames` writes in the space it is given: a long header for Initial
-  and Handshake, a short header for `app`. `Conn.writeAck` and `Conn.ackOwed`
-  likewise act per space, so each level is acknowledged in its own space
-  (§13.2.1).
+  (§12.3). `Conn.Datagram` walks a whole datagram: long headers delimit
+  themselves, a short header ends it, a packet that will not unprotect or whose
+  space is gone is counted in `dropped` and skipped (RFC 9001 §5.5), and bytes
+  with no readable end stop the walk without an error.
+- `Conn.writeFrames`, `Conn.writeAck`, and `Conn.ackOwed` take the space they act
+  on; `writeFrames` writes a short header for `app` and a long one otherwise.
+- `Conn.writeHandshake` drives the `handshake` seam: transport parameters once,
+  spaces installed from the secrets the driver reports, one CRYPTO frame per
+  call at the level the driver named, and the Handshake keys gone once
+  `confirmed` says so (§4.9.2).
 
-The gate is in `tests/rfc9001.zig`: the A.2 client Initial built through `Conn`
-and compared across all 1200 bytes.
+`src/handshake.zig` is the seam: the vtable, `Driver` with the context bound,
+and `Stub` for a caller that has no TLS.
 
-What is still unwired: the TLS driver that populates `handshake` and `app`
-(there is no code path that does it outside tests), stream frames,
-`connection_setup`, key discard, congestion, and timers. The note's slice list
-is still the order; slice four is stream wiring.
+What is still unwired, in the order I would take it:
+
+1. CRYPTO reassembly, so `feed(level, bytes)` has a machine caller at all. The
+   machine does not parse frames yet: `feed` hands the caller the payload and
+   stops. Reassembly is a per-level offset and a buffer the caller owns, and it
+   is the first half of the frame-parsing slice.
+2. Frame parsing in the machine, then streams: `StreamTable`, STREAM frames into
+   `ReceiveStream`, segments out of `SendStream`, flow control counters.
+3. `connection_setup` on the server side, Retry and version negotiation state on
+   the client side.
+4. The `Recovery.Space` per space, and with it the loss half of §6.4 that
+   `Conn.Space.discard` leaves to it.
 
 Two things the next agent should not re-derive:
 
-- The `Space` optionals are the seam for the driver, and `error.NoKeys` is the
-  only way a machine says a space is not there. Do not add a readiness flag.
+- `error.NoKeys` is the only way the machine says a space is not there. It used
+  to be a null optional next to a keys field; it is not any more, and a readiness
+  flag would be the same mistake a third time.
 - `protection.openPacket` mutates the packet in place, so the datagram the
   caller hands to `Datagram` is a receive buffer, not read-only bytes: header
   protection is an XOR.
