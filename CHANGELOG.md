@@ -96,15 +96,26 @@ All notable changes to quic are recorded here. The format follows
   including `preferred_address`. It refuses a duplicate, an out-of-range value,
   and a server-only parameter sent by a client, and it ignores a parameter this
   version does not define.
-
 - `Conn.Datagram` walks one datagram packet by packet (RFC 9000 §12.2): long
   headers delimit themselves with their Length field, a short header runs to the
   end, a packet that will not open is counted in `dropped` and the walk
   continues (RFC 9001 §5.5), and bytes with no readable end stop the walk. It
   reuses one plaintext buffer, so the caller pulls each packet's frames in turn.
+- `Conn.discard` drops a packet number space and its keys (RFC 9001 §4.9, RFC
+  9000 §17.2.2.1): the key material is zeroed, the space becomes absent, and a
+  packet that arrives for it afterwards is `error.NoKeys` for the datagram walk
+  to drop. `Conn.Space.discard` is the same at the space level, for a caller
+  that holds a copy.
+- `Conn` carries the connection IDs, not each space: `Conn.Space` holds keys,
+  counters, and received ranges only. A discarded space no longer takes the
+  connection's identity with it, so a space can be created after another one is
+  gone.
 
 ### Changed
 
+- `Conn.initial` is `?Conn.Space`, because RFC 9000 §17.2.2.1 discards the
+  Initial keys once a Handshake packet goes each way. All three spaces now
+  follow the same rule: absent means no keys.
 - `Conn` holds the three packet number spaces of RFC 9000 §12.3 and picks one
   from the packet's form and type. `Conn.feed`, `Conn.writeFrames`,
   `Conn.writeAck`, and `Conn.ackOwed` take the space they act on, and a space

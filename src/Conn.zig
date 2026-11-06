@@ -80,16 +80,14 @@ pub const Opened = struct {
     packet_len: u32,
 };
 
-/// One packet number space: its identity as far as the peer sees it, its keys,
-/// its counters, and the ranges it has received.
+/// One packet number space: its keys, its counters, and the ranges it has
+/// received. The connection IDs a packet names belong to the connection, not to
+/// a space, because a space can be discarded and the connection keeps going.
 ///
-/// `initial` exists from `init`. `handshake` and `app` are the fields a TLS
-/// driver fills in when it produces the space's traffic secrets: the keys, and
-/// the connection IDs a packet in that space names. Nothing else here is
-/// conditional on the space being present.
+/// Every space is present from `init` or appears when a TLS driver reports its
+/// traffic secrets, and any of them can be discarded. Absent is the only way
+/// this type says "no keys"; there is no flag next to it.
 pub const Space = struct {
-    destination_connection_id: []const u8,
-    source_connection_id: []const u8,
     send_keys: protection.Keys,
     receive_keys: protection.Keys,
     next_packet_number: u64 = 0,
@@ -100,9 +98,28 @@ pub const Space = struct {
     /// Received packet numbers, descending and merged, for the ACK frame.
     ranges: [range_capacity]Range = undefined,
     range_count: u4 = 0,
+    /// How much CRYPTO data this endpoint has sent in this space: the offset
+    /// the next CRYPTO frame starts at (§19.6).
+    crypto_sent: u64 = 0,
 
     pub fn ackOwed(self: *const Space) bool {
         return self.range_count != 0 and self.acked_through != self.largest_received;
+    }
+
+    /// RFC 9001 §4.9: the keys go, and nothing encrypted under them is
+    /// reachable afterwards.
+    ///
+    /// The loss state that goes with the keys (RFC 9002 §6.4) belongs to the
+    /// `Recovery.Space` a space will own, and the RTT estimate is not touched:
+    /// it belongs to the path, not to the space (RFC 9002 A.2).
+    pub fn discard(self: *Space) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.send_keys));
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.receive_keys));
+        self.next_packet_number = 0;
+        self.largest_received = null;
+        self.acked_through = null;
+        self.range_count = 0;
+        self.crypto_sent = 0;
     }
 
     /// Note a packet number that arrived, merging it into the ranges an ACK
@@ -146,10 +163,15 @@ pub const Space = struct {
 
 role: Role,
 packet_number_len: u3,
+/// What this endpoint writes into the packets it sends. The connection IDs
+/// outlive every space: discarding a space's keys does not change what the peer
+/// calls this endpoint.
+destination_connection_id: []const u8,
+source_connection_id: []const u8,
 /// Initial keys are derivable from the connection ID alone, so this space
-/// cannot be absent.
-initial: Space,
-/// Handshake keys come from the TLS driver, which is not wired yet.
+/// exists from `init`, and goes when §17.2.2.1 says it is no longer needed.
+initial: ?Space,
+/// Handshake keys come from the TLS driver.
 handshake: ?Space = null,
 /// 1-RTT keys, same.
 app: ?Space = null,
@@ -166,9 +188,9 @@ pub fn init(config: Config) Conn {
     return .{
         .role = config.role,
         .packet_number_len = config.packet_number_len,
+        .destination_connection_id = config.destination_connection_id,
+        .source_connection_id = config.source_connection_id,
         .initial = .{
-            .destination_connection_id = config.destination_connection_id,
-            .source_connection_id = config.source_connection_id,
             .send_keys = if (config.role == .client) client else server,
             .receive_keys = if (config.role == .client) server else client,
         },
@@ -180,9 +202,27 @@ pub fn init(config: Config) Conn {
 /// does, and disappears when its keys are discarded; there is no third state.
 pub fn spaceFor(self: *Conn, id: SpaceId) Error!*Space {
     switch (id) {
-        .initial => return &self.initial,
+        .initial => return if (self.initial) |*space| space else error.NoKeys,
         .handshake => return if (self.handshake) |*space| space else error.NoKeys,
         .app => return if (self.app) |*space| space else error.NoKeys,
+    }
+}
+
+/// Drop a space and its keys: RFC 9001 §4.9 for the Handshake and 1-RTT keys,
+/// RFC 9000 §17.2.2.1 for the Initial ones.
+///
+/// After this the space is absent, so a packet for it is `error.NoKeys` and the
+/// datagram walk drops it, which is what a late Initial or a coalesced packet
+/// for a level the peer has moved past needs (§12.2). The connection goes on:
+/// the connection IDs, the packet number width, and the RTT estimate are the
+/// connection's, not the space's.
+pub fn discard(self: *Conn, id: SpaceId) Error!void {
+    const space = try self.spaceFor(id);
+    space.discard();
+    switch (id) {
+        .initial => self.initial = null,
+        .handshake => self.handshake = null,
+        .app => self.app = null,
     }
 }
 
@@ -325,9 +365,9 @@ pub const Datagram = struct {
 /// The length of this endpoint's own connection ID: what the peer echoes as the
 /// destination of the packets it sends, and what a short header leaves off the
 /// wire (§17.3.1). Connection IDs do not change in this build, so the one the
-/// Initial space writes is the one every packet from the peer names.
+/// connection was configured with is the one every packet from the peer names.
 fn localConnectionIdLen(self: *const Conn) u32 {
-    return @intCast(self.initial.source_connection_id.len);
+    return @intCast(self.source_connection_id.len);
 }
 
 /// Seal a packet in `id`'s space carrying `frames`, which the caller already
@@ -346,13 +386,13 @@ pub fn writeFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8) Erro
     const pn_offset = switch (id) {
         .initial, .handshake => (try packet.writeLong(&writer, .{
             .kind = if (id == .initial) .initial else .handshake,
-            .destination_connection_id = space.destination_connection_id,
-            .source_connection_id = space.source_connection_id,
+            .destination_connection_id = self.destination_connection_id,
+            .source_connection_id = self.source_connection_id,
             .packet_number_len = pn_len,
             .body_len = @as(u32, pn_len) + @as(u32, @intCast(frames.len)) + protection.tag_length,
         })).packet_number,
         .app => (try packet.writeShort(&writer, .{
-            .destination_connection_id = space.destination_connection_id,
+            .destination_connection_id = self.destination_connection_id,
             .packet_number_len = pn_len,
         })).packet_number,
     };
@@ -368,7 +408,7 @@ pub fn writeFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8) Erro
 /// nothing, because nothing in it can have arrived.
 pub fn ackOwed(self: *const Conn, id: SpaceId) bool {
     const space: *const Space = switch (id) {
-        .initial => &self.initial,
+        .initial => if (self.initial) |*space| space else return false,
         .handshake => if (self.handshake) |*space| space else return false,
         .app => if (self.app) |*space| space else return false,
     };
@@ -484,7 +524,7 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     try testing.expectEqual(@as(u64, 0), opened.packet_number);
     try testing.expectEqual(@as(?u64, 0), server.handshake.?.largest_received);
     // Not the Initial space, which received nothing.
-    try testing.expectEqual(@as(?u64, null), server.initial.largest_received);
+    try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
     try testing.expect(server.ackOwed(.handshake));
     try testing.expect(!server.ackOwed(.initial));
 
@@ -494,7 +534,7 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     const at_client = try client.feed(datagram[0..ack_len], &plaintext);
     var cursor = Cursor.init(at_client.frames);
     try testing.expectEqual(@as(u64, 0), (try frame.read(&cursor)).ack.largest);
-    try testing.expectEqual(@as(?u64, null), client.initial.largest_received);
+    try testing.expectEqual(@as(?u64, null), client.initial.?.largest_received);
 }
 
 test "RFC 9000 §12.3, a space with no keys is an error and not a second kind of empty" {
@@ -528,6 +568,111 @@ test "RFC 9000 §12.3, a space with no keys is an error and not a second kind of
     // Nothing was recorded, so nothing is owed.
     try testing.expect(!server.ackOwed(.handshake));
     try testing.expect(!server.ackOwed(.app));
+}
+
+test "RFC 9001 §4.9, a discarded space keeps no keys and no counters" {
+    const dcid = [_]u8{ 0xd1, 0xd2 };
+    const conn: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xd3},
+    });
+
+    // A space that has been used: counters, a received range, and an
+    // acknowledgment already sent.
+    var space = conn.initial.?;
+    space.next_packet_number = 9;
+    space.crypto_sent = 1234;
+    space.largest_received = 7;
+    space.record(7);
+    space.acked_through = 7;
+    try testing.expect(!space.ackOwed());
+
+    space.discard();
+
+    const zeros: [32]u8 = @splat(0);
+    try testing.expectEqualSlices(u8, &zeros, &space.send_keys.key);
+    try testing.expectEqualSlices(u8, &zeros, &space.receive_keys.key);
+    try testing.expectEqualSlices(u8, &zeros, &space.send_keys.hp);
+    try testing.expectEqualSlices(u8, &zeros, &space.receive_keys.hp);
+    try testing.expectEqual(@as(u64, 0), space.next_packet_number);
+    try testing.expectEqual(@as(u64, 0), space.crypto_sent);
+    try testing.expectEqual(@as(?u64, null), space.largest_received);
+    try testing.expectEqual(@as(?u64, null), space.acked_through);
+    try testing.expectEqual(@as(u4, 0), space.range_count);
+}
+
+test "RFC 9000 §17.2.2.1, a packet for a discarded space is dropped and the connection goes on" {
+    const dcid = [_]u8{ 0xe1, 0xe2 };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xea},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0xea},
+        .source_connection_id = &.{0xeb},
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0xdd);
+    const server_secret: [protection.secret_length]u8 = @splat(0xee);
+    installHandshake(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+
+    // The server has read an Initial, and §17.2.2.1 says it can let the keys go
+    // once it processes a Handshake packet. It does, and then the late Initial
+    // that arrives next is dropped rather than decrypted under a dead key.
+    const stale = try client.writeFrames(.initial, "initial payload bytes", &datagram);
+    _ = try server.feed(datagram[0..stale], &plaintext);
+    try server.discard(.initial);
+    try testing.expectError(error.NoKeys, server.spaceFor(.initial));
+    try testing.expect(!server.ackOwed(.initial));
+    try testing.expectError(error.NoKeys, server.writeFrames(.initial, "x", &datagram));
+
+    const late = try client.writeFrames(.initial, "a late initial payload", &datagram);
+    var walk: Datagram = .init(datagram[0..late]);
+    try testing.expect((try walk.next(&server, &plaintext)) == null);
+    try testing.expectEqual(@as(u16, 1), walk.dropped);
+
+    // The rest of the connection is untouched: the Handshake space opens what
+    // the client sends there, because the connection IDs are the connection's.
+    const handshake = try client.writeFrames(.handshake, "handshake payload bytes", &datagram);
+    const opened = try server.feed(datagram[0..handshake], &plaintext);
+    try testing.expectEqualStrings("handshake payload bytes", opened.frames);
+    try testing.expectEqual(@as(?u64, 0), server.handshake.?.largest_received);
+
+    // And the server can still write: discarding a space does not take the
+    // connection's identity or its packet number width with it.
+    const ack = try server.writeAck(.handshake, &datagram);
+    const at_client = try client.feed(datagram[0..ack], &plaintext);
+    try testing.expect(at_client.frames.len > 0);
+}
+
+test "RFC 9001 §4.9.2, the Handshake keys can go while the application keys stay" {
+    const dcid = [_]u8{ 0xf1, 0xf2 };
+    var conn: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xfa},
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x01);
+    const server_secret: [protection.secret_length]u8 = @splat(0x02);
+    installHandshake(&conn, &conn, client_secret, server_secret);
+    installApp(&conn, &conn, client_secret, server_secret);
+
+    try conn.discard(.handshake);
+    try testing.expectError(error.NoKeys, conn.spaceFor(.handshake));
+    try testing.expectError(error.NoKeys, conn.discard(.handshake));
+    // 1-RTT traffic is the point of discarding the Handshake keys, so it is
+    // still there.
+    try testing.expect(conn.app != null);
+    try testing.expect(conn.initial != null);
 }
 
 test "RFC 9000 §17.3.1, the application space writes a short header and opens one" {
@@ -565,7 +710,7 @@ test "RFC 9000 §17.3.1, the application space writes a short header and opens o
     const opened = try server.feed(datagram[0..sent], &plaintext);
     try testing.expectEqualStrings("a one-rtt payload to sample", opened.frames);
     try testing.expectEqual(@as(?u64, 0), server.app.?.largest_received);
-    try testing.expectEqual(@as(?u64, null), server.initial.largest_received);
+    try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
     // The whole rest of the datagram is the packet: a short header has no
     // Length field (§12.2).
     try testing.expectEqual(@as(u32, @intCast(sent)), opened.packet_len);
@@ -587,10 +732,10 @@ test "RFC 9000 §19.3, eight received ranges do not overflow the ACK path" {
     var index: usize = 0;
     while (index < range_capacity) : (index += 1) {
         const smallest: u64 = 4 + (range_capacity - 1 - index) * spacing;
-        server.initial.ranges[index] = .{ .smallest = smallest, .largest = smallest + run };
-        server.initial.range_count += 1;
+        server.initial.?.ranges[index] = .{ .smallest = smallest, .largest = smallest + run };
+        server.initial.?.range_count += 1;
     }
-    server.initial.largest_received = server.initial.ranges[0].largest;
+    server.initial.?.largest_received = server.initial.?.ranges[0].largest;
 
     var out: [512]u8 = undefined;
     const ack_len = try server.writeAck(.initial, &out);
@@ -608,7 +753,7 @@ test "RFC 9000 §19.3, eight received ranges do not overflow the ACK path" {
     var cursor = Cursor.init(at_client.frames);
     const ack = (try frame.read(&cursor)).ack;
     try testing.expectEqual(@as(u64, 7), ack.range_count);
-    try testing.expectEqual(server.initial.ranges[0].largest, ack.largest);
+    try testing.expectEqual(server.initial.?.ranges[0].largest, ack.largest);
 }
 
 test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram" {
@@ -640,7 +785,7 @@ test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram"
 
     const first = (try datagram.next(&client, &plaintext)) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("initial payload bytes", first.frames);
-    try testing.expectEqual(@as(?u64, 0), client.initial.largest_received);
+    try testing.expectEqual(@as(?u64, 0), client.initial.?.largest_received);
     try testing.expectEqual(@as(?u64, null), client.handshake.?.largest_received);
 
     const second = (try datagram.next(&client, &plaintext)) orelse return error.TestUnexpectedResult;
@@ -685,7 +830,7 @@ test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next i
     var plaintext: [512]u8 = undefined;
     const opened = (try datagram.next(&client, &plaintext)) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("handshake payload bytes", opened.frames);
-    try testing.expectEqual(@as(?u64, null), client.initial.largest_received);
+    try testing.expectEqual(@as(?u64, null), client.initial.?.largest_received);
     try testing.expectEqual(@as(?u64, 0), client.handshake.?.largest_received);
     try testing.expectEqual(@as(u16, 1), datagram.dropped);
     try testing.expect(!client.ackOwed(.initial));
@@ -811,21 +956,19 @@ test "RFC 9001 §5.5, a packet that will not unprotect changes nothing" {
     datagram[sent - 20] ^= 0x01;
     try testing.expectError(error.AuthenticationFailed, server.feed(datagram[0..sent], &plaintext));
     try testing.expect(!server.ackOwed(.initial));
-    try testing.expectEqual(@as(?u64, null), server.initial.largest_received);
+    try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
 }
 
 /// Stand in for the TLS driver: hand both endpoints a space, with the keys
 /// crossed the way the two roles need them.
 fn installSpace(conn: *Conn, id: SpaceId, send: protection.Keys, receive: protection.Keys) void {
     std.debug.assert(id != .initial);
-    // The identity a driver copies from the Initial space plus its own keys.
-    var installed: Space = conn.initial;
-    installed.send_keys = send;
-    installed.receive_keys = receive;
-    installed.next_packet_number = 0;
-    installed.largest_received = null;
-    installed.acked_through = null;
-    installed.range_count = 0;
+    // What a driver fills in: the keys for the level, and nothing else. The
+    // counters and ranges start where `init` leaves them.
+    const installed: Space = .{
+        .send_keys = send,
+        .receive_keys = receive,
+    };
     switch (id) {
         .initial => unreachable,
         .handshake => conn.handshake = installed,
