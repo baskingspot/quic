@@ -218,7 +218,7 @@ test "RFC 9001 A.2, the machine reproduces the client Initial byte for byte" {
         .source_connection_id = &.{},
         .packet_number_len = 4,
     });
-    conn.next_packet_number = 2;
+    conn.initial.next_packet_number = 2;
 
     var out: [1200]u8 = undefined;
     const length = try conn.writeFrames(&data.client_payload, &out);

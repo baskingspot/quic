@@ -56,23 +56,35 @@ pub const Opened = struct {
     packet_len: u32,
 };
 
-pub const Role_ = Role;
+/// One packet number space: its identity as far as the peer sees it, its keys,
+/// its counters, and the ranges it has received.
+///
+/// Slice one populates `initial` and nothing else. `handshake` and `app` are
+/// the fields the wiring fills in: a space stays null until the handshake
+/// driver hands over its secrets.
+pub const Space = struct {
+    destination_connection_id: []const u8,
+    source_connection_id: []const u8,
+    send_keys: protection.Keys,
+    receive_keys: protection.Keys,
+    next_packet_number: u64 = 0,
+    largest_received: ?u64 = null,
+    /// The largest packet number an ACK has been sent for, so a machine does
+    /// not acknowledge the same thing twice.
+    acked_through: ?u64 = null,
+    /// Received packet numbers, descending and merged, for the ACK frame.
+    ranges: [8]Range = undefined,
+    range_count: u4 = 0,
+};
 
 role: Role,
-destination_connection_id: []const u8,
-source_connection_id: []const u8,
-send_keys: protection.Keys,
-receive_keys: protection.Keys,
 packet_number_len: u3,
-next_packet_number: u64 = 0,
-largest_received: ?u64 = null,
-/// The largest packet number an ACK has been sent for, so a machine does not
-/// acknowledge the same thing twice.
-acked_through: ?u64 = null,
-
-/// Received packet numbers, descending and merged, for the ACK frame.
-ranges: [8]Range = undefined,
-range_count: u4 = 0,
+/// The only space this slice knows how to build: Initial.
+initial: Space,
+/// Handshake keys come from the TLS driver, which is not wired yet.
+handshake: ?Space = null,
+/// 1-RTT keys, same.
+app: ?Space = null,
 
 pub fn init(config: Config) Conn {
     std.debug.assert(config.packet_number_len >= 1);
@@ -85,11 +97,13 @@ pub fn init(config: Config) Conn {
 
     return .{
         .role = config.role,
-        .destination_connection_id = config.destination_connection_id,
-        .source_connection_id = config.source_connection_id,
-        .send_keys = if (config.role == .client) client else server,
-        .receive_keys = if (config.role == .client) server else client,
         .packet_number_len = config.packet_number_len,
+        .initial = .{
+            .destination_connection_id = config.destination_connection_id,
+            .source_connection_id = config.source_connection_id,
+            .send_keys = if (config.role == .client) client else server,
+            .receive_keys = if (config.role == .client) server else client,
+        },
     };
 }
 
@@ -107,14 +121,14 @@ pub fn feed(self: *Conn, datagram: []u8, plaintext: []u8) Error!Opened {
     if (packet_end > datagram.len) return error.Truncated;
 
     const opened = try protection.openPacket(
-        &self.receive_keys,
+        &self.initial.receive_keys,
         datagram[0..packet_end],
         long.body_offset,
-        self.largest_received,
+        self.initial.largest_received,
         plaintext,
     );
 
-    self.largest_received = if (self.largest_received) |largest|
+    self.initial.largest_received = if (self.initial.largest_received) |largest|
         @max(largest, opened.packet_number)
     else
         opened.packet_number;
@@ -133,41 +147,41 @@ pub fn feed(self: *Conn, datagram: []u8, plaintext: []u8) Error!Opened {
 /// This is the seam the later slices widen: the machine builds the header, the
 /// packet number, and the protection, and the caller says what is inside.
 pub fn writeFrames(self: *Conn, frames: []const u8, out: []u8) Error!u32 {
-    const pn = self.next_packet_number;
+    const pn = self.initial.next_packet_number;
     const pn_len = self.packet_number_len;
 
     var writer: Writer = .init(out);
     const offsets = try packet.writeLong(&writer, .{
         .kind = .initial,
-        .destination_connection_id = self.destination_connection_id,
-        .source_connection_id = self.source_connection_id,
+        .destination_connection_id = self.initial.destination_connection_id,
+        .source_connection_id = self.initial.source_connection_id,
         .packet_number_len = pn_len,
         .body_len = @as(u32, pn_len) + @as(u32, @intCast(frames.len)) + protection.tag_length,
     });
     try packet_number.write(&writer, pn, pn_len);
 
-    const total = try protection.sealPacket(&self.send_keys, pn, offsets.packet_number, pn_len, frames, out);
-    self.next_packet_number += 1;
+    const total = try protection.sealPacket(&self.initial.send_keys, pn, offsets.packet_number, pn_len, frames, out);
+    self.initial.next_packet_number += 1;
     return total;
 }
 
 /// Whether an acknowledgment is owed: something has been received since the
 /// last one was sent.
 pub fn ackOwed(self: *const Conn) bool {
-    return self.range_count != 0 and self.acked_through != self.largest_received;
+    return self.initial.range_count != 0 and self.initial.acked_through != self.initial.largest_received;
 }
 
 /// Seal an Initial packet carrying one ACK frame for everything received.
 pub fn writeAck(self: *Conn, out: []u8) Error!u32 {
-    if (self.range_count == 0) return error.WrongPacketType;
+    if (self.initial.range_count == 0) return error.WrongPacketType;
 
     var scratch: [64]u8 = undefined;
     var scratch_writer: Writer = .init(&scratch);
-    const first = self.ranges[0];
+    const first = self.initial.ranges[0];
     var previous_smallest = first.smallest;
     var index: usize = 1;
-    while (index < self.range_count) : (index += 1) {
-        const range = self.ranges[index];
+    while (index < self.initial.range_count) : (index += 1) {
+        const range = self.initial.ranges[index];
         std.debug.assert(previous_smallest >= range.largest + 2);
         varint.write(&scratch_writer, previous_smallest - range.largest - 2) catch unreachable;
         varint.write(&scratch_writer, range.largest - range.smallest) catch unreachable;
@@ -178,7 +192,7 @@ pub fn writeAck(self: *Conn, out: []u8) Error!u32 {
         .largest = first.largest,
         .delay = 0,
         .first_range = first.largest - first.smallest,
-        .range_count = self.range_count - 1,
+        .range_count = self.initial.range_count - 1,
         .bytes = scratch_writer.written(),
         .ecn = null,
     };
@@ -188,7 +202,7 @@ pub fn writeAck(self: *Conn, out: []u8) Error!u32 {
     try frame.write(&payload_writer, .{ .ack = ack });
 
     const total = try self.writeFrames(payload_writer.written(), out);
-    self.acked_through = self.largest_received;
+    self.initial.acked_through = self.initial.largest_received;
     return total;
 }
 
@@ -196,7 +210,7 @@ fn record(self: *Conn, pn: u64) void {
     var buf: [9]Range = undefined;
     var count: usize = 0;
     var inserted = false;
-    for (self.ranges[0..self.range_count]) |range| {
+    for (self.initial.ranges[0..self.initial.range_count]) |range| {
         if (!inserted and range.largest < pn) {
             buf[count] = .{ .smallest = pn, .largest = pn };
             count += 1;
@@ -223,9 +237,9 @@ fn record(self: *Conn, pn: u64) void {
         merged += 1;
     }
 
-    const kept = @min(merged, self.ranges.len);
-    @memcpy(self.ranges[0..kept], buf[0..kept]);
-    self.range_count = @intCast(kept);
+    const kept = @min(merged, self.initial.ranges.len);
+    @memcpy(self.initial.ranges[0..kept], buf[0..kept]);
+    self.initial.range_count = @intCast(kept);
 }
 
 test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
@@ -316,5 +330,5 @@ test "RFC 9001 §5.5, a packet that will not unprotect changes nothing" {
     datagram[sent - 20] ^= 0x01;
     try testing.expectError(error.AuthenticationFailed, server.feed(datagram[0..sent], &plaintext));
     try testing.expect(!server.ackOwed());
-    try testing.expectEqual(@as(?u64, null), server.largest_received);
+    try testing.expectEqual(@as(?u64, null), server.initial.largest_received);
 }

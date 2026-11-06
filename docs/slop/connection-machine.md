@@ -139,3 +139,31 @@ can block everything after slice 4.
 
 What is not in the number: `http.h3`, QPACK, stream scheduling, pacing, ECN,
 PMTUD, key update, and the 0-RTT path. Each is its own note.
+
+## Where to resume
+
+State as of `Conn` slice one plus the `Space` struct, green at 160 tests.
+
+What exists: `src/Conn.zig` with `Conn.init` (Initial keys from the connection
+ID, by role), `feed` (one datagram, one packet, unprotect, recover the number
+from `largest_received`, record the range, return frames plus `packet_len`),
+`writeFrames` (header, number, seal), `writeAck` (an ACK for what was received,
+remembering what it covered), and `acked_through` so a machine does not
+acknowledge the same thing twice. The gate is in `tests/rfc9001.zig`: the A.2
+client Initial built through `Conn` and compared across all 1200 bytes.
+
+What the struct gives the next agent: `Conn.Space` carries identity, keys,
+counters, and received ranges. `Conn` holds `initial: Space` and two optionals,
+`handshake` and `app`, that are null and stay null until the wiring fills them.
+Every method currently acts on `self.initial` explicitly, so the wiring is a
+matter of choosing the space and passing it, not of splitting anything.
+
+What is still unwired: the space selection in `feed` (`handshake` and `app`
+nothing reads yet), the TLS driver that populates them, coalescing across a
+datagram beyond the first packet, stream frames, `connection_setup`, key
+discard, and timers. The note's slice list is still the order.
+
+One thing the next agent should not re-derive: the `Space` optionals are the
+seam for slice two. `feed` should pick by packet kind and return
+`error.UnsupportedVersion` or a drop for a space that is still null, rather than
+inventing a second notion of "keys not available yet".
