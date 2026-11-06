@@ -27,6 +27,12 @@ All notable changes to quic are recorded here. The format follows
 - `InitialSpace` is no longer exported from the package. It is an Initial-level
   prototype, and the per-space type that replaces it will own the state
   `Recovery` already has.
+- `StreamTable` is a fixed-capacity id-to-slot table over caller storage: it
+  keeps slots sorted by stream ID for a binary lookup, refuses a stream past
+  capacity with `error.TableFull`, and never evicts or owns a stream's buffers.
+- `ReceiveStream.onData` reports backpressure instead of an error when the
+  caller's ring is full, leaving the stream untouched. The reassembly table's
+  own limit is `error.TooManyGaps`.
 - `RecoveryDriver` is the timer side of RFC 9002: one deadline across every
   packet number space (a due loss time beats a probe), and the event to service
   when it passes. It holds no clock; the caller passes the time. Firing changes

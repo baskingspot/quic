@@ -108,6 +108,7 @@ pub fn write(self: *SendStream, bytes: []const u8) Error!usize {
 /// of length zero at the final size.
 pub fn end(self: *SendStream) Error!void {
     if (self.final_size != null) return error.Closed;
+    if (self.reset_code != null) return error.Closed;
     if (self.isTerminal()) return error.Closed;
     self.final_size = self.written;
 }
@@ -427,4 +428,117 @@ test "RFC 9000 §3.5, STOP_SENDING demands a reset while data is still sendable"
     try testing.expectEqual(State.data_sent, finished.state);
     try testing.expect(!try finished.onStopSending(0x10));
     try testing.expectEqual(State.data_sent, finished.state);
+}
+
+/// A stream in the given state, over the caller's buffer.
+fn inState(state: State, buffer: []u8) SendStream {
+    var stream: SendStream = .init(0, buffer, 1000);
+    switch (state) {
+        .ready => {},
+        .send => {
+            _ = stream.write("abcd") catch unreachable;
+            _ = stream.nextSegment(2);
+        },
+        .data_sent, .data_recvd => {
+            _ = stream.write("abcd") catch unreachable;
+            stream.end() catch unreachable;
+            _ = stream.nextSegment(4);
+            if (state == .data_recvd) stream.onAck(0, 4) catch unreachable;
+        },
+        .reset_sent => stream.reset(1) catch unreachable,
+        .reset_recvd => {
+            stream.reset(1) catch unreachable;
+            stream.onResetAcked() catch unreachable;
+        },
+    }
+    return stream;
+}
+
+test "RFC 9000 §3.1, every operation in every sending state" {
+    inline for (std.meta.tags(State)) |state| {
+        var buffer: [16]u8 = undefined;
+
+        // write: legal until the application ends or the stream dies.
+        {
+            var stream = inState(state, &buffer);
+            const result = stream.write("x");
+            switch (state) {
+                .ready, .send => try testing.expectEqual(@as(usize, 1), try result),
+                else => try testing.expectError(error.Closed, result),
+            }
+        }
+
+        // end: the same rule, and idempotence is not allowed either.
+        {
+            var stream = inState(state, &buffer);
+            const result = stream.end();
+            switch (state) {
+                .ready, .send => try result,
+                else => try testing.expectError(error.Closed, result),
+            }
+        }
+
+        // reset: legal from the three live states only.
+        {
+            var stream = inState(state, &buffer);
+            const result = stream.reset(9);
+            switch (state) {
+                .ready, .send, .data_sent => try result,
+                else => try testing.expectError(error.StreamState, result),
+            }
+        }
+
+        // nextSegment: data only while there is data to hand out.
+        {
+            var stream = inState(state, &buffer);
+            const segment = stream.nextSegment(2);
+            switch (state) {
+                // Ready has nothing queued: this stream was created and never
+                // written to. Send always has something left.
+                .ready => try testing.expect(segment == null),
+                .send => try testing.expect(segment != null),
+                else => try testing.expect(segment == null),
+            }
+        }
+
+        // onAck: a valid acknowledgment is never an error, in any state.
+        {
+            var stream = inState(state, &buffer);
+            try stream.onAck(0, 1);
+        }
+
+        // onResetAcked: only a reset stream can have one acknowledged.
+        {
+            var stream = inState(state, &buffer);
+            const result = stream.onResetAcked();
+            switch (state) {
+                .reset_sent => try result,
+                else => try testing.expectError(error.StreamState, result),
+            }
+        }
+
+        // onStopSending: a demand for a reset in the live states, a deferral in
+        // Data Sent, and nothing at all once the stream is over.
+        {
+            var stream = inState(state, &buffer);
+            const must_reset = try stream.onStopSending(5);
+            switch (state) {
+                .ready, .send => try testing.expect(must_reset),
+                .data_sent, .reset_sent, .reset_recvd, .data_recvd => try testing.expect(!must_reset),
+            }
+        }
+    }
+}
+
+test "RFC 9000 §3.1, an acknowledgment beyond the final size is still an acknowledgment" {
+    // The stream does not police what the peer acknowledges; it only tracks the
+    // contiguous prefix, which is capped by what it sent.
+    var buffer: [8]u8 = undefined;
+    var stream: SendStream = .init(0, &buffer, 1000);
+    _ = try stream.write("ab");
+    try stream.end();
+    _ = stream.nextSegment(2).?;
+    try stream.onAck(0, 2);
+    try testing.expectEqual(State.data_recvd, stream.state);
+    try testing.expectEqual(@as(u64, 2), stream.acked);
 }

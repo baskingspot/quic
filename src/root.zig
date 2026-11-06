@@ -38,6 +38,7 @@ pub const varint = @import("varint.zig");
 pub const SendStream = @import("SendStream.zig");
 pub const ReceiveStream = @import("ReceiveStream.zig");
 pub const FlowControl = @import("FlowControl.zig");
+pub const StreamTable = @import("StreamTable.zig");
 
 test {
     _ = @import("Cursor.zig");
@@ -59,4 +60,5 @@ test {
     _ = SendStream;
     _ = ReceiveStream;
     _ = FlowControl;
+    _ = StreamTable;
 }

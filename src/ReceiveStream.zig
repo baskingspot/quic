@@ -37,9 +37,21 @@ pub const Error = error{
     FinalSize,
     /// STREAM_STATE_ERROR: the stream cannot accept this (§3.2).
     StreamState,
-    /// The caller's ring is smaller than the window it advertised, so the byte
-    /// cannot be stored. That is a caller defect, not a wire error.
-    NoSpace,
+    /// More out-of-order runs are outstanding than the reassembly table holds.
+    /// This is the table's limit, not the ring's: a frame that does not fit the
+    /// ring is backpressure, see `Stored`.
+    TooManyGaps,
+};
+
+/// What happened to a STREAM frame's payload.
+pub const Stored = enum {
+    /// The bytes are in the ring.
+    accepted,
+    /// The ring has no room. The stream is unchanged: nothing was stored and no
+    /// range was recorded, so the caller can read, or widen its window, and
+    /// offer the same frame again. A peer that respected the advertised window
+    /// did nothing wrong, which is why this is not an error.
+    backpressure,
 };
 
 const Range = struct {
@@ -99,9 +111,9 @@ pub fn nextMaxStreamData(self: *const ReceiveStream) ?u64 {
 }
 
 /// Take a STREAM frame's payload.
-pub fn onData(self: *ReceiveStream, offset: u64, data: []const u8, fin: bool) Error!void {
-    if (self.state == .reset_recvd or self.state == .reset_read) return;
-    if (self.state == .data_read) return;
+pub fn onData(self: *ReceiveStream, offset: u64, data: []const u8, fin: bool) Error!Stored {
+    if (self.state == .reset_recvd or self.state == .reset_read) return .accepted;
+    if (self.state == .data_read) return .accepted;
 
     const end = offset + data.len;
     if (self.final_size) |size| {
@@ -119,13 +131,15 @@ pub fn onData(self: *ReceiveStream, offset: u64, data: []const u8, fin: bool) Er
         if (self.final_size.? > self.limit) return error.FlowControl;
     }
 
-    // Everything inside the advertised window must fit the ring.
-    if (data.len > 0 and end > self.window()) return error.NoSpace;
+    // A frame inside the advertised window always fits a ring that is as large
+    // as the window. A caller that advertised more than it can hold gets
+    // backpressure, not an error, and the stream stays exactly as it was.
+    if (data.len > 0 and end > self.window()) return .backpressure;
 
     if (data.len > 0) {
         self.store(offset, data);
         self.highest = @max(self.highest, end);
-        self.noteRange(offset, end) catch return error.NoSpace;
+        try self.noteRange(offset, end);
     }
 
     if (fin and self.state == .recv) self.state = .size_known;
@@ -134,6 +148,7 @@ pub fn onData(self: *ReceiveStream, offset: u64, data: []const u8, fin: bool) Er
             self.state = .data_recvd;
         }
     }
+    return .accepted;
 }
 
 /// §3.2: a RESET_STREAM. Legal in Recv, Size Known, and after the data is in.
@@ -210,7 +225,7 @@ fn noteRange(self: *ReceiveStream, start: u64, end: u64) Error!void {
         self.absorb();
         return;
     }
-    if (self.pending_len == self.pending.len) return error.NoSpace;
+    if (self.pending_len == self.pending.len) return error.TooManyGaps;
 
     var index: usize = 0;
     while (index < self.pending_len and self.pending[index].start < start) : (index += 1) {}
@@ -261,11 +276,11 @@ test "RFC 9000 §3.2, in-order data is read and the stream ends cleanly" {
     var ring: [16]u8 = undefined;
     var stream: ReceiveStream = .init(0, &ring, 16);
 
-    try stream.onData(0, "hello", false);
+    _ = try stream.onData(0, "hello", false);
     try testing.expectEqual(@as(u64, 5), stream.readable());
     try testing.expectEqual(State.recv, stream.state);
 
-    try stream.onData(5, " world", true);
+    _ = try stream.onData(5, " world", true);
     try testing.expectEqual(@as(u64, 11), stream.readable());
     // §3.2: the FIN tells us the final size, and with all the data here the
     // stream is Data Recvd.
@@ -285,12 +300,12 @@ test "RFC 9000 §2.2, out-of-order data reassembles into a contiguous stream" {
     var stream: ReceiveStream = .init(4, &ring, 32);
 
     // The tail arrives first: nothing is readable yet.
-    try stream.onData(5, "fghij", false);
+    _ = try stream.onData(5, "fghij", false);
     try testing.expectEqual(@as(u64, 0), stream.readable());
     try testing.expectEqual(@as(u64, 10), stream.highest);
 
     // The head arrives and the run joins it.
-    try stream.onData(0, "abcde", false);
+    _ = try stream.onData(0, "abcde", false);
     try testing.expectEqual(@as(u64, 10), stream.readable());
     try testing.expectEqual(State.recv, stream.state);
 
@@ -303,7 +318,7 @@ test "RFC 9000 §3.2 and §4.1, the stream limit is an absolute offset" {
     var ring: [64]u8 = undefined;
     var stream: ReceiveStream = .init(0, &ring, 10);
 
-    try stream.onData(0, "0123456789", false);
+    _ = try stream.onData(0, "0123456789", false);
     try testing.expectEqual(@as(u64, 10), stream.readable());
 
     // One byte past the advertised limit is a connection error, not a dropped
@@ -313,7 +328,7 @@ test "RFC 9000 §3.2 and §4.1, the stream limit is an absolute offset" {
     try testing.expectError(error.FlowControl, stream.onData(20, "y", false));
     // A FIN at exactly the limit is legal: it sets no byte past it. One byte
     // further is a violation, because the final size consumes credit (§4.5).
-    try stream.onData(10, "", true);
+    _ = try stream.onData(10, "", true);
     try testing.expectEqual(@as(?u64, 10), stream.final_size);
     var other: ReceiveStream = .init(0, &ring, 10);
     try testing.expectError(error.FlowControl, other.onData(11, "", true));
@@ -323,7 +338,7 @@ test "RFC 9000 §4.5, the final size cannot change" {
     var ring: [32]u8 = undefined;
     var stream: ReceiveStream = .init(0, &ring, 32);
 
-    try stream.onData(0, "abcd", true);
+    _ = try stream.onData(0, "abcd", true);
     try testing.expectEqual(@as(?u64, 4), stream.final_size);
     try testing.expectEqual(State.data_recvd, stream.state);
 
@@ -337,7 +352,7 @@ test "RFC 9000 §3.2, a reset ends the stream and the application collects the c
     var ring: [32]u8 = undefined;
     var stream: ReceiveStream = .init(0, &ring, 32);
 
-    try stream.onData(0, "abc", false);
+    _ = try stream.onData(0, "abc", false);
     try stream.onReset(0x42, 3);
     try testing.expectEqual(State.reset_recvd, stream.state);
     try testing.expectEqual(@as(?u64, 0x42), stream.reset_code);
@@ -362,7 +377,7 @@ test "RFC 9000 §4.2, the receiver owes a MAX_STREAM_DATA after the application 
     // With nothing read, the window is what we already advertised.
     try testing.expectEqual(@as(?u64, null), stream.nextMaxStreamData());
 
-    try stream.onData(0, "0123456789", false);
+    _ = try stream.onData(0, "0123456789", false);
     var out: [16]u8 = undefined;
     _ = try stream.readInto(&out);
 
@@ -376,10 +391,142 @@ test "RFC 9000 §3.5, STOP_SENDING is answered once and only while receiving" {
     var stream: ReceiveStream = .init(0, &ring, 16);
     try testing.expectEqual(@as(?u64, 7), stream.onStopSending(7));
     // Frames after the stop are still accounted for flow control.
-    try stream.onData(0, "abc", false);
+    _ = try stream.onData(0, "abc", false);
     try testing.expectEqual(@as(u64, 3), stream.highest);
 
     // Once the stream is reset, there is nothing left to ask the peer to stop.
     try stream.onReset(1, 3);
     try testing.expectEqual(@as(?u64, null), stream.onStopSending(7));
+}
+
+/// A stream in the given state, over the caller's ring.
+fn inState(state: State, ring: []u8) ReceiveStream {
+    var stream: ReceiveStream = .init(0, ring, 16);
+    switch (state) {
+        .recv => {},
+        .size_known => _ = stream.onData(0, "ab", true) catch unreachable,
+        .data_recvd => {
+            _ = stream.onData(0, "ab", true) catch unreachable;
+        },
+        .data_read => {
+            _ = stream.onData(0, "ab", true) catch unreachable;
+            var out: [4]u8 = undefined;
+            _ = stream.readInto(&out) catch unreachable;
+        },
+        .reset_recvd => stream.onReset(1, 2) catch unreachable,
+        .reset_read => {
+            stream.onReset(1, 2) catch unreachable;
+            _ = stream.readReset() catch unreachable;
+        },
+    }
+    return stream;
+}
+
+test "RFC 9000 §3.2, every operation in every receiving state" {
+    inline for (std.meta.tags(State)) |state| {
+        var ring: [16]u8 = undefined;
+
+        // onData: data is always accepted while the stream is live, and after a
+        // reset or a full read it is ignored rather than refused.
+        {
+            var stream = inState(state, &ring);
+            const stored = try stream.onData(0, "xy", false);
+            switch (state) {
+                .recv, .size_known => try testing.expectEqual(Stored.accepted, stored),
+                else => try testing.expectEqual(Stored.accepted, stored),
+            }
+        }
+
+        // onReset: legal until the application has finished with the stream.
+        {
+            var stream = inState(state, &ring);
+            const result = stream.onReset(3, 2);
+            switch (state) {
+                .data_read, .reset_read => try result,
+                else => try result,
+            }
+        }
+
+        // readInto: reading a reset stream is the application's mistake.
+        {
+            var stream = inState(state, &ring);
+            var out: [4]u8 = undefined;
+            const result = stream.readInto(&out);
+            switch (state) {
+                .reset_recvd, .reset_read => try testing.expectError(error.StreamState, result),
+                else => _ = try result,
+            }
+        }
+
+        // readReset: only a reset stream has a code to collect.
+        {
+            var stream = inState(state, &ring);
+            const result = stream.readReset();
+            switch (state) {
+                .reset_recvd => try testing.expectEqual(@as(u64, 1), try result),
+                else => try testing.expectError(error.StreamState, result),
+            }
+        }
+    }
+}
+
+test "RFC 9000 §2.2, overlapping and duplicate ranges are idempotent" {
+    var ring: [32]u8 = undefined;
+    var stream: ReceiveStream = .init(0, &ring, 32);
+
+    _ = try stream.onData(0, "abcdef", false);
+    // The same bytes again, and a range that overlaps both ends.
+    _ = try stream.onData(0, "abcdef", false);
+    _ = try stream.onData(2, "cdefgh", false);
+
+    try testing.expectEqual(@as(u64, 8), stream.readable());
+    var out: [16]u8 = undefined;
+    const read = try stream.readInto(&out);
+    try testing.expectEqualStrings("abcdefgh", out[0..read]);
+
+    // A duplicate that arrives behind the read point is not an error.
+    _ = try stream.onData(0, "ab", false);
+    try testing.expectEqual(@as(u64, 0), stream.readable());
+}
+
+test "RFC 9000 §4.5, a FIN in the middle of the range and data past it" {
+    var ring: [32]u8 = undefined;
+    var stream: ReceiveStream = .init(0, &ring, 32);
+
+    // A FIN with data: the final size is offset plus length.
+    _ = try stream.onData(2, "cd", true);
+    try testing.expectEqual(@as(?u64, 4), stream.final_size);
+    try testing.expectEqual(State.size_known, stream.state);
+
+    // Data past that final size is FINAL_SIZE_ERROR, even though the stream is
+    // not complete.
+    try testing.expectError(error.FinalSize, stream.onData(4, "e", false));
+
+    // The gap closes and the stream completes.
+    _ = try stream.onData(0, "ab", false);
+    try testing.expectEqual(State.data_recvd, stream.state);
+
+    // Exactly at the final size with no bytes is legal and changes nothing.
+    _ = try stream.onData(4, "", false);
+    try testing.expectEqual(State.data_recvd, stream.state);
+}
+
+test "the ring is the caller's limit, and a full one is backpressure" {
+    var ring: [4]u8 = undefined;
+    // A window larger than the ring: the caller advertised more than it holds.
+    var stream: ReceiveStream = .init(0, &ring, 32);
+
+    _ = try stream.onData(0, "abcd", false);
+    try testing.expectEqual(@as(u64, 4), stream.readable());
+
+    // The fifth byte does not fit. The stream is unchanged, and the caller can
+    // read and offer it again.
+    try testing.expectEqual(Stored.backpressure, try stream.onData(4, "e", false));
+    try testing.expectEqual(@as(u64, 4), stream.readable());
+    try testing.expectEqual(@as(u64, 4), stream.highest);
+
+    var out: [4]u8 = undefined;
+    _ = try stream.readInto(&out);
+    try testing.expectEqual(Stored.accepted, try stream.onData(4, "e", false));
+    try testing.expectEqual(@as(u64, 1), stream.readable());
 }
