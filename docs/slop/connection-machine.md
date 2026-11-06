@@ -1,0 +1,107 @@
+# The connection machine: contract, spaces, line
+
+Design note. No code yet. The model is `h1.ServerConn` in http: the caller owns
+the wire, the buffers, and the clock; the machine owns protocol state and turns
+bytes into events.
+
+## The contract
+
+A caller provides, once, at `init`:
+
+- storage: the send datagram, the receive datagram, one `StreamTable` and its
+  slots, and the send buffers and receive rings for each stream. No allocator
+  enters the API, so capacity is the caller's number and every "no room" is a
+  named error rather than a reallocation.
+- identity: role, local connection IDs, the peer's initial connection ID, and
+  the initial limits from its own transport parameters.
+- its own `Recovery` and `Congestion`, and the `RecoveryDriver` over them.
+
+Per call it provides `now` and, for input, exactly one datagram. It receives:
+
+- `events`: packets parsed, CRYPTO bytes per encryption level, stream bytes,
+  acknowledgments requested, packets declared lost, a discarded space, a close
+  with its code, and a timestamp-free deadline from `RecoveryDriver`.
+- `out`: datagrams to send, one at a time, built by `write(out)`.
+
+Everything is borrowed or caller-owned. `feed` never keeps a pointer into the
+datagram it was handed; a stream's bytes are copied into that stream's ring at
+`onData`, which is where the only unavoidable copy lives.
+
+## The three spaces
+
+| space | keys from | created | discarded |
+| --- | --- | --- | --- |
+| Initial | `protection.initialSecrets(dcid)` — us, not tls | `init` | the client's first Handshake packet sent, or the server's first received (RFC 9000 §17.2.2.1) |
+| Handshake | the TLS driver's handshake secrets | when the driver reports them | when the handshake is confirmed (RFC 9001 §4.9.2) |
+| 1-RTT | the driver's application secrets | same | on close |
+
+Each space has its own `Recovery.Space` over caller slots, and a discard is
+`Space.discard()` plus zeroing the key bytes: the RTT estimate and congestion
+window survive, because they belong to the path, not the space (RFC 9002 A.2).
+
+Key update (RFC 9001 §6) is deliberately out of the first build. The "quic ku"
+derivation is already tested, so the hook is a driver method, not new arithmetic.
+
+### What I need from tls, precisely
+
+The handshake driver is a sans-I/O message machine with encryption levels, no
+record layer:
+
+1. `feed(level, bytes) -> Error!void` — CRYPTO frame payloads, in order, per
+   level. The machine does reassembly of CRYPTO offsets; the driver sees a
+   contiguous stream.
+2. `next() -> ?Message { level, bytes }` — handshake bytes to put in CRYPTO
+   frames at that level, drained until null.
+3. `secrets(level) -> ?Secrets { client, server }` — 32-byte traffic secrets
+   (48 for SHA-384 suites, which `protection.deriveKeys` already refuses by
+   length). The driver says when they become available.
+4. A way to set our `quic_transport_parameters` extension (0x0039) before the
+   first flight and to return the peer's bytes when they arrive. QUIC encodes
+   them; tls carries them opaquely.
+5. `confirmed() -> bool` — the moment §4.9.2 lets us discard Handshake keys and
+   the moment §6.2.1 lets us arm 1-RTT PTO.
+6. `alpn() -> ?[]const u8`, and alerts surfaced as the CRYPTO_ERROR range so
+   §20.1 mapping needs no table in the machine.
+7. The same ownership rules: no I/O, no clock, caller buffers, explicit errors.
+
+## The constraints already written down
+
+`connection-constraints.md` holds two, both of which the machine satisfies by
+construction:
+
+- **Coalescing.** `feed` takes a datagram and walks it: parse the invariant
+  header, choose the space from the version and packet type, unprotect, and on
+  failure drop that packet and continue (RFC 9001 §5.5). A short header ends the
+  walk because it has no Length field. `Long.packet_len` is where the next one
+  starts.
+- **Key discard.** `Space.discard()` exists now; the machine calls it at the two
+  moments in the table above, and a packet arriving for a discarded space is
+  dropped, not an error.
+
+The third item in that note, the duplicated `largest_acked`, disappears: the
+machine owns the only `Recovery.Space` per space, and `InitialSpace` is deleted
+in the same change that lands the machine.
+
+## The line
+
+The machine owns: packet format and protection per space, packet number
+assignment, ACK generation and ranges, the stream table and both stream halves,
+stream and connection flow control counters, close, version negotiation and
+Retry on the server side, the client's `connection_setup.Client`, and key
+discard.
+
+It refuses to own, because a caller does it better or because it needs a
+resource a library must not hold:
+
+- the socket, the clock value, and the send loop;
+- the congestion controller — `Congestion` exists, the machine calls it and reads
+  `canSend`, and implements no policy of its own;
+- retransmission policy: the machine reports lost packets and acked ranges; what
+  to resend, and in which order, is the caller's queue;
+- pacing, ECN, PMTUD, stream scheduling, and any server policy with a clock in
+  it (token minting, anti-amplification, idle timeout).
+
+To be a QUIC endpoint a caller writes: a UDP socket, a monotonic clock, a
+resend queue, a TLS driver satisfying the seam above, a `Congestion`, and its
+application protocol. Those seven exist in `http` already or are the reason
+`http.h3` will be a separate module.
