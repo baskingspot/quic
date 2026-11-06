@@ -1,10 +1,13 @@
-//! The connection machine, slice one: parse, protect, acknowledge.
+//! The connection machine, slice two: the three packet number spaces.
 //!
-//! A caller feeds one datagram and a time, and gets the frames that came out of
-//! it. The machine holds the Initial keys, the packet numbers in both
-//! directions, and the ranges it has received, which is exactly what producing
-//! an acknowledgment requires. Nothing else is here yet: no handshake, no
-//! streams, no congestion, no coalescing, no timers.
+//! A caller feeds one datagram and gets the frames of one packet. The machine
+//! holds a `Space` per packet number space and picks one from the packet's form
+//! and type (RFC 9000 §12.3). Initial keys come from the connection ID (§5.2 of
+//! RFC 9001), so they exist from `init`; the Handshake and application spaces
+//! stay empty until a TLS driver hands their traffic secrets over, and a packet
+//! for an empty space is `error.NoKeys` for the caller to drop (RFC 9001 §5.5).
+//! There is no second notion of "not ready": a space either has keys or it does
+//! not exist.
 //!
 //! Every buffer is the caller's, the clock is a value the caller passes, and
 //! nothing allocates. The only frame this slice emits is an ACK, and it is
@@ -25,13 +28,31 @@ const Conn = @This();
 
 const Range = struct { smallest: u64, largest: u64 };
 
+/// How many separate received ranges a space tracks. Eight covers the
+/// reordering a handshake sees in practice; beyond it, the oldest range is
+/// forgotten, which §13.2.4 allows.
+pub const range_capacity = 8;
+
+/// The widest encoding of one integer, from the codec that writes it.
+const max_varint_len = varint.size(varint.max);
+
+/// The most a gap and its range length can take: two eight-byte varints. A full
+/// table holds `range_capacity` ranges, so at most one fewer pair (§19.3.1).
+const ack_range_scratch_len = range_capacity * 2 * max_varint_len;
+
 pub const Role = enum { client, server };
 
+/// The packet number spaces of §12.3. There are three, not four: 0-RTT and
+/// 1-RTT packets share the application data space.
+pub const SpaceId = enum { initial, handshake, app };
+
 pub const Error = protection.Error || packet.Error || frame.Error || error{
-    NotInitial,
+    /// No traffic keys are installed for the space. Handshake and application
+    /// keys arrive from the TLS driver, and the space is absent until then.
+    NoKeys,
     UnsupportedVersion,
-    /// The caller's output buffer cannot hold the packet.
-    NoSpace,
+    /// An acknowledgment was asked of a space that has received nothing.
+    NothingToAcknowledge,
 };
 
 pub const Config = struct {
@@ -59,9 +80,10 @@ pub const Opened = struct {
 /// One packet number space: its identity as far as the peer sees it, its keys,
 /// its counters, and the ranges it has received.
 ///
-/// Slice one populates `initial` and nothing else. `handshake` and `app` are
-/// the fields the wiring fills in: a space stays null until the handshake
-/// driver hands over its secrets.
+/// `initial` exists from `init`. `handshake` and `app` are the fields a TLS
+/// driver fills in when it produces the space's traffic secrets: the keys, and
+/// the connection IDs a packet in that space names. Nothing else here is
+/// conditional on the space being present.
 pub const Space = struct {
     destination_connection_id: []const u8,
     source_connection_id: []const u8,
@@ -73,13 +95,56 @@ pub const Space = struct {
     /// not acknowledge the same thing twice.
     acked_through: ?u64 = null,
     /// Received packet numbers, descending and merged, for the ACK frame.
-    ranges: [8]Range = undefined,
+    ranges: [range_capacity]Range = undefined,
     range_count: u4 = 0,
+
+    pub fn ackOwed(self: *const Space) bool {
+        return self.range_count != 0 and self.acked_through != self.largest_received;
+    }
+
+    /// Note a packet number that arrived, merging it into the ranges an ACK
+    /// frame is built from (§19.3.1).
+    fn record(self: *Space, pn: u64) void {
+        var buf: [range_capacity + 1]Range = undefined;
+        var count: usize = 0;
+        var inserted = false;
+        for (self.ranges[0..self.range_count]) |range| {
+            if (!inserted and range.largest < pn) {
+                buf[count] = .{ .smallest = pn, .largest = pn };
+                count += 1;
+                inserted = true;
+            }
+            buf[count] = range;
+            count += 1;
+        }
+        if (!inserted) {
+            buf[count] = .{ .smallest = pn, .largest = pn };
+            count += 1;
+        }
+
+        var merged: usize = 0;
+        for (buf[0..count]) |range| {
+            if (merged > 0) {
+                const previous = &buf[merged - 1];
+                if (range.largest +% 1 >= previous.smallest) {
+                    previous.smallest = @min(previous.smallest, range.smallest);
+                    continue;
+                }
+            }
+            buf[merged] = range;
+            merged += 1;
+        }
+
+        const kept = @min(merged, range_capacity);
+        @memcpy(self.ranges[0..kept], buf[0..kept]);
+        self.range_count = @intCast(kept);
+    }
 };
 
 role: Role,
 packet_number_len: u3,
-/// The only space this slice knows how to build: Initial.
+/// Initial keys are derivable from the connection ID alone, so this space
+/// cannot be absent.
 initial: Space,
 /// Handshake keys come from the TLS driver, which is not wired yet.
 handshake: ?Space = null,
@@ -107,82 +172,166 @@ pub fn init(config: Config) Conn {
     };
 }
 
-/// Take one datagram's first packet and return its frames.
+/// The space for `id` with traffic keys installed, or `error.NoKeys` when there
+/// is none to act on. A handshake or application space appears when its driver
+/// does, and disappears when its keys are discarded; there is no third state.
+pub fn spaceFor(self: *Conn, id: SpaceId) Error!*Space {
+    switch (id) {
+        .initial => return &self.initial,
+        .handshake => return if (self.handshake) |*space| space else error.NoKeys,
+        .app => return if (self.app) |*space| space else error.NoKeys,
+    }
+}
+
+/// Take the first packet of a datagram and return its frames.
 ///
 /// `plaintext` receives the payload. A packet that will not unprotect is an
 /// error and leaves the machine untouched, which is what §5.5 requires of a
 /// caller that then drops it.
 pub fn feed(self: *Conn, datagram: []u8, plaintext: []u8) Error!Opened {
-    const long = try packet.parseLong(datagram);
-    if (long.kind != .initial) return error.NotInitial;
-    if (long.version != .v1) return error.UnsupportedVersion;
+    return self.open(try self.locate(datagram), plaintext);
+}
 
-    const packet_end = @as(usize, long.body_offset) + long.length;
-    if (packet_end > datagram.len) return error.Truncated;
+/// One packet of a datagram, located and assigned to a space, before it is
+/// unprotected.
+const Located = struct {
+    /// The space the packet belongs to, from its form and type (§12.3).
+    id: SpaceId,
+    /// Exactly this packet's bytes. A short header has no Length field, so it
+    /// runs to the end of the datagram (§12.2).
+    bytes: []u8,
+    /// Where the packet number starts, counted from `bytes[0]`.
+    pn_offset: u32,
+};
+
+fn locate(self: *const Conn, bytes: []u8) Error!Located {
+    if (bytes.len == 0) return error.Truncated;
+
+    if (bytes[0] & 0x80 == 0) {
+        // §17.3.1: a short header omits the destination connection ID length,
+        // so reading one needs the connection and not only its bytes.
+        const short = try packet.parseShort(bytes, self.localConnectionIdLen());
+        return .{
+            .id = .app,
+            .bytes = bytes,
+            .pn_offset = @intCast(1 + short.destination_connection_id.len),
+        };
+    }
+
+    const long = try packet.parseLong(bytes);
+    if (long.version != .v1) return error.UnsupportedVersion;
+    const id: SpaceId = switch (long.kind) {
+        .initial => .initial,
+        .handshake => .handshake,
+        // §12.3 puts 0-RTT in the application space. This build has no 0-RTT
+        // keys, so a 0-RTT packet is opened, at best, under 1-RTT keys and
+        // fails to authenticate: that is the drop §12.2 asks for.
+        .zero_rtt => .app,
+        // `parseLong` refuses a Retry, which has no Length field.
+        .retry => unreachable,
+    };
+
+    return .{
+        .id = id,
+        .bytes = bytes[0 .. @as(usize, long.body_offset) + long.length],
+        .pn_offset = long.body_offset,
+    };
+}
+
+fn open(self: *Conn, at: Located, plaintext: []u8) Error!Opened {
+    const space = try self.spaceFor(at.id);
 
     const opened = try protection.openPacket(
-        &self.initial.receive_keys,
-        datagram[0..packet_end],
-        long.body_offset,
-        self.initial.largest_received,
+        &space.receive_keys,
+        at.bytes,
+        at.pn_offset,
+        space.largest_received,
         plaintext,
     );
 
-    self.initial.largest_received = if (self.initial.largest_received) |largest|
+    space.largest_received = if (space.largest_received) |largest|
         @max(largest, opened.packet_number)
     else
         opened.packet_number;
-    self.record(opened.packet_number);
+    space.record(opened.packet_number);
 
     return .{
         .packet_number = opened.packet_number,
         .frames = opened.payload,
         .header_len = opened.header_len,
-        .packet_len = @intCast(packet_end),
+        .packet_len = @intCast(at.bytes.len),
     };
 }
 
-/// Seal a packet carrying `frames`, which the caller already encoded.
+/// The length of this endpoint's own connection ID: what the peer echoes as the
+/// destination of the packets it sends, and what a short header leaves off the
+/// wire (§17.3.1). Connection IDs do not change in this build, so the one the
+/// Initial space writes is the one every packet from the peer names.
+fn localConnectionIdLen(self: *const Conn) u32 {
+    return @intCast(self.initial.source_connection_id.len);
+}
+
+/// Seal a packet in `id`'s space carrying `frames`, which the caller already
+/// encoded.
 ///
-/// This is the seam the later slices widen: the machine builds the header, the
-/// packet number, and the protection, and the caller says what is inside.
-pub fn writeFrames(self: *Conn, frames: []const u8, out: []u8) Error!u32 {
-    const pn = self.initial.next_packet_number;
+/// Initial and Handshake packets get a long header; an application packet gets
+/// a short one, because §17.3 allows no other form for 1-RTT. This is the seam
+/// the later slices widen: the machine builds the header, the packet number, and
+/// the protection, and the caller says what is inside.
+pub fn writeFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8) Error!u32 {
+    const space = try self.spaceFor(id);
+    const pn = space.next_packet_number;
     const pn_len = self.packet_number_len;
 
     var writer: Writer = .init(out);
-    const offsets = try packet.writeLong(&writer, .{
-        .kind = .initial,
-        .destination_connection_id = self.initial.destination_connection_id,
-        .source_connection_id = self.initial.source_connection_id,
-        .packet_number_len = pn_len,
-        .body_len = @as(u32, pn_len) + @as(u32, @intCast(frames.len)) + protection.tag_length,
-    });
+    const pn_offset = switch (id) {
+        .initial, .handshake => (try packet.writeLong(&writer, .{
+            .kind = if (id == .initial) .initial else .handshake,
+            .destination_connection_id = space.destination_connection_id,
+            .source_connection_id = space.source_connection_id,
+            .packet_number_len = pn_len,
+            .body_len = @as(u32, pn_len) + @as(u32, @intCast(frames.len)) + protection.tag_length,
+        })).packet_number,
+        .app => (try packet.writeShort(&writer, .{
+            .destination_connection_id = space.destination_connection_id,
+            .packet_number_len = pn_len,
+        })).packet_number,
+    };
     try packet_number.write(&writer, pn, pn_len);
 
-    const total = try protection.sealPacket(&self.initial.send_keys, pn, offsets.packet_number, pn_len, frames, out);
-    self.initial.next_packet_number += 1;
+    const total = try protection.sealPacket(&space.send_keys, pn, pn_offset, pn_len, frames, out);
+    space.next_packet_number += 1;
     return total;
 }
 
-/// Whether an acknowledgment is owed: something has been received since the
-/// last one was sent.
-pub fn ackOwed(self: *const Conn) bool {
-    return self.initial.range_count != 0 and self.initial.acked_through != self.initial.largest_received;
+/// Whether an acknowledgment is owed in `id`'s space: something has been
+/// received there since the last one was sent. A space with no keys owes
+/// nothing, because nothing in it can have arrived.
+pub fn ackOwed(self: *const Conn, id: SpaceId) bool {
+    const space: *const Space = switch (id) {
+        .initial => &self.initial,
+        .handshake => if (self.handshake) |*space| space else return false,
+        .app => if (self.app) |*space| space else return false,
+    };
+    return space.ackOwed();
 }
 
-/// Seal an Initial packet carrying one ACK frame for everything received.
-pub fn writeAck(self: *Conn, out: []u8) Error!u32 {
-    if (self.initial.range_count == 0) return error.WrongPacketType;
+/// Seal a packet carrying one ACK frame for everything received in `id`'s
+/// space. An ACK is sent in the space it acknowledges (§13.2.1).
+pub fn writeAck(self: *Conn, id: SpaceId, out: []u8) Error!u32 {
+    const space = try self.spaceFor(id);
+    if (space.range_count == 0) return error.NothingToAcknowledge;
 
-    var scratch: [64]u8 = undefined;
+    var scratch: [ack_range_scratch_len]u8 = undefined;
     var scratch_writer: Writer = .init(&scratch);
-    const first = self.initial.ranges[0];
+    const first = space.ranges[0];
     var previous_smallest = first.smallest;
     var index: usize = 1;
-    while (index < self.initial.range_count) : (index += 1) {
-        const range = self.initial.ranges[index];
+    while (index < space.range_count) : (index += 1) {
+        const range = space.ranges[index];
         std.debug.assert(previous_smallest >= range.largest + 2);
+        // Each value is below 2^62, so eight bytes hold it and the scratch,
+        // sized for every pair at eight bytes, cannot run out.
         varint.write(&scratch_writer, previous_smallest - range.largest - 2) catch unreachable;
         varint.write(&scratch_writer, range.largest - range.smallest) catch unreachable;
         previous_smallest = range.smallest;
@@ -192,54 +341,18 @@ pub fn writeAck(self: *Conn, out: []u8) Error!u32 {
         .largest = first.largest,
         .delay = 0,
         .first_range = first.largest - first.smallest,
-        .range_count = self.initial.range_count - 1,
+        .range_count = space.range_count - 1,
         .bytes = scratch_writer.written(),
         .ecn = null,
     };
 
-    var payload: [128]u8 = undefined;
+    var payload: [ack_range_scratch_len + 32]u8 = undefined;
     var payload_writer: Writer = .init(&payload);
     try frame.write(&payload_writer, .{ .ack = ack });
 
-    const total = try self.writeFrames(payload_writer.written(), out);
-    self.initial.acked_through = self.initial.largest_received;
+    const total = try self.writeFrames(id, payload_writer.written(), out);
+    space.acked_through = space.largest_received;
     return total;
-}
-
-fn record(self: *Conn, pn: u64) void {
-    var buf: [9]Range = undefined;
-    var count: usize = 0;
-    var inserted = false;
-    for (self.initial.ranges[0..self.initial.range_count]) |range| {
-        if (!inserted and range.largest < pn) {
-            buf[count] = .{ .smallest = pn, .largest = pn };
-            count += 1;
-            inserted = true;
-        }
-        buf[count] = range;
-        count += 1;
-    }
-    if (!inserted) {
-        buf[count] = .{ .smallest = pn, .largest = pn };
-        count += 1;
-    }
-
-    var merged: usize = 0;
-    for (buf[0..count]) |range| {
-        if (merged > 0) {
-            const previous = &buf[merged - 1];
-            if (range.largest +% 1 >= previous.smallest) {
-                previous.smallest = @min(previous.smallest, range.smallest);
-                continue;
-            }
-        }
-        buf[merged] = range;
-        merged += 1;
-    }
-
-    const kept = @min(merged, self.initial.ranges.len);
-    @memcpy(self.initial.ranges[0..kept], buf[0..kept]);
-    self.initial.range_count = @intCast(kept);
 }
 
 test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
@@ -260,15 +373,18 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
 
-    const sent = try client.writeFrames("a payload with enough bytes to sample", &datagram);
+    // Nothing has arrived yet, so there is nothing to acknowledge.
+    try testing.expectError(error.NothingToAcknowledge, server.writeAck(.initial, &datagram));
+
+    const sent = try client.writeFrames(.initial, "a payload with enough bytes to sample", &datagram);
     const at_server = try server.feed(datagram[0..sent], &plaintext);
     try testing.expectEqual(@as(u64, 0), at_server.packet_number);
     try testing.expectEqualStrings("a payload with enough bytes to sample", at_server.frames);
-    try testing.expect(server.ackOwed());
+    try testing.expect(server.ackOwed(.initial));
 
     // The server answers with an ACK for packet 0.
-    const ack_len = try server.writeAck(&datagram);
-    try testing.expect(!server.ackOwed());
+    const ack_len = try server.writeAck(.initial, &datagram);
+    try testing.expect(!server.ackOwed(.initial));
 
     const at_client = try client.feed(datagram[0..ack_len], &plaintext);
     var cursor = Cursor.init(at_client.frames);
@@ -276,6 +392,164 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     try testing.expectEqual(@as(u64, 0), ack.largest);
     try testing.expectEqual(@as(u64, 0), ack.first_range);
     try testing.expectEqual(@as(u64, 0), ack.range_count);
+}
+
+test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
+    const dcid = [_]u8{ 3, 1, 4, 1, 5 };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{ 0xa1, 0xa2 },
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{ 0xa1, 0xa2 },
+        .source_connection_id = &.{ 0xb1, 0xb2 },
+    });
+
+    // What the TLS driver will do: both sides get the Handshake keys from the
+    // handshake secrets, client and server halves crossed.
+    const client_secret: [protection.secret_length]u8 = @splat(0x11);
+    const server_secret: [protection.secret_length]u8 = @splat(0x22);
+    installHandshake(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+
+    const sent = try client.writeFrames(.handshake, "handshake bytes to sample", &datagram);
+    const opened = try server.feed(datagram[0..sent], &plaintext);
+
+    try testing.expectEqualStrings("handshake bytes to sample", opened.frames);
+    try testing.expectEqual(@as(u64, 0), opened.packet_number);
+    try testing.expectEqual(@as(?u64, 0), server.handshake.?.largest_received);
+    // Not the Initial space, which received nothing.
+    try testing.expectEqual(@as(?u64, null), server.initial.largest_received);
+    try testing.expect(server.ackOwed(.handshake));
+    try testing.expect(!server.ackOwed(.initial));
+
+    // And the acknowledgment is a Handshake packet, which is the only space the
+    // client can read it in (§13.2.1).
+    const ack_len = try server.writeAck(.handshake, &datagram);
+    const at_client = try client.feed(datagram[0..ack_len], &plaintext);
+    var cursor = Cursor.init(at_client.frames);
+    try testing.expectEqual(@as(u64, 0), (try frame.read(&cursor)).ack.largest);
+    try testing.expectEqual(@as(?u64, null), client.initial.largest_received);
+}
+
+test "RFC 9000 §12.3, a space with no keys is an error and not a second kind of empty" {
+    const dcid = [_]u8{ 2, 7, 1, 8 };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x01},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x01},
+        .source_connection_id = &.{0x02},
+    });
+
+    // The client learns the Handshake secrets and the server does not, which is
+    // the window between the driver reporting them and nothing.
+    const client_secret: [protection.secret_length]u8 = @splat(0x33);
+    const server_secret: [protection.secret_length]u8 = @splat(0x44);
+    installHandshake(&client, &client, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    const sent = try client.writeFrames(.handshake, "handshake bytes to sample", &datagram);
+
+    try testing.expectError(error.NoKeys, server.feed(datagram[0..sent], &plaintext));
+    try testing.expectError(error.NoKeys, server.writeFrames(.handshake, "x", &datagram));
+    try testing.expectError(error.NoKeys, server.writeAck(.app, &datagram));
+    // Nothing was recorded, so nothing is owed.
+    try testing.expect(!server.ackOwed(.handshake));
+    try testing.expect(!server.ackOwed(.app));
+}
+
+test "RFC 9000 §17.3.1, the application space writes a short header and opens one" {
+    // A short header omits the connection ID length, so the two ends have to
+    // agree on it: the client names the server's ID and the server names the
+    // client's.
+    const server_id = [_]u8{ 0x51, 0x52, 0x53 };
+    const client_id = [_]u8{ 0x61, 0x62 };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &server_id,
+        .destination_connection_id = &server_id,
+        .source_connection_id = &client_id,
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &server_id,
+        .destination_connection_id = &client_id,
+        .source_connection_id = &server_id,
+    });
+
+    const client_secret: [protection.secret_length]u8 = @splat(0x55);
+    const server_secret: [protection.secret_length]u8 = @splat(0x66);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+
+    const sent = try client.writeFrames(.app, "a one-rtt payload to sample", &datagram);
+    // §17.3.1: the form bit is clear, and the destination connection ID has no
+    // length on the wire.
+    try testing.expectEqual(@as(u8, 0x00), datagram[0] & 0x80);
+    try testing.expectEqualSlices(u8, &server_id, datagram[1..][0..server_id.len]);
+
+    const opened = try server.feed(datagram[0..sent], &plaintext);
+    try testing.expectEqualStrings("a one-rtt payload to sample", opened.frames);
+    try testing.expectEqual(@as(?u64, 0), server.app.?.largest_received);
+    try testing.expectEqual(@as(?u64, null), server.initial.largest_received);
+    // The whole rest of the datagram is the packet: a short header has no
+    // Length field (§12.2).
+    try testing.expectEqual(@as(u32, @intCast(sent)), opened.packet_len);
+}
+
+test "RFC 9000 §19.3, eight received ranges do not overflow the ACK path" {
+    const dcid = [_]u8{ 0xaa, 0xbb };
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xcc},
+    });
+
+    // Ranges wide enough that both the gap to the next one and the run length
+    // need eight-byte varints: the widest ACK a full range table can produce.
+    const run: u64 = 1 << 56;
+    const spacing: u64 = 2 * run + 8;
+    var index: usize = 0;
+    while (index < range_capacity) : (index += 1) {
+        const smallest: u64 = 4 + (range_capacity - 1 - index) * spacing;
+        server.initial.ranges[index] = .{ .smallest = smallest, .largest = smallest + run };
+        server.initial.range_count += 1;
+    }
+    server.initial.largest_received = server.initial.ranges[0].largest;
+
+    var out: [512]u8 = undefined;
+    const ack_len = try server.writeAck(.initial, &out);
+    try testing.expect(ack_len > 0);
+
+    // The frame round trips, which says the scratch held every pair.
+    var plaintext: [512]u8 = undefined;
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0xcc},
+        .source_connection_id = &dcid,
+    });
+    const at_client = try client.feed(out[0..ack_len], &plaintext);
+    var cursor = Cursor.init(at_client.frames);
+    const ack = (try frame.read(&cursor)).ack;
+    try testing.expectEqual(@as(u64, 7), ack.range_count);
+    try testing.expectEqual(server.initial.ranges[0].largest, ack.largest);
 }
 
 test "RFC 9000 §12.2, coalesced packets: only the first is taken, the length says where it ends" {
@@ -295,8 +569,8 @@ test "RFC 9000 §12.2, coalesced packets: only the first is taken, the length sa
 
     var plaintext: [512]u8 = undefined;
     var combined: [1024]u8 = undefined;
-    const first = try client.writeFrames("first packet bytes to sample", &combined);
-    const second = try client.writeFrames("second packet bytes to sample", combined[first..]);
+    const first = try client.writeFrames(.initial, "first packet bytes to sample", &combined);
+    const second = try client.writeFrames(.initial, "second packet bytes to sample", combined[first..]);
 
     const opened = try server.feed(&combined, &plaintext);
     try testing.expectEqual(@as(u32, @intCast(first)), opened.packet_len);
@@ -324,11 +598,61 @@ test "RFC 9001 §5.5, a packet that will not unprotect changes nothing" {
 
     var datagram: [256]u8 = undefined;
     var plaintext: [256]u8 = undefined;
-    const sent = try client.writeFrames("payload long enough to sample", &datagram);
+    const sent = try client.writeFrames(.initial, "payload long enough to sample", &datagram);
 
     // One bit in the ciphertext, far from the header sample.
     datagram[sent - 20] ^= 0x01;
     try testing.expectError(error.AuthenticationFailed, server.feed(datagram[0..sent], &plaintext));
-    try testing.expect(!server.ackOwed());
+    try testing.expect(!server.ackOwed(.initial));
     try testing.expectEqual(@as(?u64, null), server.initial.largest_received);
+}
+
+/// Stand in for the TLS driver: hand both endpoints a space, with the keys
+/// crossed the way the two roles need them.
+fn installSpace(conn: *Conn, id: SpaceId, send: protection.Keys, receive: protection.Keys) void {
+    std.debug.assert(id != .initial);
+    // The identity a driver copies from the Initial space plus its own keys.
+    var installed: Space = conn.initial;
+    installed.send_keys = send;
+    installed.receive_keys = receive;
+    installed.next_packet_number = 0;
+    installed.largest_received = null;
+    installed.acked_through = null;
+    installed.range_count = 0;
+    switch (id) {
+        .initial => unreachable,
+        .handshake => conn.handshake = installed,
+        .app => conn.app = installed,
+    }
+}
+
+fn installHandshake(
+    client: *Conn,
+    server: *Conn,
+    client_secret: [protection.secret_length]u8,
+    server_secret: [protection.secret_length]u8,
+) void {
+    installPaired(client, server, .handshake, client_secret, server_secret);
+}
+
+fn installApp(
+    client: *Conn,
+    server: *Conn,
+    client_secret: [protection.secret_length]u8,
+    server_secret: [protection.secret_length]u8,
+) void {
+    installPaired(client, server, .app, client_secret, server_secret);
+}
+
+fn installPaired(
+    client: *Conn,
+    server: *Conn,
+    id: SpaceId,
+    client_secret: [protection.secret_length]u8,
+    server_secret: [protection.secret_length]u8,
+) void {
+    const client_keys = protection.deriveKeys(&client_secret, .aes_128_gcm) catch unreachable;
+    const server_keys = protection.deriveKeys(&server_secret, .aes_128_gcm) catch unreachable;
+    installSpace(client, id, client_keys, server_keys);
+    installSpace(server, id, server_keys, client_keys);
 }

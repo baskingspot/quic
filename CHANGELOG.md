@@ -96,3 +96,18 @@ All notable changes to quic are recorded here. The format follows
   including `preferred_address`. It refuses a duplicate, an out-of-range value,
   and a server-only parameter sent by a client, and it ignores a parameter this
   version does not define.
+
+### Changed
+
+- `Conn` holds the three packet number spaces of RFC 9000 §12.3 and picks one
+  from the packet's form and type. `Conn.feed`, `Conn.writeFrames`,
+  `Conn.writeAck`, and `Conn.ackOwed` take the space they act on, and a space
+  without traffic keys is `error.NoKeys`. `Conn.feed` no longer returns
+  `error.NotInitial`, and `Conn.writeAck` with nothing received is
+  `error.NothingToAcknowledge`.
+
+### Fixed
+
+- `Conn.writeAck` sized its buffers for a single received range, so eight
+  fragments could overflow the varint scratch into a panic. Both buffers now
+  follow `Conn.range_capacity`.
