@@ -235,7 +235,7 @@ fn apply(id: Id, value: []const u8, role: Role, out: *TransportParameters) Error
 pub fn encode(writer: *Writer, parameters: TransportParameters, role: Role) Error!void {
     if (parameters.original_destination_connection_id) |id| {
         try requireServer(role);
-        try writeParam(writer, .original_destination_connection_id, id);
+        try writeConnectionId(writer, .original_destination_connection_id, id);
     }
     if (parameters.max_idle_timeout) |value| {
         try writeInt(writer, .max_idle_timeout, value);
@@ -286,11 +286,11 @@ pub fn encode(writer: *Writer, parameters: TransportParameters, role: Role) Erro
         try writeInt(writer, .active_connection_id_limit, value);
     }
     if (parameters.initial_source_connection_id) |id| {
-        try writeParam(writer, .initial_source_connection_id, id);
+        try writeConnectionId(writer, .initial_source_connection_id, id);
     }
     if (parameters.retry_source_connection_id) |id| {
         try requireServer(role);
-        try writeParam(writer, .retry_source_connection_id, id);
+        try writeConnectionId(writer, .retry_source_connection_id, id);
     }
 }
 
@@ -373,6 +373,13 @@ fn writePreferredAddress(writer: *Writer, address: PreferredAddress) Error!void 
     try writer.put(&address.reset_token);
 }
 
+/// §17.2: a connection ID is at most 20 bytes, and this decoder refuses a
+/// longer one, so a longer one here would be bytes that cannot come back.
+fn writeConnectionId(writer: *Writer, id: Id, connection_id: []const u8) Error!void {
+    if (connection_id.len > 20) return error.InvalidValue;
+    try writeParam(writer, id, connection_id);
+}
+
 fn writeParam(writer: *Writer, id: Id, value: []const u8) Error!void {
     try writeVarint(writer, @backingInt(id));
     try writeVarint(writer, value.len);
@@ -380,6 +387,10 @@ fn writeParam(writer: *Writer, id: Id, value: []const u8) Error!void {
 }
 
 fn writeInt(writer: *Writer, id: Id, value: u64) Error!void {
+    // §16: a transport parameter value is a variable-length integer, so a value
+    // above 2^62 - 1 has no encoding on the wire.
+    if (value > varint.max) return error.InvalidValue;
+
     var buf: [8]u8 = undefined;
     var scratch: Writer = .init(&buf);
     try writeVarint(&scratch, value);
@@ -395,8 +406,8 @@ fn writeU16(writer: *Writer, value: u16) Error!void {
 fn writeVarint(writer: *Writer, value: u64) Error!void {
     varint.write(writer, value) catch |err| switch (err) {
         error.NoSpace => return error.NoSpace,
-        // Every value written here is a parameter id, a length inside a
-        // datagram, or a value that came from the wire, so all are in range.
+        // Every value written here is a parameter id, a length of a checked
+        // parameter, or a value `writeInt` already bounded.
         error.Overflow => unreachable,
     };
 }
@@ -623,11 +634,69 @@ test "RFC 9000 §18.2, a parameter this version does not define is ignored" {
     try testing.expectError(error.DuplicateParameter, decode(dup_writer.written(), .client, &params));
 }
 
-test "a parameter length past the end is truncation" {
+// §18 gives each parameter an (identifier, length, value) tuple, and §7.4
+// makes a malformed one a TRANSPORT_PARAMETER_ERROR. The length is a varint,
+// so it can declare more bytes than any buffer holds; the declaration is
+// refused before the value is taken.
+test "RFC 9000 §18, a parameter that declares more bytes than are left is refused" {
     // Id 0x01 with a length of 4 and no bytes.
     var params: TransportParameters = .{};
     try testing.expectError(error.Truncated, decode(&.{ 0x01, 0x04 }, .client, &params));
     try testing.expectError(error.Truncated, decode(&.{0x01}, .client, &params));
+
+    // §16 allows a length in the eight-byte form, so the check cannot assume
+    // the declared length fits the cursor's u32 position. This is 2^40 with a
+    // single byte behind it: the length is refused before the byte is read.
+    const huge = [_]u8{ 0x01, 0xcd, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xaa };
+    try testing.expectError(error.Truncated, decode(&huge, .client, &params));
+
+    // The largest length the form carries, with nothing behind it.
+    const longest = [_]u8{ 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    try testing.expectError(error.Truncated, decode(&longest, .client, &params));
+    try expectEqual(@as(?u64, null), params.max_idle_timeout);
+}
+
+test "RFC 9000 §18.2, encode refuses a value the wire has no encoding for" {
+    // A parameter value is a variable-length integer (§18.2) and §16 caps the
+    // encoding at 2^62 - 1, so a bigger field has no bytes to write. It is a
+    // caller bug that returns, not one that panics.
+    var buf: [64]u8 = undefined;
+    var writer: Writer = .init(&buf);
+    const too_big: TransportParameters = .{ .max_idle_timeout = 1 << 62 };
+    try testing.expectError(error.InvalidValue, encode(&writer, too_big, .client));
+    try expectEqual(@as(u32, 0), writer.pos);
+
+    const largest: TransportParameters = .{ .initial_max_data = varint.max };
+    try encode(&writer, largest, .client);
+    var params: TransportParameters = .{};
+    try decode(writer.written(), .client, &params);
+    try expectEqual(@as(?u64, varint.max), params.initial_max_data);
+}
+
+test "RFC 9000 §17.2, encode refuses a connection ID longer than 20 bytes" {
+    // The decoder refuses these bytes, so the encoder must not produce them:
+    // an encode the peer reads as a TRANSPORT_PARAMETER_ERROR is never the
+    // answer the caller wanted.
+    const long = @as([21]u8, @splat(0xaa));
+    var buf: [128]u8 = undefined;
+    var writer: Writer = .init(&buf);
+
+    const cases = [_]TransportParameters{
+        .{ .original_destination_connection_id = &long },
+        .{ .initial_source_connection_id = &long },
+        .{ .retry_source_connection_id = &long },
+    };
+    for (cases) |params| {
+        try testing.expectError(error.InvalidValue, encode(&writer, params, .server));
+        try expectEqual(@as(u32, 0), writer.pos);
+    }
+
+    // Twenty bytes is the limit and still writes.
+    const limit = @as([20]u8, @splat(0xbb));
+    try encode(&writer, .{ .initial_source_connection_id = &limit }, .client);
+    var params: TransportParameters = .{};
+    try decode(writer.written(), .client, &params);
+    try testing.expectEqualSlices(u8, &limit, params.initial_source_connection_id.?);
 }
 
 test "more distinct parameters than the decoder tracks is refused" {
