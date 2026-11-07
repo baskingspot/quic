@@ -754,7 +754,11 @@ fn onStreamFrame(self: *Conn, space: SpaceId, frame_stream: frame.Stream) Error!
     }
 
     // §4.1: the connection window counts the highest offset reached on every
-    // stream, so what moves it is the delta of this stream's own highest.
+    // stream, so what moves it is the delta of this stream's own highest. The
+    // counter inside the stream is the only thing that may raise it, and this
+    // subtraction is the one place the two meet: assert it here rather than
+    // trusting a reordering inside `ReceiveStream` never to lower it.
+    std.debug.assert(entry.recv.highest >= before);
     try self.receive_window.onStreamProgress(entry.recv.highest - before);
 }
 
