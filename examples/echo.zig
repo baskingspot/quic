@@ -190,7 +190,9 @@ pub fn main(init: std.process.Init) !void {
     // the spaces its driver reported secrets for.
     const first_server_packet = try server.feed(wire[0..flight], now(io));
     std.debug.assert(first_server_packet.space == .initial);
-    try std.testing.expect((try server.conn.writeHandshake(&frames, &wire, now(io))) == null);
+    // Nothing to say back yet; installing the spaces the driver reported is
+    // what makes the server's 1-RTT keys exist.
+    try server.conn.installSpaces();
     std.debug.print("server: 1-RTT keys from the faked handshake: {}\n", .{server.conn.app != null});
 
     // The client asks for a stream, writes, and offers it to the packetizer. The

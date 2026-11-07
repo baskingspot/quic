@@ -7,6 +7,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.installSpaces` installs the packet number spaces the TLS driver has
+  reported secrets for, hands over the transport parameters once, and discards
+  the Handshake keys on confirmation. It is separate from `writeHandshake`, which
+  now calls it and then drains a message: a server with nothing to send installs
+  its 1-RTT keys with `installSpaces` instead of calling a write function and
+  getting null.
 - `Conn.joinStream` takes up the sending half of a stream the peer opened. It is
   a different act from `Conn.openStream`, which now opens only the stream IDs
   this endpoint initiates and refuses the peer's with `error.WrongDirection`;

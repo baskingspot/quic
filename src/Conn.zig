@@ -1121,25 +1121,22 @@ pub const Datagram = struct {
     }
 };
 
-/// Drain one handshake message into a packet.
+/// Install the packet number spaces the driver has reported traffic secrets
+/// for, and act on the handshake's confirmation.
 ///
-/// The machine's half of the TLS seam: it hands the driver its transport
-/// parameters once, installs the spaces the driver has reported secrets for,
-/// discards the Handshake keys once `confirmed` says to (§4.9.2 of RFC 9001),
-/// and writes the next message as a CRYPTO frame at the level the driver chose.
-/// The caller drains until this returns null, one packet per call.
+/// This is not writing a packet. A server whose driver has nothing to say calls
+/// this after it has read the handshake's bytes, because that is what makes its
+/// application space exist; the alternative was calling `writeHandshake` and
+/// getting null back, which made a key installation look like a send.
 ///
-/// `frames` is the caller's scratch for the CRYPTO frame and `out` the
-/// datagram, because the machine owns no buffer of its own. Null means the
-/// driver has nothing to send, which is also how a caller learns the handshake
-/// has no more bytes after the spaces were installed.
-///
-/// `now` dates the packet: handshake bytes are ack-eliciting and in flight like
-/// any other (§6.1 of RFC 9002).
-pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8, now: Duration) Error!?u32 {
-    // Before the driver is asked: a message taken from it cannot be given back.
+/// It hands the driver this endpoint's transport parameters once (§8.2), builds
+/// whichever of Handshake and 1-RTT is missing and reported (§7.1 of RFC 9001),
+/// and discards the Handshake keys once `confirmed` says so (§4.9.2). A driver
+/// that has already reported everything makes it a no-op, so a caller may call
+/// it after every packet. Without a driver it does nothing.
+pub fn installSpaces(self: *Conn) Error!void {
     if (self.state != .open) return error.Closed;
-    const tls = self.tls orelse return null;
+    const tls = self.tls orelse return;
 
     switch (self.parameters) {
         // §8.2: ours go out in the first message, so the driver takes them
@@ -1153,6 +1150,26 @@ pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8, now: Duration) Error
     try self.installSecrets(tls);
 
     if (tls.confirmed()) self.discardIfPresent(.handshake);
+}
+
+/// Drain one handshake message into a packet.
+///
+/// The machine's half of the TLS seam's sending side: it installs the spaces
+/// the driver has reported secrets for (`installSpaces`), then writes the next
+/// message as a CRYPTO frame at the level the driver chose. The caller drains
+/// until this returns null, one packet per call.
+///
+/// `frames` is the caller's scratch for the CRYPTO frame and `out` the
+/// datagram, because the machine owns no buffer of its own. Null means the
+/// driver has nothing to send, which is also how a caller learns the handshake
+/// has no more bytes after the spaces were installed.
+///
+/// `now` dates the packet: handshake bytes are ack-eliciting and in flight like
+/// any other (§6.1 of RFC 9002).
+pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8, now: Duration) Error!?u32 {
+    // Before the driver is asked: a message taken from it cannot be given back.
+    try self.installSpaces();
+    const tls = self.tls orelse return null;
 
     const message = (try tls.next()) orelse return null;
     const id: SpaceId = switch (message.level) {
@@ -3668,9 +3685,10 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
     try testing.expectEqual(seam.Level.initial, server_stub.fed_level.?);
     try testing.expectEqualStrings(hello, server_stub.fed[0..server_stub.fed_len]);
 
-    // The server's own driver has nothing to send, but the call installs the
-    // spaces its secrets describe, which is how its Handshake keys arrive.
-    try testing.expect((try server.writeHandshake(&payload, &datagram, 0)) == null);
+    // The server's own driver has nothing to send, and installing the spaces it
+    // reported is a separate call from writing a packet: that is how its
+    // Handshake and 1-RTT keys arrive.
+    try server.installSpaces();
     try testing.expect(server.handshake != null);
     try testing.expect(server.app != null);
 
@@ -3701,7 +3719,7 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
 
     // §4.9.2: confirmation takes the Handshake keys, and 1-RTT carries on.
     client_stub.confirmed = true;
-    try testing.expect((try client.writeHandshake(&payload, &datagram, 0)) == null);
+    try client.installSpaces();
     try testing.expectEqual(@as(?Space, null), client.handshake);
     try testing.expect(client.app != null);
     try testing.expectError(error.NoKeys, client.writeFrames(.handshake, "\x01", &datagram, .data(0)));
@@ -3746,12 +3764,10 @@ test "RFC 8446 §B.4, a suite this package cannot do is refused, never substitut
         .tls = stub.driver(),
     });
 
-    var datagram: [512]u8 = undefined;
-    var frames: [256]u8 = undefined;
     // The driver says AES-256-GCM, which needs SHA-384 and is not implemented.
     // The machine refuses by name rather than deriving AES-128-GCM and hoping
     // the peer notices.
-    try testing.expectError(error.UnsupportedCipherSuite, client.writeHandshake(&frames, &datagram, 0));
+    try testing.expectError(error.UnsupportedCipherSuite, client.installSpaces());
     try testing.expectEqual(@as(?Space, null), client.handshake);
     try testing.expectEqual(@as(?Space, null), client.app);
 }
@@ -3772,12 +3788,10 @@ test "RFC 9001 §5.1, a driver's 48-byte secret is refused rather than truncated
         .tls = stub.driver(),
     });
 
-    var datagram: [512]u8 = undefined;
-    var frames: [256]u8 = undefined;
     // A driver that says AES-128-GCM and hands out a 48-byte secret has told two
     // different stories; `deriveKeys` refuses the length, so no space is built
     // from a key schedule that does not belong to it.
-    try testing.expectError(error.SecretLengthMismatch, client.writeHandshake(&frames, &datagram, 0));
+    try testing.expectError(error.SecretLengthMismatch, client.installSpaces());
     try testing.expectEqual(@as(?Space, null), client.handshake);
     try testing.expectEqual(@as(?Space, null), client.app);
 }
@@ -3795,6 +3809,7 @@ test "an endpoint with no driver has no handshake to write" {
 
     var datagram: [512]u8 = undefined;
     var frames: [256]u8 = undefined;
+    try conn.installSpaces();
     try testing.expect((try conn.writeHandshake(&frames, &datagram, 0)) == null);
 }
 
