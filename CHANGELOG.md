@@ -27,6 +27,10 @@ All notable changes to quic are recorded here. The format follows
 - `InitialSpace` is no longer exported from the package. It is an Initial-level
   prototype, and the per-space type that replaces it will own the state
   `Recovery` already has.
+- `Conn.flowControlOwed` reports the MAX_DATA and MAX_STREAM_DATA frames the
+  application's reads have made due, and `Conn.onFlowControlSent` records the
+  raises after the caller puts them on the wire. A frame that never left does
+  not widen a window.
 - `Conn` begins the connection machine: it derives the Initial keys, seals and
   opens Initial packets, tracks packet numbers both ways, records the ranges it
   received, and builds the ACK frame it owes. It has no handshake, streams,
@@ -154,6 +158,10 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `FlowControl.nextLimit` raises the limit by the window the receiver keeps open,
+  not by a fixed 16 KiB: `FlowControl` remembers its window, and a raise is due
+  once half of it is consumed. A caller that read a few bytes no longer owes a
+  frame for every read call.
 - `varint.size` takes a `u62` instead of a `u64`, so the value it measures must
   have an encoding. A caller passing a `u64` adds `@intCast` after its own range
   check, and `varint.write` stays the one place that refuses `error.Overflow`.

@@ -9,6 +9,7 @@
 //! effect.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const testing = std.testing;
 
 const FlowControl = @This();
@@ -18,14 +19,18 @@ limit: u64,
 /// The sum of the highest offsets received across all streams, which is what
 /// §4.1 says the limit is compared against.
 used: u64 = 0,
-/// The smallest limit worth advertising: a window that shrinks below this is
-/// not worth a frame.
-pub const minimum_increment: u64 = 1 << 14;
+/// §4.2: the window this receiver keeps open ahead of what the application has
+/// consumed. It starts at the configured limit and stays there: a raise moves
+/// the advertised limit, not the size of the window.
+window: u64,
 
 /// A receiver's controller, starting from the limit it sends in its transport
 /// parameters.
 pub fn init(limit: u64) FlowControl {
-    return .{ .limit = limit };
+    // §16: a MAX_DATA value is a variable-length integer, so a window that does
+    // not fit one could never be advertised.
+    assert(limit <= (1 << 62) - 1);
+    return .{ .limit = limit, .window = limit };
 }
 
 pub const Error = error{
@@ -42,12 +47,23 @@ pub fn onStreamProgress(self: *FlowControl, delta: u64) Error!void {
     self.used = next;
 }
 
-/// §4.2: the receiver raises the limit once the peer has consumed most of the
-/// window. This returns the new limit to put in a MAX_DATA frame, or null when
-/// nothing needs sending.
+/// §4.2: the limit to put in a MAX_DATA frame, or null when the peer already
+/// has enough credit.
+///
+/// `consumed` is how many bytes the application has taken out of its receive
+/// rings, which is the only thing that may open a window: advertising credit
+/// the ring cannot back is how a receiver talks itself into `error.NoSpace`.
+/// The target keeps `window` bytes ahead of consumption, and a raise is worth a
+/// frame only once the credit left is under half a window. That half window is
+/// the hysteresis: without it, every read call that consumed a byte would owe a
+/// frame.
 pub fn nextLimit(self: *const FlowControl, consumed: u64) ?u64 {
-    const target = consumed + minimum_increment;
+    // The application cannot have read what never arrived.
+    assert(consumed <= self.used);
+
+    const target = consumed + self.window;
     if (target <= self.limit) return null;
+    if (self.limit - consumed >= self.window / 2) return null;
     return target;
 }
 
@@ -95,21 +111,35 @@ test "RFC 9000 §4.1, a receiver permits exactly the advertised total" {
     try testing.expectEqual(@as(u64, 1000), flow.used);
 }
 
-test "RFC 9000 §4.2, a receiver raises the limit only when it must" {
-    var flow: FlowControl = .init(1000);
-    // 500 consumed: a new window of 500 + 16384 is larger, so advertise it.
-    try testing.expectEqual(@as(?u64, 500 + minimum_increment), flow.nextLimit(500));
-    flow.raise(500 + minimum_increment);
-    // Nothing more to say until the peer has consumed another increment: at
-    // 100 bytes consumed the window still has more than `minimum_increment`
-    // left in it.
-    try testing.expectEqual(@as(?u64, null), flow.nextLimit(100));
-    // At 600 it does not: 600 + 16384 is past the advertised limit.
-    try testing.expectEqual(@as(?u64, 600 + minimum_increment), flow.nextLimit(600));
+test "RFC 9000 §4.2, a receiver raises the limit once half the window is consumed" {
+    const window: u64 = 40_000;
+    var flow: FlowControl = .init(window);
+    try flow.onStreamProgress(window);
+
+    // Nothing has been read, so nothing is due.
+    try testing.expectEqual(@as(?u64, null), flow.nextLimit(0));
+
+    // §4.2: exactly half a window consumed still leaves half the window of
+    // credit ahead, which is enough for the peer to keep going.
+    try testing.expectEqual(@as(?u64, null), flow.nextLimit(window / 2));
+
+    // One byte past half is where the credit left drops under half a window, so
+    // the raise is due, and it keeps a full window ahead of what was read.
+    const consumed = window / 2 + 1;
+    try testing.expectEqual(@as(?u64, consumed + window), flow.nextLimit(consumed));
+    flow.raise(consumed + window);
+
+    // The window slid, so the next raise is another half window of reading
+    // later, not the next read call. The peer keeps sending, or the application
+    // could not read what `next` names.
+    try flow.onStreamProgress(20_000);
+    try testing.expectEqual(@as(?u64, null), flow.nextLimit(consumed + 1));
+    const next = consumed + window / 2 + 1;
+    try testing.expectEqual(@as(?u64, next + window), flow.nextLimit(next));
 
     // A smaller limit is not a decrease (§4.2).
     flow.raise(10);
-    try testing.expectEqual(@as(u64, 500 + minimum_increment), flow.limit);
+    try testing.expectEqual(consumed + window, flow.limit);
 }
 
 test "RFC 9000 §4.1, a sender stops at the connection limit and ignores a smaller one" {

@@ -854,6 +854,64 @@ pub fn onMaxData(self: *Conn, limit: u64) void {
     self.send_window.onMaxData(limit);
 }
 
+/// §4.2: the MAX_DATA and every MAX_STREAM_DATA the application's reads have
+/// made due, in that order, written into `out` and returned as a prefix of it.
+///
+/// Reading a receive ring is the caller's act, so consumption is the only thing
+/// that opens a window, and this is where the machine notices it. No limit
+/// moves here: a frame that never leaves is a window the peer does not have, so
+/// `onFlowControlSent` records the raises after the caller puts them on the
+/// wire. Until then the same frames come back, which is what makes a caller
+/// that ran out of packet room simply try again.
+pub fn flowControlOwed(self: *Conn, out: []frame.Frame) []frame.Frame {
+    var count: usize = 0;
+
+    if (self.receive_window.nextLimit(self.consumedBytes())) |limit| {
+        if (count == out.len) return out[0..count];
+        out[count] = .{ .max_data = limit };
+        count += 1;
+    }
+
+    // §4.2: one frame per stream, in stream ID order, so two calls that see the
+    // same state build the same list in the same places.
+    for (self.stream_table.iterator()) |slot| {
+        const recv = slot.recv orelse continue;
+        const limit = recv.nextMaxStreamData() orelse continue;
+        if (count == out.len) break;
+        out[count] = .{ .max_stream_data = .{ .stream_id = recv.id, .maximum = limit } };
+        count += 1;
+    }
+    return out[0..count];
+}
+
+/// §4.2: record that `frames` went on the wire, so their limits apply. A limit
+/// only ever rises here, the same rule a receiver applies to a MAX frame it
+/// reads.
+pub fn onFlowControlSent(self: *Conn, frames: []const frame.Frame) void {
+    for (frames) |value| {
+        switch (value) {
+            .max_data => |limit| self.receive_window.raise(limit),
+            .max_stream_data => |data| {
+                const entry = self.stream(data.stream_id) orelse continue;
+                if (data.maximum > entry.recv.limit) entry.recv.limit = data.maximum;
+            },
+            else => {},
+        }
+    }
+}
+
+/// The bytes the application has taken out of every receive ring. §4.2 ties the
+/// connection window to what was consumed, not to what arrived, because credit
+/// the rings cannot back is credit this endpoint would have to refuse.
+fn consumedBytes(self: *Conn) u64 {
+    var consumed: u64 = 0;
+    for (self.stream_table.iterator()) |slot| {
+        const recv = slot.recv orelse continue;
+        consumed += recv.read_offset;
+    }
+    return consumed;
+}
+
 /// The length of this endpoint's own connection ID: what the peer echoes as the
 /// destination of the packets it sends, and what a short header leaves off the
 /// wire (§17.3.1). Connection IDs do not change in this build, so the one the
@@ -1623,6 +1681,82 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
     try testing.expectEqualStrings("hello stream", read_buffer[0..read]);
     // §4.1: the connection window counts the highest offset, not the bytes.
     try testing.expectEqual(@as(u64, 12), server.receive_window.used);
+}
+
+test "RFC 9000 §4.2, reading a ring is what makes a window raise due" {
+    const dcid = [_]u8{0x24};
+    var ring: [64]u8 = undefined;
+    var slots: [1]StreamTable.Slot = undefined;
+    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .recv_limit_bytes = 64 }};
+
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x2c},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x2c},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 64,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x29);
+    const server_secret: [protection.secret_length]u8 = @splat(0x2a);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var payload: [128]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+    var owed: [4]frame.Frame = undefined;
+
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 4,
+        .offset = 0,
+        .data = &@as([60]u8, @splat(0x5a)),
+        .fin = false,
+        .length_present = true,
+    } });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram);
+    _ = try server.feed(datagram[0..sent], &plaintext, &events);
+
+    // §4.2: arriving bytes open nothing. The window is tied to what the
+    // application consumed, so a peer cannot make the receiver advertise credit
+    // it has not read.
+    try testing.expectEqual(@as(usize, 0), server.flowControlOwed(&owed).len);
+
+    const entry = server.stream(4) orelse return error.TestUnexpectedResult;
+    var read_buffer: [64]u8 = undefined;
+    const read = try entry.recv.readInto(&read_buffer);
+    try testing.expectEqual(@as(usize, 60), read);
+
+    // 60 of the 64 advertised bytes are read, so 4 of credit are left: under
+    // half a window. Both windows slide to 60 consumed plus their size.
+    const due = server.flowControlOwed(&owed);
+    try testing.expectEqual(@as(usize, 2), due.len);
+    try testing.expectEqual(@as(u64, 124), due[0].max_data);
+    try testing.expectEqual(@as(u64, 4), due[1].max_stream_data.stream_id);
+    try testing.expectEqual(@as(u64, 124), due[1].max_stream_data.maximum);
+
+    // Deciding is not raising: until the caller says the frames left, the same
+    // ones are still due.
+    try testing.expectEqual(@as(usize, 2), server.flowControlOwed(&owed).len);
+    try testing.expectEqual(@as(u64, 64), server.receive_window.limit);
+    try testing.expectEqual(@as(u64, 64), entry.recv.limit);
+
+    server.onFlowControlSent(due);
+    try testing.expectEqual(@as(u64, 124), server.receive_window.limit);
+    try testing.expectEqual(@as(u64, 124), entry.recv.limit);
+    try testing.expectEqual(@as(usize, 0), server.flowControlOwed(&owed).len);
+
+    // §4.2: a late or damaged frame cannot lower a limit.
+    server.onFlowControlSent(&.{.{ .max_data = 8 }});
+    try testing.expectEqual(@as(u64, 124), server.receive_window.limit);
 }
 
 test "RFC 9000 §4.6, a full stream table is peer-visible and not a dropped packet" {

@@ -103,10 +103,23 @@ pub fn window(self: *const ReceiveStream) u64 {
 
 /// §4.2: the limit to put in a MAX_STREAM_DATA frame, or null when the peer
 /// already has enough credit.
+///
+/// The raise is held back until the credit left is under half the ring. Sending
+/// on every read call would spend a frame per call, and waiting for the peer to
+/// hit the limit would stall it: half a ring is the point where the peer still
+/// has room to send while the frame is in flight.
 pub fn nextMaxStreamData(self: *const ReceiveStream) ?u64 {
     if (self.state != .recv) return null;
+
+    // §4.1: the limit is an absolute offset, and it only ever grows, so the
+    // read position can never be past it.
+    std.debug.assert(self.limit >= self.read_offset);
+
     const target = self.window();
     if (target <= self.limit) return null;
+
+    const credit = self.limit - self.read_offset;
+    if (credit >= self.buffer.len / 2) return null;
     return target;
 }
 
