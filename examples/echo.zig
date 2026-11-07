@@ -64,12 +64,17 @@ const Endpoint = struct {
         };
     }
 
-    fn start(self: *Endpoint, config: Conn.Config) void {
+    /// Storage whose address the connection will point at, set up before the
+    /// configuration can name it.
+    fn prepare(self: *Endpoint) void {
         self.events = .init(&self.acked, &self.lost);
         self.streams = .{
             .{ .send_buffer = &self.send_a, .recv_buffer = &self.ring_a, .recv_limit_bytes = 1024 },
             .{ .send_buffer = &self.send_b, .recv_buffer = &self.ring_b, .recv_limit_bytes = 1024 },
         };
+    }
+
+    fn start(self: *Endpoint, config: Conn.Config) void {
         self.conn = .init(config);
     }
 
@@ -99,7 +104,14 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     clock_start = Io.Timestamp.now(io, .awake);
 
-    const server_id = [_]u8{ 0x5e, 0x5e, 0x5e, 0x5e };
+    // The client invents the server's name, and §7.2 asks for eight bytes: it is
+    // also the seed of the Initial keys (RFC 9001 §5.2).
+    const named_server = [_]u8{ 0x5e, 0x5e, 0x5e, 0x5e, 0x5e, 0x5e, 0x5e, 0x5e };
+    // What the server calls itself. A real server generates this from its own
+    // entropy; the example fixes it so the transcript reads the same every run.
+    // Same length as `named_server` because this example has no connection ID
+    // migration, which is what would let the two lengths differ.
+    const server_local_id = [_]u8{ 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78 };
     const client_id = [_]u8{ 0xc1, 0xc2 };
 
     // Two stub drivers that agree on secrets and on nothing else. The machine
@@ -120,11 +132,13 @@ pub fn main(init: std.process.Init) !void {
 
     const client = try arena.create(Endpoint);
     const server = try arena.create(Endpoint);
+    client.prepare();
+    server.prepare();
     client.start(.{
         .role = .client,
         .loss = client.loss(),
-        .original_destination_connection_id = &server_id,
-        .destination_connection_id = &server_id,
+        .original_destination_connection_id = &named_server,
+        .destination_connection_id = &named_server,
         .source_connection_id = &client_id,
         .tls = client_stub.driver(),
         .transport_parameters = "client parameters",
@@ -136,30 +150,40 @@ pub fn main(init: std.process.Init) !void {
         .send_limit = 4096,
         .max_streams_bidi = 1,
     });
-    server.start(.{
-        .role = .server,
-        .loss = server.loss(),
-        .original_destination_connection_id = &server_id,
-        .destination_connection_id = &client_id,
-        .source_connection_id = &server_id,
-        .tls = server_stub.driver(),
-        .transport_parameters = "server parameters",
-        .crypto = .{ .initial = &server.crypto_in_initial, .handshake = &server.crypto_in_handshake },
-        .crypto_sent = .{ .initial = &server.crypto_out_initial, .handshake = &server.crypto_out_handshake },
-        .stream_slots = &server.slots,
-        .streams = &server.streams,
-        .receive_limit = 4096,
-        .send_limit = 4096,
-        .max_streams_bidi = 1,
-    });
-
     var wire: [1500]u8 = undefined;
     var frames: [512]u8 = undefined;
 
-    // The client's handshake flight, and the server's call that writes nothing
-    // but installs the spaces its driver reported secrets for.
+    // The client's handshake flight.
     const flight = (try client.conn.writeHandshake(&frames, &wire, now(io))) orelse
         return error.NoHandshakeWritten;
+
+    // The server is built from that datagram: the client's Destination
+    // Connection ID is the seed of the Initial keys and the client's Source
+    // Connection ID is where every reply goes, and the constructor is what
+    // pairs them with the right one. The IDs are copied out of the receive
+    // buffer, which is about to be reused.
+    var server_ids: [40]u8 = undefined;
+    const opening = try Conn.Opening.fromDatagram(wire[0..flight], &server_ids);
+    var server_config = opening.serverConfig(&server_local_id, server.loss());
+    server_config.tls = server_stub.driver();
+    server_config.transport_parameters = "server parameters";
+    server_config.crypto = .{
+        .initial = &server.crypto_in_initial,
+        .handshake = &server.crypto_in_handshake,
+    };
+    server_config.crypto_sent = .{
+        .initial = &server.crypto_out_initial,
+        .handshake = &server.crypto_out_handshake,
+    };
+    server_config.stream_slots = &server.slots;
+    server_config.streams = &server.streams;
+    server_config.receive_limit = 4096;
+    server_config.send_limit = 4096;
+    server_config.max_streams_bidi = 1;
+    server.start(server_config);
+
+    // The server reads the flight, and its call writes nothing but installs
+    // the spaces its driver reported secrets for.
     const first_server_packet = try server.feed(wire[0..flight], now(io));
     std.debug.assert(first_server_packet.space == .initial);
     try std.testing.expect((try server.conn.writeHandshake(&frames, &wire, now(io))) == null);

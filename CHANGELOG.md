@@ -7,6 +7,13 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.Opening.fromDatagram` reads a client's first Initial, refuses anything
+  that is not one, and copies its two connection IDs into the caller's storage.
+  `Opening.serverConfig` turns that into a `Conn.Config` seeded from the
+  datagram: the client's Destination Connection ID is the Initial key seed, its
+  Source Connection ID is the reply's destination, and the server's own
+  Connection ID is the caller's, because the machine holds no entropy. Filling
+  those three by hand is how a server ends up with a handshake that never opens.
 - `Conn.feed` and `Conn.Datagram.next` report the streams a packet changed, in a
   caller-owned list returned as `Opened.streams`: one record per stream with
   `readable` set when new bytes became contiguous and `finished` set when the

@@ -108,7 +108,14 @@ pub const Error = protection.Error ||
         /// No traffic keys are installed for the space. Handshake and application
         /// keys arrive from the TLS driver, and the space is absent until then.
         NoKeys,
+        /// The bytes name a version this package does not implement, so the
+        /// caller's answer is Version Negotiation, not a connection (§6).
         UnsupportedVersion,
+        /// §7.2: the packet that would start a connection is not an Initial.
+        NotInitial,
+        /// §7.2: a first Initial with no Destination Connection ID names no
+        /// endpoint and seeds no Initial keys.
+        InvalidConnectionId,
         /// An acknowledgment was asked of a space that has received nothing.
         NothingToAcknowledge,
         /// §4.6: the peer opened more streams than this endpoint advertised. It is
@@ -248,6 +255,88 @@ pub const Config = struct {
     /// it was allowed must never find `error.StreamLimit`.
     max_streams_bidi: u64 = 0,
     max_streams_uni: u64 = 0,
+};
+
+/// What a server learns from a client's first Initial, before it has a `Conn`.
+///
+/// §7.2: the Destination Connection ID of that packet names this endpoint.
+/// §5.2 of RFC 9001 makes those same bytes the seed of the Initial keys, so
+/// pairing them with the wrong datagram is a handshake that never opens.
+///
+/// Both slices borrow the caller's `storage`, never the datagram: the datagram
+/// is a receive buffer, and `protection.openPacket` even rewrites it in place.
+/// A connection keeps the client's Source Connection ID for its whole life, and
+/// a Retry has to mint a name before the next packet overwrites the one it
+/// answered.
+pub const Opening = struct {
+    /// The client's Destination Connection ID: this endpoint as the client
+    /// names it, the seed of both directions' Initial keys, and the value the
+    /// original_destination_connection_id transport parameter must echo (§7.3).
+    destination_connection_id: []const u8,
+    /// The client's Source Connection ID: where this endpoint sends until the
+    /// client adopts a different one.
+    source_connection_id: []const u8,
+
+    /// Read the identity out of a client's first datagram, copying both
+    /// connection IDs into `storage`.
+    ///
+    /// Only an Initial starts a connection. A short header names one already
+    /// open, a Handshake arrives after this endpoint has answered, and a
+    /// Version Negotiation packet is never a client's first word (§17.2.1).
+    /// A version this package does not implement is `error.UnsupportedVersion`,
+    /// which is the caller's cue to answer with `connection_setup`.
+    ///
+    /// `error.NoSpace` means `storage` cannot hold the two connection IDs, and
+    /// it is refused before anything is written.
+    pub fn fromDatagram(bytes: []const u8, storage: []u8) Error!Opening {
+        const invariant = try packet.parseInvariant(bytes);
+
+        // §17.2.1: a Version Negotiation packet carries neither a version nor a
+        // packet type, so the version is read before the type bits mean
+        // anything.
+        if (invariant.version == .negotiation) return error.NotInitial;
+        if (invariant.version != .v1) return error.UnsupportedVersion;
+
+        const kind: packet.Kind = @fromBackingInt(@intCast((invariant.first >> 4) & 0x03));
+        if (kind != .initial) return error.NotInitial;
+
+        // §7.2: a client MUST name at least eight bytes in its first Initial.
+        // The floor is a server's MAY to enforce, but a zero-length name seeds
+        // the keys from nothing and names no endpoint, so this refuses it.
+        const destination_length = invariant.destination_connection_id.len;
+        if (destination_length == 0) return error.InvalidConnectionId;
+
+        const source_length = invariant.source_connection_id.len;
+        if (storage.len < destination_length + source_length) return error.NoSpace;
+
+        // §17.2: both are shortened before the copy, so the two cannot overlap
+        // and neither can be moved after this point.
+        const destination = storage[0..destination_length];
+        @memcpy(destination, invariant.destination_connection_id);
+        const source = storage[destination_length..][0..source_length];
+        @memcpy(source, invariant.source_connection_id);
+
+        return .{ .destination_connection_id = destination, .source_connection_id = source };
+    }
+
+    /// The configuration a server starts from, with this endpoint's own
+    /// connection ID.
+    ///
+    /// `connection_id` is the caller's: the machine holds no entropy, so it
+    /// cannot generate one, and §5.1 wants connection IDs unpredictable. `loss`
+    /// is the caller's too, and the only field of `Config` with no default. Fill
+    /// in the rest — `tls`, the streams, the limits — before `Conn.init`; this
+    /// removes only the way to seed the Initial keys and the reply's destination
+    /// from the wrong connection ID.
+    pub fn serverConfig(self: Opening, connection_id: []const u8, loss: Loss) Config {
+        return .{
+            .role = .server,
+            .loss = loss,
+            .original_destination_connection_id = self.destination_connection_id,
+            .destination_connection_id = self.source_connection_id,
+            .source_connection_id = connection_id,
+        };
+    }
 };
 
 /// One stream the machine can hold: the buffers and the per-stream limit, then
@@ -2979,6 +3068,92 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     try testing.expectEqual(@as(usize, 1), report.ackedPackets().len);
     try testing.expectEqual(@as(u64, 0), report.ackedPackets()[0].packet_number);
     try testing.expectEqual(@as(usize, 0), client.initial.?.recovery.inFlight().len);
+}
+
+test "RFC 9000 §7.2, a server is built from the datagram that called it" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+
+    // The client invents a name for the server, which is also the seed of the
+    // Initial keys (RFC 9001 §5.2). Eight bytes because §7.2 asks for at least
+    // that many in a first Initial.
+    const named_server = [_]u8{ 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1 };
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &named_server,
+        .destination_connection_id = &named_server,
+        .source_connection_id = &.{ 0xc1, 0xc2 },
+    });
+
+    const payload = pings(4);
+    var datagram: [512]u8 = undefined;
+    const sent = try client.writeFrames(.initial, &payload, &datagram, .data(0));
+
+    // The server reads the identity out of those bytes, and calls itself
+    // something the client has never seen.
+    var id_storage: [40]u8 = undefined;
+    const opening = try Opening.fromDatagram(datagram[0..sent], &id_storage);
+    try testing.expectEqualSlices(u8, &named_server, opening.destination_connection_id);
+    try testing.expectEqualSlices(u8, &.{ 0xc1, 0xc2 }, opening.source_connection_id);
+
+    const own_name = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(opening.serverConfig(&own_name, server_loss.value()));
+    try testing.expectEqualSlices(u8, &.{ 0xc1, 0xc2 }, server.destination_connection_id);
+    try testing.expectEqualSlices(u8, &own_name, server.source_connection_id);
+
+    // The proof that the pairing is right: the Initial opens under the keys the
+    // client's name seeded. Any other connection ID here is a packet that will
+    // not decrypt.
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    const at_server = try server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(.initial, at_server.space);
+    try testing.expectEqual(@as(u64, 0), at_server.packet_number);
+
+    // A short header names a connection that is already open, so there is no
+    // identity to read out of it.
+    var short: [24]u8 = @splat(0);
+    short[0] = 0x40;
+    try testing.expectError(error.NotLongHeader, Opening.fromDatagram(&short, &id_storage));
+
+    // A Handshake arrives after this endpoint has answered, and a Retry is this
+    // endpoint's own packet.
+    const handshake = [_]u8{ 0xe0, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0 };
+    try testing.expectError(error.NotInitial, Opening.fromDatagram(&handshake, &id_storage));
+    const retry = [_]u8{ 0xf0, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0 };
+    try testing.expectError(error.NotInitial, Opening.fromDatagram(&retry, &id_storage));
+
+    // §17.2.1: a Version Negotiation packet has no version and no type, and a
+    // version this package does not implement is the caller's cue to answer with
+    // Version Negotiation (§6).
+    const negotiation = [_]u8{ 0xc0, 0, 0, 0, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0 };
+    try testing.expectError(error.NotInitial, Opening.fromDatagram(&negotiation, &id_storage));
+    const unknown = [_]u8{ 0xc0, 0x0a, 0x0a, 0x0a, 0x0a, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0 };
+    try testing.expectError(error.UnsupportedVersion, Opening.fromDatagram(&unknown, &id_storage));
+
+    // §7.2: with no Destination Connection ID the first Initial names nobody
+    // and seeds nothing.
+    const unnamed = [_]u8{ 0xc0, 0, 0, 0, 1, 0, 0 };
+    try testing.expectError(error.InvalidConnectionId, Opening.fromDatagram(&unnamed, &id_storage));
+
+    // The two names have to fit the caller's storage together, and a refusal
+    // writes nothing.
+    var tight: [9]u8 = @splat(0xff);
+    try testing.expectError(error.NoSpace, Opening.fromDatagram(datagram[0..sent], &tight));
+    const untouched: [9]u8 = @splat(0xff);
+    try testing.expectEqualSlices(u8, &untouched, &tight);
 }
 
 test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
