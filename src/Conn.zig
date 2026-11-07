@@ -21,6 +21,11 @@ const std = @import("std");
 const testing = std.testing;
 const Cursor = @import("Cursor.zig");
 const CryptoStream = @import("CryptoStream.zig");
+const FlowControl = @import("FlowControl.zig");
+const ReceiveStream = @import("ReceiveStream.zig");
+const SendStream = @import("SendStream.zig");
+const StreamTable = @import("StreamTable.zig");
+const stream_id = @import("stream_id.zig");
 const frame = @import("frame.zig");
 const seam = @import("handshake.zig");
 const packet = @import("packet.zig");
@@ -51,14 +56,29 @@ pub const Role = enum { client, server };
 /// 1-RTT packets share the application data space.
 pub const SpaceId = enum { initial, handshake, app };
 
-pub const Error = protection.Error || packet.Error || frame.Error || seam.Error || CryptoStream.Error || error{
-    /// No traffic keys are installed for the space. Handshake and application
-    /// keys arrive from the TLS driver, and the space is absent until then.
-    NoKeys,
-    UnsupportedVersion,
-    /// An acknowledgment was asked of a space that has received nothing.
-    NothingToAcknowledge,
-};
+pub const Error = protection.Error ||
+    packet.Error ||
+    frame.Error ||
+    seam.Error ||
+    CryptoStream.Error ||
+    StreamTable.Error ||
+    SendStream.Error ||
+    ReceiveStream.Error ||
+    FlowControl.Error ||
+    error{
+        /// No traffic keys are installed for the space. Handshake and application
+        /// keys arrive from the TLS driver, and the space is absent until then.
+        NoKeys,
+        UnsupportedVersion,
+        /// An acknowledgment was asked of a space that has received nothing.
+        NothingToAcknowledge,
+        /// §4.6: the peer opened more streams than this endpoint advertised. It is
+        /// peer-visible, not a dropped packet: the connection closes with
+        /// STREAM_LIMIT_ERROR.
+        StreamLimit,
+        /// §12.4: STREAM frames belong to the application space only.
+        WrongFrameSpace,
+    };
 
 pub const Config = struct {
     role: Role,
@@ -84,6 +104,35 @@ pub const Config = struct {
     /// caller sizes it for the largest handshake it expects; a frame that would
     /// reach past what it holds is `error.NoSpace`.
     crypto: CryptoStorage = .{},
+    /// The streams this endpoint can hold: the table's slots and the storage
+    /// behind them, in the same order. Their length is the stream limit the
+    /// machine advertises, so a peer that opens one more is `error.StreamLimit`
+    /// (§4.6) rather than a packet anyone drops.
+    stream_slots: []StreamTable.Slot = &.{},
+    streams: []Stream = &.{},
+    /// §4.1: the connection-wide limit this endpoint advertises, and the one the
+    /// peer advertised in its transport parameters.
+    receive_limit: u64 = 0,
+    send_limit: u64 = 0,
+};
+
+/// One stream the machine can hold: the buffers and the per-stream limit, then
+/// the two halves the machine builds when the stream opens.
+///
+/// `send_buffer` and `recv_buffer` are the caller's, and stay theirs: opening a
+/// stream fills in `send` and `recv` and never moves a byte.
+pub const Stream = struct {
+    /// Where the send half's bytes live.
+    send_buffer: []u8 = "",
+    /// The ring the receive half reassembles into, which must be at least as
+    /// large as `limit` (§2.2, §4.1).
+    recv_buffer: []u8 = "",
+    /// §4.1: the per-stream limit this endpoint advertises.
+    limit: u64 = 0,
+    send: SendStream = undefined,
+    recv: ReceiveStream = undefined,
+    has_send: bool = false,
+    open: bool = false,
 };
 
 pub const CryptoStorage = struct {
@@ -208,6 +257,13 @@ transport_parameters: []const u8,
 /// CRYPTO reassembly per level, over the caller's storage, indexed by
 /// `SpaceId`.
 crypto: [3]CryptoStream,
+/// The open streams, and the storage behind each one.
+stream_table: StreamTable,
+streams: []Stream,
+/// §4.1: the receive window across all streams, and the send allowance the peer
+/// gave.
+receive_window: FlowControl,
+send_window: FlowControl.Sender,
 /// Whether the driver has them yet. One call, before the first flight.
 transport_parameters_set: bool = false,
 
@@ -232,6 +288,10 @@ pub fn init(config: Config) Conn {
             .init(config.crypto.handshake),
             .init(config.crypto.app),
         },
+        .stream_table = .init(config.stream_slots),
+        .streams = config.streams,
+        .receive_window = .init(config.receive_limit),
+        .send_window = .init(config.send_limit),
         .initial = .{
             .send_keys = if (config.role == .client) client else server,
             .receive_keys = if (config.role == .client) server else client,
@@ -399,6 +459,7 @@ fn finish(self: *Conn, raw: Raw, frames: []frame.Frame) Error!Opened {
     while (!cursor.atEnd()) {
         switch (try frame.read(&cursor)) {
             .crypto => |crypto| try self.feedCrypto(raw.id, crypto.offset, crypto.data),
+            .stream => |frame_stream| try self.onStreamFrame(raw.id, frame_stream),
             .padding => {},
             else => |parsed| {
                 if (count == frames.len) return error.NoSpace;
@@ -582,6 +643,125 @@ fn installSpace(
         .handshake => self.handshake = space,
         .app => self.app = space,
     }
+}
+
+/// The stream with `id`, or null when it is not open.
+pub fn stream(self: *Conn, id: u64) ?*Stream {
+    const slot = self.stream_table.get(id) orelse return null;
+    return streamOf(slot);
+}
+
+fn streamOf(slot: *StreamTable.Slot) *Stream {
+    if (slot.recv) |recv| return @fieldParentPtr("recv", recv);
+    return @fieldParentPtr("send", slot.send.?);
+}
+
+fn freeStream(self: *Conn) ?usize {
+    for (self.streams, 0..) |*entry, index| {
+        if (!entry.open) return index;
+    }
+    return null;
+}
+
+/// Open a stream this endpoint initiates (§2.1), with a send half and, for a
+/// bidirectional stream, a receive half too. `send_limit` is the peer's initial
+/// per-stream limit from its transport parameters; MAX_STREAM_DATA raises it
+/// through `Stream.send.onMaxStreamData`.
+pub fn openStream(self: *Conn, id: u64, send_limit: u64) Error!*Stream {
+    if (self.stream_table.get(id)) |slot| {
+        // A bidirectional stream the peer opened is ours to send on as well.
+        if (slot.send != null) return error.AlreadyOpen;
+        const existing = streamOf(slot);
+        existing.send = SendStream.init(id, existing.send_buffer, send_limit);
+        existing.has_send = true;
+        slot.send = &existing.send;
+        return existing;
+    }
+
+    const index = self.freeStream() orelse return error.StreamLimit;
+    const entry = &self.streams[index];
+    entry.send = SendStream.init(id, entry.send_buffer, send_limit);
+    entry.has_send = true;
+    entry.open = true;
+
+    if (stream_id.direction(id) == .bidi) {
+        entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.limit);
+        _ = try self.stream_table.open(id, &entry.send, &entry.recv);
+    } else {
+        _ = try self.stream_table.open(id, &entry.send, null);
+    }
+    return entry;
+}
+
+/// The stream for an incoming STREAM frame, opening it if this is the first
+/// frame on it.
+///
+/// §2.1: a stream exists as soon as a frame for it arrives, so an unknown id is
+/// the ordinary case and never an error. A full table is `error.StreamLimit`,
+/// which the peer must see: §4.6 closes the connection with STREAM_LIMIT_ERROR.
+fn streamFor(self: *Conn, id: u64) Error!*Stream {
+    if (self.stream_table.get(id)) |slot| return streamOf(slot);
+
+    const index = self.freeStream() orelse return error.StreamLimit;
+    const entry = &self.streams[index];
+    entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.limit);
+    entry.open = true;
+    _ = try self.stream_table.open(id, null, &entry.recv);
+    return entry;
+}
+
+fn onStreamFrame(self: *Conn, space: SpaceId, frame_stream: frame.Stream) Error!void {
+    // §12.4: Initial and Handshake packets carry no STREAM frames.
+    if (space != .app) return error.WrongFrameSpace;
+
+    const entry = try self.streamFor(frame_stream.id);
+    const before = entry.recv.highest;
+    switch (try entry.recv.onData(frame_stream.offset, frame_stream.data, frame_stream.fin)) {
+        .accepted => {},
+        // The ring is smaller than the window this stream advertised. The
+        // caller sized both, and the machine cannot honour a limit it cannot
+        // hold; §4.1 makes that the caller's number to get right, not a silent
+        // truncation here.
+        .backpressure => return error.NoSpace,
+    }
+
+    // §4.1: the connection window counts the highest offset reached on every
+    // stream, so what moves it is the delta of this stream's own highest.
+    try self.receive_window.onStreamProgress(entry.recv.highest - before);
+}
+
+/// Seal the next segment of `id`'s send half into one packet.
+///
+/// Null means there is nothing sendable now: the stream has no new bytes, or the
+/// peer's connection-wide allowance is used up. §4.1 limits compose, so the
+/// segment is clamped by both the stream's limit (inside `nextSegment`) and the
+/// connection's.
+pub fn writeStream(self: *Conn, id: u64, max_len: u32, frames: []u8, out: []u8) Error!?u32 {
+    const entry = self.stream(id) orelse return error.NotOpen;
+    if (!entry.has_send) return error.NotOpen;
+
+    const allowance = self.send_window.available();
+    if (allowance == 0) return null;
+    const length: u32 = @intCast(@min(max_len, allowance));
+
+    const segment = entry.send.nextSegment(length) orelse return null;
+    var writer: Writer = .init(frames);
+    try frame.write(&writer, .{ .stream = .{
+        .id = id,
+        .offset = segment.offset,
+        .data = segment.data,
+        .fin = segment.fin,
+        .length_present = true,
+    } });
+
+    const total = try self.writeFrames(.app, writer.written(), out);
+    try self.send_window.onSent(segment.data.len);
+    return total;
+}
+
+/// §4.2: apply a MAX_DATA the peer sent, raising the connection-wide allowance.
+pub fn onMaxData(self: *Conn, limit: u64) void {
+    self.send_window.onMaxData(limit);
 }
 
 /// The length of this endpoint's own connection ID: what the peer echoes as the
@@ -1274,6 +1454,316 @@ test "RFC 9000 §12.4, a frame that will not parse is an error and not a dropped
     // is a fresh packet rather than the same bytes again.
     const again = try client.writeFrames(.initial, &bad, &datagram);
     try testing.expectError(error.UnknownFrameType, server.feed(datagram[0..again], &plaintext, &events));
+}
+
+test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
+    const dcid = [_]u8{ 0x21, 0x22 };
+    var ring: [64]u8 = undefined;
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{ .{ .recv_buffer = &ring, .limit = 64 }, .{} };
+
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x2a},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x2a},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 1024,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x25);
+    const server_secret: [protection.secret_length]u8 = @splat(0x26);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var payload: [64]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 4,
+        .offset = 0,
+        .data = "hello stream",
+        .fin = true,
+        .length_present = true,
+    } });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram);
+
+    const opened = try server.feed(datagram[0..sent], &plaintext, &events);
+    // The machine has a home for STREAM frames now, so none come back.
+    try testing.expectEqual(@as(usize, 0), opened.frames.len);
+
+    const entry = server.stream(4) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(ReceiveStream.State.data_recvd, entry.recv.state);
+
+    var read_buffer: [32]u8 = undefined;
+    const read = try entry.recv.readInto(&read_buffer);
+    try testing.expectEqualStrings("hello stream", read_buffer[0..read]);
+    // §4.1: the connection window counts the highest offset, not the bytes.
+    try testing.expectEqual(@as(u64, 12), server.receive_window.used);
+}
+
+test "RFC 9000 §4.6, a full stream table is peer-visible and not a dropped packet" {
+    const dcid = [_]u8{0x23};
+    var ring: [64]u8 = undefined;
+    var slots: [1]StreamTable.Slot = undefined;
+    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .limit = 64 }};
+
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x2b},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x2b},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 1024,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x27);
+    const server_secret: [protection.secret_length]u8 = @splat(0x28);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var payload: [64]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+
+    // Two streams in one packet, and room for one.
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 0,
+        .offset = 0,
+        .data = "a",
+        .fin = true,
+        .length_present = true,
+    } });
+    try frame.write(&writer, .{ .stream = .{
+        .id = 4,
+        .offset = 0,
+        .data = "b",
+        .fin = true,
+        .length_present = true,
+    } });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram);
+
+    // §4.6: the connection closes with STREAM_LIMIT_ERROR, so the caller must
+    // see it. The walk does not swallow it the way it swallows a bad tag.
+    var walk: Datagram = .init(datagram[0..sent]);
+    try testing.expectError(error.StreamLimit, walk.next(&server, &plaintext, &events));
+    try testing.expectEqual(@as(u16, 0), walk.dropped);
+}
+
+test "RFC 9000 §4.1, a peer past the stream limit is a connection error" {
+    const dcid = [_]u8{ 0x24, 0x25 };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x2c},
+    });
+    var ring: [64]u8 = undefined;
+    var slots: [1]StreamTable.Slot = undefined;
+    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .limit = 4 }};
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x2c},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 1024,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x29);
+    const server_secret: [protection.secret_length]u8 = @splat(0x2a);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var payload: [64]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+
+    // The stream's limit is 4 and the frame ends at 5 (§4.1).
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 0,
+        .offset = 0,
+        .data = "hello",
+        .fin = false,
+        .length_present = true,
+    } });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram);
+
+    try testing.expectError(error.FlowControl, server.feed(datagram[0..sent], &plaintext, &events));
+    // The connection window was not touched: the stream refused it first.
+    try testing.expectEqual(@as(u64, 0), server.receive_window.used);
+}
+
+test "RFC 9000 §4.1, a peer past the connection limit is a connection error" {
+    const dcid = [_]u8{ 0x26, 0x27 };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x2d},
+    });
+    var ring_a: [64]u8 = undefined;
+    var ring_b: [64]u8 = undefined;
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &ring_a, .limit = 64 },
+        .{ .recv_buffer = &ring_b, .limit = 64 },
+    };
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x2d},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 8,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x2b);
+    const server_secret: [protection.secret_length]u8 = @splat(0x2c);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var payload: [64]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+
+    // Each stream is inside its own limit; together they pass the connection's.
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 0,
+        .offset = 0,
+        .data = "12345",
+        .fin = false,
+        .length_present = true,
+    } });
+    try frame.write(&writer, .{ .stream = .{
+        .id = 4,
+        .offset = 0,
+        .data = "67890",
+        .fin = false,
+        .length_present = true,
+    } });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram);
+
+    try testing.expectError(error.FlowControl, server.feed(datagram[0..sent], &plaintext, &events));
+    // The first stream's five bytes were counted before the second blew it.
+    try testing.expectEqual(@as(u64, 5), server.receive_window.used);
+}
+
+test "RFC 9000 §12.4, a STREAM frame in an Initial packet is a connection error" {
+    const dcid = [_]u8{0x28};
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x2e},
+    });
+    var ring: [64]u8 = undefined;
+    var slots: [1]StreamTable.Slot = undefined;
+    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .limit = 64 }};
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x2e},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+    });
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var payload: [64]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 0,
+        .offset = 0,
+        .data = "x",
+        .fin = false,
+        .length_present = true,
+    } });
+    const sent = try client.writeFrames(.initial, writer.written(), &datagram);
+
+    try testing.expectError(error.WrongFrameSpace, server.feed(datagram[0..sent], &plaintext, &events));
+    try testing.expect(server.stream(0) == null);
+}
+
+test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame" {
+    const dcid = [_]u8{ 0x29, 0x2a };
+    var send_buffer: [64]u8 = undefined;
+    var client_ring: [64]u8 = undefined;
+    var client_slots: [2]StreamTable.Slot = undefined;
+    var client_streams: [2]Conn.Stream = .{
+        .{ .send_buffer = &send_buffer, .recv_buffer = &client_ring, .limit = 64 },
+        .{},
+    };
+
+    var receive_ring: [64]u8 = undefined;
+    var server_slots: [2]StreamTable.Slot = undefined;
+    var server_streams: [2]Conn.Stream = .{ .{ .recv_buffer = &receive_ring, .limit = 64 }, .{} };
+
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x2f},
+        .stream_slots = &client_slots,
+        .streams = &client_streams,
+        .send_limit = 64,
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x2f},
+        .source_connection_id = &dcid,
+        .stream_slots = &server_slots,
+        .streams = &server_streams,
+        .receive_limit = 64,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x2d);
+    const server_secret: [protection.secret_length]u8 = @splat(0x2e);
+    installApp(&client, &server, client_secret, server_secret);
+
+    const entry = try client.openStream(0, 64);
+    _ = try entry.send.write("stream bytes");
+    try entry.send.end();
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var payload: [64]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+
+    const sent = (try client.writeStream(0, 64, &payload, &datagram)) orelse return error.TestUnexpectedResult;
+    _ = try server.feed(datagram[0..sent], &plaintext, &events);
+
+    const received = server.stream(0) orelse return error.TestUnexpectedResult;
+    // The FIN rode on the segment that reached the final size (§19.8), so the
+    // stream knows its size before anything is read.
+    try testing.expectEqual(ReceiveStream.State.data_recvd, received.recv.state);
+
+    var read_buffer: [32]u8 = undefined;
+    const read = try received.recv.readInto(&read_buffer);
+    try testing.expectEqualStrings("stream bytes", read_buffer[0..read]);
+    try testing.expectEqual(ReceiveStream.State.data_read, received.recv.state);
+    // §4.1: the send allowance moved with the bytes.
+    try testing.expectEqual(@as(u64, 12), client.send_window.sent);
 }
 
 test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram" {

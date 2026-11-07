@@ -96,6 +96,16 @@ All notable changes to quic are recorded here. The format follows
   including `preferred_address`. It refuses a duplicate, an out-of-range value,
   and a server-only parameter sent by a client, and it ignores a parameter this
   version does not define.
+- `Conn` wires streams: a STREAM frame opens the stream if this is the first
+  one (§2.1), its bytes go into the stream's `ReceiveStream` ring, and the
+  connection-wide receive window counts the highest offset reached (§4.1). A
+  table with no free slot is `error.StreamLimit`, which the caller closes the
+  connection with (STREAM_LIMIT_ERROR, §4.6), not a dropped packet. `Conn.stream`
+  hands the caller the stream halves, `Conn.writeStream` seals the next
+  `SendStream` segment into a packet clamped by the peer's connection allowance,
+  and `Conn.onMaxData` raises that allowance. `Conn.Config` gained `stream_slots`,
+  `streams`, `receive_limit`, and `send_limit`; `Conn.Stream` is the caller's
+  per-stream storage.
 - `Conn` parses the frames of every packet it opens. CRYPTO frames are
   reassembled per level and handed to the TLS driver in order; PADDING is
   consumed; every other frame comes back to the caller as `Conn.Opened.frames`,
@@ -140,6 +150,9 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- STREAM frames no longer appear in `Conn.Opened.frames`, because the machine
+  has a home for them. A STREAM frame in an Initial or Handshake packet is
+  `error.WrongFrameSpace` (§12.4).
 - `Conn.feed` and `Conn.Datagram.next` take a caller array for the frames the
   machine did not act on, and `Conn.Opened` carries `space`, the parsed `frames`,
   and `payload` instead of the raw payload alone. `Conn.Config` gained `crypto`,

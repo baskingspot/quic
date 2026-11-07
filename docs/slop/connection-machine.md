@@ -156,8 +156,8 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 
 ## Where to resume
 
-State as of the three spaces, the datagram walk, key discard, the TLS seam, and
-frame parsing with CRYPTO reassembly: 188 tests.
+State as of the three spaces, the datagram walk, key discard, the TLS seam,
+frame parsing, and streams: 194 tests.
 
 What exists in `src/Conn.zig`:
 
@@ -192,19 +192,23 @@ What exists in `src/Conn.zig`:
 `src/handshake.zig` is the seam: the vtable, `Driver` with the context bound,
 and `Stub` for a caller that has no TLS.
 
+- Streams are wired: `Conn.stream_slots` and `Conn.streams` are the caller's
+  storage and their length is the stream limit; a STREAM frame opens the stream
+  it names (§2.1) and its bytes land in that stream's `ReceiveStream`; the
+  connection-wide `FlowControl` counts the highest offset per stream (§4.1), and
+  both limits are connection errors when a peer passes them. `Conn.writeStream`
+  seals one `SendStream` segment per call, clamped by `FlowControl.Sender`.
+
 What is still unwired, in the order I would take it:
 
-1. Streams: STREAM frames into a `ReceiveStream` reached through `StreamTable`,
-   segments out of a `SendStream`, and the connection-level `FlowControl`
-   counters. `Conn.Config` grows the caller-owned pieces — table slots, a ring
-   and a limit per stream — and the stream frame leaves `Opened.frames` because
-   the machine then has a home for it. A peer over the limit is
-   `error.FlowControl` (§4.1), never a truncated stream.
+1. ACK frames into a `Recovery.Space` per space, and the timer loop over them:
+   that brings the loss half of §6.4, retransmission through the caller's resend
+   queue, and stops ACK frames coming back in `Opened.frames`.
 2. `connection_setup` on the server side, Retry and version negotiation state on
-   the client side.
-3. The `Recovery.Space` per space, ACK frames into it, and with it the loss half
-   of §6.4 that `Conn.Space.discard` leaves to it. Until then ACK frames come
-   back to the caller in `Opened.frames`.
+   the client side, and the connection close path every error above is waiting
+   for.
+3. MAX_STREAM_DATA and MAX_DATA generation for the receive side, and the stream
+   scheduler that decides which `SendStream` gets the next packet.
 
 Two things the next agent should not re-derive:
 
