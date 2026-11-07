@@ -157,7 +157,40 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 ## Where to resume
 
 State as of the three spaces, the datagram walk, key discard, the TLS seam,
-frame parsing, and streams: 194 tests.
+frame parsing, and streams: 198 tests.
+
+### The TigerStyle pass
+
+Landed after the note was written, in four commits. It changed no bytes on the
+wire, and the round-trip and RFC vector tests that were already there stayed
+byte-identical.
+
+- `frame.write` is a switch over the §19 families, each one calling a helper
+  that takes `(writer, payload)` and switches its own arms: `writeMarker`
+  (§19.1, §19.2, §19.20), `writeStreamControl` (§19.4, §19.5),
+  `writeStreamData` (§19.6, §19.7), `writeFlowControl` (§19.9 to §19.14),
+  `writeConnectionId` (§19.15, §19.16), `writePath` (§19.17, §19.18), and
+  `writeConnectionClose` (§19.19). `writeAck` and `writeStream` were already
+  there. A frame that reaches a helper without a matching arm hits its
+  `else => unreachable`, so the two lists are asserted against each other at
+  runtime by the tests rather than by the compiler.
+- `transport.decode` already refused a declared length past the end of the
+  slice before it took anything, and had since the file was written; the guard
+  is now pinned by a test with a length in the eight-byte form above `u32`,
+  which is the case a `usize` or `u32` position would have hidden.
+- `transport.encode` had no check on what a caller handed it, and its
+  `writeVarint` called `error.Overflow` impossible: a parameter value above
+  2^62 - 1 panicked, and a connection ID over 20 bytes was written even though
+  this same decoder refuses those bytes. Both are `error.InvalidValue` now.
+- `varint.size` is on the `u62` half of the range, so it needs no assertion and
+  `varint.write` is the only place that refuses a value with no encoding.
+- `Recovery` had a real overrun, not a style problem: `Events` is 64 records,
+  the caller's sent table is any size, and one ACK covering more than 64 of them
+  tripped the report's assertion, which in a release build is an out-of-bounds
+  write. `Recovery.sent_packets_max` is now the one number for both, `space()`
+  asserts the caller's table against it, and `Space.sentValid` is asserted
+  wherever the count moves. The index-versus-count hazard is the removal loop:
+  `remove` moves the tail down, so the loop must not advance afterwards.
 
 What exists in `src/Conn.zig`:
 
@@ -201,14 +234,28 @@ and `Stub` for a caller that has no TLS.
 
 What is still unwired, in the order I would take it:
 
-1. ACK frames into a `Recovery.Space` per space, and the timer loop over them:
+1. `Recovery.Events` is fixed at 64 records, so **one space tracks at most 64
+   packets in flight**. That is below what a fast path needs: 1 Gbps at 50 ms
+   RTT is about 5,200 packets. Lifting it means the caller supplies the two
+   event arrays the way it supplies the sent table, so `Events.init(acked,
+   lost)` takes slices. The bound was made safe and explicit first, on purpose,
+   because this change touches `RecoveryDriver` and every harness.
+2. ACK frames into a `Recovery.Space` per space, and the timer loop over them:
    that brings the loss half of §6.4, retransmission through the caller's resend
-   queue, and stops ACK frames coming back in `Opened.frames`.
-2. `connection_setup` on the server side, Retry and version negotiation state on
+   queue, and stops ACK frames coming back in `Opened.frames`. Today nothing is
+   acknowledged in the loss sense, nothing is ever declared lost, and no PTO is
+   armed, because `Recovery` has no caller.
+3. The receive side never generates MAX_STREAM_DATA or MAX_DATA. `FlowControl`
+   has the counters that say when a limit should rise and nobody asks them, so
+   a peer that fills a ring window stalls until the idle timeout. MAX_STREAMS
+   has the same gap when a slot frees.
+4. `connection_setup` on the server side, Retry and version negotiation state on
    the client side, and the connection close path every error above is waiting
    for.
-3. MAX_STREAM_DATA and MAX_DATA generation for the receive side, and the stream
-   scheduler that decides which `SendStream` gets the next packet.
+5. The stream scheduler that decides which `SendStream` gets the next packet.
+6. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
+   both callers carry an `unreachable` arm for it. Narrowing the set to
+   `error{Truncated}` deletes those arms.
 
 Two things the next agent should not re-derive:
 
