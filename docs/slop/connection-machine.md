@@ -157,8 +157,8 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 ## Where to resume
 
 State as of the three spaces, the datagram walk, key discard, the TLS seam,
-frame parsing, streams, and the receive-side flow control generator: 199
-tests.
+frame parsing, streams, the receive-side flow control generator, loss recovery,
+and the close path: 209 tests.
 
 ### The TigerStyle pass
 
@@ -219,12 +219,16 @@ What exists in `src/Conn.zig`:
 - Every packet that opens has its payload parsed. CRYPTO frames go through
   `CryptoStream` — one ring per level, in the caller's storage — and then to the
   driver in order, whatever order the frames arrived in (§19.6). PADDING is
-  consumed. Everything else is returned to the caller as `Conn.Opened.frames`,
+  consumed, STREAM frames go to their stream, and ACK frames go to loss
+  recovery. Everything else is returned to the caller as `Conn.Opened.frames`,
   borrowed and in wire order, which is the list of what the machine has no home
   for yet. A frame that will not parse is a connection error (§12.4); only a
   packet that will not unprotect is dropped.
 - `Conn.writeFrames`, `Conn.writeAck`, and `Conn.ackOwed` take the space they act
   on; `writeFrames` writes a short header for `app` and a long one otherwise.
+  Every writer takes `now`, and `writeFrames` takes a `Conn.Write` that says what
+  the machine cannot see: the send time, and whether the packet is ack-eliciting
+  and in flight.
 - `Conn.writeHandshake` drives the `handshake` seam: transport parameters once,
   spaces installed from the secrets and the cipher suite the driver reports
   (`error.UnsupportedCipherSuite` rather than a substitution), one CRYPTO frame
@@ -241,66 +245,111 @@ and `Stub` for a caller that has no TLS.
   both limits are connection errors when a peer passes them. `Conn.writeStream`
   seals one `SendStream` segment per call, clamped by `FlowControl.Sender`.
 
-What is still unwired, in the order I would take it:
+### Loss recovery is wired, and it is the caller's
 
-1. **Wire `Recovery` into `Conn`.** Nothing is acknowledged in the loss sense,
-   nothing is ever declared lost, no PTO is armed, and ACK frames still come back
-   in `Opened.frames` as caller events. Do this before `connection_setup` and the
-   close path: acknowledgments and loss detection are what make the machine a
-   transport at all, and the rest is protocol surface that can land after.
+The trap above is closed by the type. `Conn.Config.loss` is a `Conn.Loss`: the
+caller's `*Recovery` plus one sent-packet table per space. `Conn` keeps only
+handles built from it, so a `Conn` value copies correctly, and a test asserts the
+pointers still name the caller's storage after a copy.
 
-   **The trap, first.** `Recovery.Space` holds `*Recovery`, and `Conn.init`
-   returns `Conn` by value, so the caller's assignment copies it. A `Recovery`
-   field inside `Conn` therefore leaves every space pointing at the pre-move
-   address. That is a dangling pointer, and it surfaces much later as recovery
-   state that changes on its own, with no path back to the cause. The `Recovery`
-   and its sent tables live outside `Conn`; `Conn` holds a pointer to them.
+`Conn.Space.recovery` is a `Recovery.Space`, not the `?Recovery.Space` this note
+first asked for. All three tables are required — `lossTablesValid` asserts it in
+`init` — so every space always has one; the optional would have existed only to
+express "no table", which is now a configuration error. `Conn.discard` empties
+the loss space in place instead of taking it away, which is what keeps the
+address a caller's `RecoveryDriver` already holds usable.
 
-   The four API changes:
+Two things `Recovery.Space` grew, both because the wiring found a hole:
 
-   - `Conn.Config` gains `recovery: *Recovery` and three caller-owned sent
-     tables, `sent_initial`, `sent_handshake`, `sent_app`: `[]Recovery.SentPacket`,
-     each non-empty and at least as long as the `Recovery.Events` report the
-     caller passes to `feed`.
-   - `Conn.Space` gains `?Recovery.Space`, built from the config table on first
-     use and taken away by `Conn.discard`, which calls `Space.discard()` before
-     it zeroes the keys, because §6.4 puts the loss state in the same grave.
-   - `Conn` has no clock, so `feed` and the writers grow `now: Duration`.
-     Whether a packet is ack-eliciting and in flight is a property of the frames
-     the caller put inside, and the machine never parses what it just sealed, so
-     `writeFrames` takes both as an options struct: two bools in positional
-     arguments is a swap waiting to happen.
-   - `feed` takes `events: *Recovery.Events` beside `frames`. `.ack` frames go
-     to `space.recovery.onAckReceived(ack, now, options, events)` and stop
-     coming back in `Opened.frames`; the `Options` fields come from `Config`
-     plus the handshake seam's `confirmed()`. The caller drives
-     `RecoveryDriver` for timers; `Conn` grows no timer loop of its own.
+- `discarded`. §6.2.2.1 arms an anti-deadlock probe when nothing is in flight and
+  the peer's address is unvalidated, and that branch is unconditional: without a
+  flag, a discarded space answers `nextTimer` with a probe at every call, forever.
+  §6.4 says a discarded space contributes no timer, so it says so itself rather
+  than asking the driver to remember.
+- `hasRoom`, so a writer can refuse a full table before it seals anything.
 
-   Tests that pin it: an ACK covering a sent packet empties `inFlight` and
-   reports the record in `events`; a packet never acknowledged becomes lost
-   after the loss delay, named by packet number so the caller's resend queue can
-   find its own description of it; and `.ack` no longer appears in
-   `Opened.frames`.
+Acknowledgments are the machine's now. `feed` and `Datagram.next` take the
+caller's `Recovery.Events` and `now`; `.ack` goes to `onAckReceived` and no longer
+appears in `Opened.frames`. The report describes one packet, so a call with no ACK
+leaves it empty, and `finish` clears it for that reason. An ACK naming a packet
+number this endpoint never used is `error.InvalidAckRange` (§19.3.1), refused
+before the estimator moves. The delay field is scaled by `Config.ack_delay_exponent`
+(§18.2) on the way in, because `Recovery` wants nanoseconds and saturates rather
+than wrapping on a hostile 2^62.
 
-2. `connection_setup` on the server side, Retry and version negotiation state on
-   the client side, and the connection close path every error above is waiting
-   for.
+Writers date what they send. `Conn.Write` carries the send time and the two
+properties the machine cannot see for itself: ack-eliciting (§13.2.1) and in
+flight (§7.1 of RFC 9002). A packet that is neither — an ACK on its own, a
+CONNECTION_CLOSE — is not recorded, so an idle connection does not fill the sent
+table with packets that will be reported lost and resent for nothing.
+
+`Conn.close` and `Conn.State` landed with it. Every error the machine now returns
+(`error.FlowControl`, `error.StreamLimit`, `error.InvalidAckRange`) is one the
+caller closes the connection over, and `error_code.forFrameError` names the code,
+so the machine being able to seal a CONNECTION_CLOSE was the missing half.
+
+### The wall in front of the client's Retry path
+
+Not an amount of work: a decision. To continue after a Retry the client must send
+the same ClientHello again, because the server never saw it and the Initial keys
+changed with the Destination Connection ID (§5.2 of RFC 9001, §17.2.5.3 of RFC
+9000). The machine cannot do that today. It hands CRYPTO bytes to the TLS driver
+and keeps `crypto_sent_bytes` alone, so the bytes are gone, and the caller's resend
+queue holds frame descriptions — for a CRYPTO frame that is a range with no bytes
+behind it. The same gap means a lost Initial or Handshake packet can never be
+retransmitted at all, Retry or no Retry.
+
+Three shapes:
+
+- **The caller owns the bytes.** `Conn.Config` gains a CRYPTO send buffer per
+  level; the machine copies every CRYPTO payload it writes into it, and
+  `Conn.replayCrypto(space)` writes the unacknowledged ranges again. Storage the
+  caller sizes, one implementation, and handshake loss starts working too.
+- **The driver replays.** `handshake.VTable` gains `replay(level)` and the driver
+  re-offers bytes it already produced. Pushes the storage into the other
+  repository and asks a TLS driver to behave unlike TLS.
+- **A Retry restarts the attempt.** A fresh `Conn` and a fresh driver. Packet
+  numbers restart, which §17.2.5.3 says a client MUST NOT do, and a server may
+  abort the connection over it.
+
+I would build the first. It is a decision for Matt, so the client Retry path waits
+on it.
+
+### What is still unwired, in the order I would take it
+
+1. The client's side of connection setup, minus the blocked part: `Conn` should
+   own a `connection_setup.Client` so the attempt carries `retried`, `responded`,
+   and `one_rtt_sent`, and report `VersionNegotiation.Action` so a `.abandon` is
+   the caller's to act on. Version negotiation itself needs no new logic:
+   `VersionNegotiation.handle` cannot return a different version because its
+   return type has no such value.
+2. The server's side needs nothing new in `Conn`. A Retry and a Version
+   Negotiation are per-datagram and precede the connection: `Retry.write` and
+   `VersionNegotiation.write` build them, and the interop tool drives both against
+   quiche today. The one addition worth making is a checked constructor from a
+   datagram's invariant header, so a server cannot pair the wrong connection IDs
+   with the keys it derives. After a Retry the server derives Initial keys from
+   its own Source Connection ID, which is the client's new Destination.
 3. MAX_STREAMS when a stream slot frees. The receive-side MAX_DATA and
    MAX_STREAM_DATA generation landed; this is the one limit still never raised.
 4. The stream scheduler that decides which `SendStream` gets the next packet.
 5. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
    both callers carry an `unreachable` arm for it. Narrowing the set to
    `error{Truncated}` deletes those arms.
+6. `InitialSpace` is still a file with its own tests and no user. The machine
+   covers everything it did; deleting it takes the duplicated `largest_acked` out
+   of the tree, which is what this note always said would happen.
 
-Two things the next agent should not re-derive:
+### Three things the next agent should not re-derive
 
 - `error.NoKeys` is the only way the machine says a space is not there. It used
   to be a null optional next to a keys field; it is not any more, and a readiness
   flag would be the same mistake a third time.
-- `protection.openPacket` mutates the packet in place, so the datagram the
-  caller hands to `Datagram` is a receive buffer, not read-only bytes: header
-  protection is an XOR. Feeding the same buffer twice does not work, which is
-  why a test that wants to walk and then feed builds the packet twice.
+- `protection.openPacket` mutates the packet in place, so the datagram the caller
+  hands to `Datagram` is a receive buffer, not read-only bytes: header protection
+  is an XOR. Feeding the same buffer twice does not work, which is why a test that
+  wants to walk and then feed builds the packet twice — and why a test that feeds
+  a packet after a close needs a packet built before the close.
 - `Conn.dropped` counts packets the datagram could not process, and a frame that
   will not parse is not one of them: the packet decrypted, so the peer said
   something invalid and the connection closes (§12.4).
