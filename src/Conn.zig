@@ -374,6 +374,28 @@ pub const Opening = struct {
     }
 };
 
+/// A client's configuration: the name it invents for the server, its own, and
+/// the loss state that has no default.
+///
+/// §7.2: a client names the server in its first Initial, and RFC 9001 §5.2 makes
+/// those same bytes the seed of the Initial keys, so the two numbers cannot
+/// differ. The destination starts as that name and changes only when the server
+/// offers a connection ID of its own. Fill in the rest — `tls`, the streams, the
+/// limits — before `Conn.init`.
+pub fn clientConfig(
+    destination_connection_id: []const u8,
+    source_connection_id: []const u8,
+    loss: Loss,
+) Config {
+    return .{
+        .role = .client,
+        .loss = loss,
+        .original_destination_connection_id = destination_connection_id,
+        .destination_connection_id = destination_connection_id,
+        .source_connection_id = source_connection_id,
+    };
+}
+
 /// One stream the machine can hold: the buffers and the per-stream limit, then
 /// the two halves the machine builds when the stream opens.
 ///
@@ -563,6 +585,16 @@ role: Role,
 /// §10.2: where this connection is in its life. A packet that arrives after the
 /// close is `error.Closed`, processed no further.
 state: State = .open,
+/// Where this connection was first used, for the move assertion.
+///
+/// A caller builds a `RecoveryDriver` over `&conn.app.?.recovery` and the other
+/// spaces, so a `Conn` that moves leaves the driver writing through pointers
+/// into nobody's storage. `init` returns by value and cannot see the address the
+/// caller assigns it to, so the first call that uses the connection records that
+/// address and every call after asserts it. A move before the first call is
+/// invisible, and harmless: nothing has handed out a pointer into the connection
+/// yet.
+home: ?*const Conn = null,
 packet_number_len: u3,
 /// What this endpoint writes into the packets it sends. The connection IDs
 /// outlive every space: discarding a space's keys does not change what the peer
@@ -628,6 +660,21 @@ streams_allowed: StreamLimits,
 streams_advertised: StreamLimits,
 /// Whether the driver has them yet. One call, before the first flight.
 transport_parameters_set: bool = false,
+
+/// Whether the connection is still at the address it was first used from.
+///
+/// A pure predicate so the bad shape can be driven in a test: an assertion that
+/// cannot be expected is a rule nobody can check.
+fn atHome(home: ?*const Conn, self: *const Conn) bool {
+    const recorded = home orelse return true;
+    return recorded == self;
+}
+
+/// Record this connection's address on first use and refuse a later move.
+fn pin(self: *Conn) void {
+    std.debug.assert(atHome(self.home, self));
+    if (self.home == null) self.home = self;
+}
 
 pub fn init(config: Config) Conn {
     std.debug.assert(config.packet_number_len >= 1);
@@ -710,11 +757,13 @@ pub fn init(config: Config) Conn {
 /// is none to act on. A handshake or application space appears when its driver
 /// does, and disappears when its keys are discarded; there is no third state.
 pub fn spaceFor(self: *Conn, id: SpaceId) Error!*Space {
+    self.pin();
     return self.spaceMaybe(id) orelse error.NoKeys;
 }
 
 /// The same, for a caller that already knows a missing space is not an error.
 fn spaceMaybe(self: *Conn, id: SpaceId) ?*Space {
+    self.pin();
     switch (id) {
         .initial => return if (self.initial) |*space| space else null,
         .handshake => return if (self.handshake) |*space| space else null,
@@ -731,6 +780,7 @@ fn spaceMaybe(self: *Conn, id: SpaceId) ?*Space {
 /// the connection IDs, the packet number width, and the RTT estimate are the
 /// connection's, not the space's.
 pub fn discard(self: *Conn, id: SpaceId) Error!void {
+    self.pin();
     const space = try self.spaceFor(id);
     space.discard();
     self.clear(id);
@@ -788,6 +838,7 @@ pub fn feed(
     events: *Recovery.Events,
     now: Duration,
 ) Error!Opened {
+    self.pin();
     // §10.2.1 and §10.2.2: a connection that has closed, either way, processes
     // no more frames. The caller decides whether to answer with its close again.
     if (self.state != .open) return error.Closed;
@@ -1084,6 +1135,7 @@ pub const Datagram = struct {
         events: *Recovery.Events,
         now: Duration,
     ) Error!?Opened {
+        conn.pin();
         // The same rule as `feed`: a closed connection walks nothing.
         if (conn.state != .open) return error.Closed;
 
@@ -1135,6 +1187,7 @@ pub const Datagram = struct {
 /// that has already reported everything makes it a no-op, so a caller may call
 /// it after every packet. Without a driver it does nothing.
 pub fn installSpaces(self: *Conn) Error!void {
+    self.pin();
     if (self.state != .open) return error.Closed;
     const tls = self.tls orelse return;
 
@@ -1364,6 +1417,7 @@ fn tablesOverlap(a: []const Recovery.SentPacket, b: []const Recovery.SentPacket)
 
 /// The stream with `id`, or null when it is not open.
 pub fn stream(self: *Conn, id: u64) ?*Stream {
+    self.pin();
     const slot = self.stream_table.get(id) orelse return null;
     return streamOf(slot);
 }
@@ -1389,6 +1443,7 @@ fn freeStream(self: *Conn) ?usize {
 /// peer initiates is `error.WrongDirection`: that stream already exists on the
 /// receive side, and `joinStream` is how its sending half comes into being.
 pub fn openStream(self: *Conn, id: u64) Error!*Stream {
+    self.pin();
     if (self.stream_table.get(id) != null) return error.AlreadyOpen;
 
     const initiator: stream_id.Initiator = switch (self.role) {
@@ -1424,6 +1479,7 @@ pub fn openStream(self: *Conn, id: u64) Error!*Stream {
 /// peer opened is `error.WrongDirection`, because §2.1 gives its only direction
 /// to the peer.
 pub fn joinStream(self: *Conn, id: u64) Error!*Stream {
+    self.pin();
     const slot = self.stream_table.get(id) orelse return error.NotOpen;
     if (slot.send != null) return error.AlreadyOpen;
     if (stream_id.direction(id) != .bidi) return error.WrongDirection;
@@ -1463,6 +1519,7 @@ fn streamFor(self: *Conn, id: u64) Error!*Stream {
 /// because freeing its slot early would let the peer's next frame on that stream
 /// open it again over the same buffers.
 pub fn closeStream(self: *Conn, id: u64) Error!void {
+    self.pin();
     const entry = self.stream(id) orelse return error.NotOpen;
     if (!streamFinished(entry)) return error.StreamState;
 
@@ -1780,6 +1837,7 @@ fn appPayloadRoom(self: *const Conn, out: []u8) u32 {
 
 /// §4.2: apply a MAX_DATA the peer sent, raising the connection-wide allowance.
 pub fn onMaxData(self: *Conn, limit: u64) void {
+    self.pin();
     self.send_window.onMaxData(limit);
 }
 
@@ -1793,6 +1851,7 @@ pub fn onMaxData(self: *Conn, limit: u64) void {
 /// wire. Until then the same frames come back, which is what makes a caller
 /// that ran out of packet room simply try again.
 pub fn flowControlOwed(self: *Conn, out: []frame.Frame) []frame.Frame {
+    self.pin();
     var count: usize = 0;
 
     if (self.receive_window.nextLimit(self.consumedBytes())) |limit| {
@@ -1837,6 +1896,7 @@ pub fn flowControlOwed(self: *Conn, out: []frame.Frame) []frame.Frame {
 /// only ever rises here, the same rule a receiver applies to a MAX frame it
 /// reads.
 pub fn onFlowControlSent(self: *Conn, frames: []const frame.Frame) void {
+    self.pin();
     for (frames) |value| {
         switch (value) {
             .max_data => |limit| self.receive_window.raise(limit),
@@ -1870,6 +1930,7 @@ pub fn onVersionNegotiation(
     self: *Conn,
     response: *const packet.VersionNegotiation,
 ) Error!setup.VersionNegotiation.Action {
+    self.pin();
     const attempt = if (self.attempt) |*attempt| attempt else return error.WrongRole;
     // The version this machine speaks, which is the only one it is built for.
     return attempt.onVersionNegotiation(response, .v1);
@@ -1887,6 +1948,7 @@ pub fn onVersionNegotiation(
 /// bytes, and the ClientHello this Retry exists to re-send lives in exactly that
 /// buffer.
 pub fn onRetry(self: *Conn, retry: *const packet.Retry, raw: []const u8) Error!setup.Client.Outcome {
+    self.pin();
     const attempt = if (self.attempt) |*attempt| attempt else return error.WrongRole;
 
     // §17.2.5.2: a Retry that does not name this endpoint's own connection ID is
@@ -1958,6 +2020,7 @@ fn rekeyInitial(self: *Conn, destination_connection_id: []const u8) void {
 /// caller's own anti-amplification policy accepts, and this machine owns
 /// neither.
 pub fn onPeerAddressValidated(self: *Conn) void {
+    self.pin();
     self.peer_address_validated = true;
 }
 
@@ -2017,6 +2080,7 @@ pub const Write = struct {
 /// before anything is sealed, so the machine is left as it was found and the
 /// caller's buffer holds no half packet.
 pub fn writeFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8, write: Write) Error!u32 {
+    self.pin();
     // §10.2.1: a closing endpoint sends nothing but CONNECTION_CLOSE, and this
     // is where every other frame this machine writes goes out.
     if (self.state != .open) return error.Closed;
@@ -2197,6 +2261,7 @@ pub const Close = struct {
 /// required; a caller that would rather resend the packet it already has is
 /// allowed to as well (§12.3 carves that out explicitly).
 pub fn close(self: *Conn, args: Close, frames: []u8, out: []u8, now: Duration) Error!u32 {
+    self.pin();
     const id: SpaceId = if (self.app != null)
         .app
     else if (self.handshake != null)
@@ -5051,6 +5116,48 @@ test "RFC 9001 §5.5, a packet that will not unprotect changes nothing" {
     );
     try testing.expect(!server.ackOwed(.initial));
     try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
+}
+
+test "a connection pins the address it is used from" {
+    const dcid = [_]u8{ 0x81, 0x82 };
+    var loss: LossTables = .{};
+    var conn: Conn = .init(clientConfig(&dcid, &.{0x83}, loss.value()));
+
+    // Nothing is recorded until the connection is used: `init` returns by value
+    // and cannot see the address the caller gives it.
+    try testing.expectEqual(@as(?*const Conn, null), conn.home);
+    try testing.expect(atHome(null, &conn));
+
+    // The first call records it, and a second call from the same address is
+    // fine.
+    var none: [0]frame.Frame = .{};
+    _ = conn.flowControlOwed(&none);
+    try testing.expectEqual(@as(*const Conn, &conn), conn.home.?);
+    try testing.expect(atHome(conn.home, &conn));
+
+    // A copy at another address is what the assertion refuses: a
+    // `RecoveryDriver` built over the first one holds `&conn.app.?.recovery`,
+    // and the copy's spaces are somewhere else.
+    var moved = conn;
+    try testing.expect(!atHome(moved.home, &moved));
+}
+
+test "a client's configuration seeds its keys from the name it invented" {
+    const dcid = [_]u8{ 0x84, 0x85 };
+    var loss: LossTables = .{};
+    const config = clientConfig(&dcid, &.{0x86}, loss.value());
+
+    try testing.expectEqual(Role.client, config.role);
+    // RFC 9001 §5.2: the Initial keys come from the original Destination
+    // Connection ID, and §7.2 makes that the same name the client puts in its
+    // first packet. One constructor is what keeps the two from disagreeing.
+    try testing.expectEqualSlices(u8, &dcid, config.original_destination_connection_id);
+    try testing.expectEqualSlices(u8, &dcid, config.destination_connection_id);
+    try testing.expectEqualSlices(u8, &.{0x86}, config.source_connection_id);
+
+    // Everything else is the caller's to fill in, and the defaults still build.
+    const client: Conn = .init(config);
+    try testing.expect(client.initial != null);
 }
 
 test "the loss state stays outside the machine, so a copy of it still works" {

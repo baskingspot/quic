@@ -134,23 +134,26 @@ pub fn main(init: std.process.Init) !void {
     const server = try arena.create(Endpoint);
     client.prepare();
     server.prepare();
-    client.start(.{
-        .role = .client,
-        .loss = client.loss(),
-        .original_destination_connection_id = &named_server,
-        .destination_connection_id = &named_server,
-        .source_connection_id = &client_id,
-        .tls = client_stub.driver(),
-        .transport_parameters = "client parameters",
-        .crypto = .{ .initial = &client.crypto_in_initial, .handshake = &client.crypto_in_handshake },
-        .crypto_sent = .{ .initial = &client.crypto_out_initial, .handshake = &client.crypto_out_handshake },
-        .stream_slots = &client.slots,
-        .streams = &client.streams,
-        .receive_limit = 4096,
-        .send_limit = 4096,
-        .send_streams = .{ .bidi_remote = 4096 },
-        .max_streams_bidi = 1,
-    });
+    // The client's identity is the name it makes up for the server, which is
+    // also the seed of its Initial keys, and the constructor is what pairs them.
+    var client_config = Conn.clientConfig(&named_server, &client_id, client.loss());
+    client_config.tls = client_stub.driver();
+    client_config.transport_parameters = "client parameters";
+    client_config.crypto = .{
+        .initial = &client.crypto_in_initial,
+        .handshake = &client.crypto_in_handshake,
+    };
+    client_config.crypto_sent = .{
+        .initial = &client.crypto_out_initial,
+        .handshake = &client.crypto_out_handshake,
+    };
+    client_config.stream_slots = &client.slots;
+    client_config.streams = &client.streams;
+    client_config.receive_limit = 4096;
+    client_config.send_limit = 4096;
+    client_config.send_streams = .{ .bidi_remote = 4096 };
+    client_config.max_streams_bidi = 1;
+    client.start(client_config);
     var wire: [1500]u8 = undefined;
     var frames: [512]u8 = undefined;
 

@@ -7,6 +7,14 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.clientConfig` builds a client's configuration from the name it invents
+  for the server, its own connection ID, and its loss state, mirroring
+  `Opening.serverConfig`. The two numbers the Initial keys depend on cannot
+  disagree when one call sets both.
+- `Conn` asserts, in debug builds, that it is still at the address it was first
+  used from. A caller builds a `RecoveryDriver` over `&conn.app.?.recovery`, so a
+  connection that moves leaves the driver writing through pointers into nobody's
+  storage. The assertion catches the move on the next call instead of days later.
 - `Conn.acksOwed` reports every packet number space that owes an acknowledgment
   in one call, lowest first, as `Conn.flowControlOwed` does for the window
   frames. `ackOwed` and `writeAck` still take a space; the summary removes the
