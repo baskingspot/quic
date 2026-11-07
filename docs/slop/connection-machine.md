@@ -156,8 +156,8 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 
 ## Where to resume
 
-State as of the three spaces, the datagram walk, key discard, and the TLS seam:
-177 tests.
+State as of the three spaces, the datagram walk, key discard, the TLS seam, and
+frame parsing with CRYPTO reassembly: 188 tests.
 
 What exists in `src/Conn.zig`:
 
@@ -173,12 +173,20 @@ What exists in `src/Conn.zig`:
   (§12.3). `Conn.Datagram` walks a whole datagram: long headers delimit
   themselves, a short header ends it, a packet that will not unprotect or whose
   space is gone is counted in `dropped` and skipped (RFC 9001 §5.5), and bytes
-  with no readable end stop the walk without an error.
+  with no readable end stop stop the walk without an error.
+- Every packet that opens has its payload parsed. CRYPTO frames go through
+  `CryptoStream` — one ring per level, in the caller's storage — and then to the
+  driver in order, whatever order the frames arrived in (§19.6). PADDING is
+  consumed. Everything else is returned to the caller as `Conn.Opened.frames`,
+  borrowed and in wire order, which is the list of what the machine has no home
+  for yet. A frame that will not parse is a connection error (§12.4); only a
+  packet that will not unprotect is dropped.
 - `Conn.writeFrames`, `Conn.writeAck`, and `Conn.ackOwed` take the space they act
   on; `writeFrames` writes a short header for `app` and a long one otherwise.
 - `Conn.writeHandshake` drives the `handshake` seam: transport parameters once,
-  spaces installed from the secrets the driver reports, one CRYPTO frame per
-  call at the level the driver named, and the Handshake keys gone once
+  spaces installed from the secrets and the cipher suite the driver reports
+  (`error.UnsupportedCipherSuite` rather than a substitution), one CRYPTO frame
+  per call at the level the driver named, and the Handshake keys gone once
   `confirmed` says so (§4.9.2).
 
 `src/handshake.zig` is the seam: the vtable, `Driver` with the context bound,
@@ -186,16 +194,17 @@ and `Stub` for a caller that has no TLS.
 
 What is still unwired, in the order I would take it:
 
-1. CRYPTO reassembly, so `feed(level, bytes)` has a machine caller at all. The
-   machine does not parse frames yet: `feed` hands the caller the payload and
-   stops. Reassembly is a per-level offset and a buffer the caller owns, and it
-   is the first half of the frame-parsing slice.
-2. Frame parsing in the machine, then streams: `StreamTable`, STREAM frames into
-   `ReceiveStream`, segments out of `SendStream`, flow control counters.
-3. `connection_setup` on the server side, Retry and version negotiation state on
+1. Streams: STREAM frames into a `ReceiveStream` reached through `StreamTable`,
+   segments out of a `SendStream`, and the connection-level `FlowControl`
+   counters. `Conn.Config` grows the caller-owned pieces — table slots, a ring
+   and a limit per stream — and the stream frame leaves `Opened.frames` because
+   the machine then has a home for it. A peer over the limit is
+   `error.FlowControl` (§4.1), never a truncated stream.
+2. `connection_setup` on the server side, Retry and version negotiation state on
    the client side.
-4. The `Recovery.Space` per space, and with it the loss half of §6.4 that
-   `Conn.Space.discard` leaves to it.
+3. The `Recovery.Space` per space, ACK frames into it, and with it the loss half
+   of §6.4 that `Conn.Space.discard` leaves to it. Until then ACK frames come
+   back to the caller in `Opened.frames`.
 
 Two things the next agent should not re-derive:
 
@@ -204,4 +213,8 @@ Two things the next agent should not re-derive:
   flag would be the same mistake a third time.
 - `protection.openPacket` mutates the packet in place, so the datagram the
   caller hands to `Datagram` is a receive buffer, not read-only bytes: header
-  protection is an XOR.
+  protection is an XOR. Feeding the same buffer twice does not work, which is
+  why a test that wants to walk and then feed builds the packet twice.
+- `Conn.dropped` counts packets the datagram could not process, and a frame that
+  will not parse is not one of them: the packet decrypted, so the peer said
+  something invalid and the connection closes (§12.4).
