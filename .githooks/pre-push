@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run everything CI runs before the push, in the devshell. The pre-commit hook
+# has already linted; this is the one that also runs the tests, because a few
+# minutes before a push is cheaper than a red build on the other side.
+set -uo pipefail
+if ! nix develop --command just ci >/tmp/quic-pre-push.log 2>&1; then
+    echo "pre-push: just ci failed; the push is refused. Output:" >&2
+    tail -40 /tmp/quic-pre-push.log >&2
+    exit 1
+fi
