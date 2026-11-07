@@ -458,3 +458,57 @@ places the machine knows something the caller has to reconstruct.
 Not friction, and worth saying: `writeStreams`, `feed`'s event report, and
 `replayCrypto` were used exactly as designed, and the echo needed no reach into
 machine internals.
+
+## The queue, in Matt's order, and where the next session starts
+
+Nothing in this list is built. It is ordered, with the reasoning, so the next
+session starts with an edit and not a decision.
+
+1. **`SendStream.write` must not be able to take part of what it is given (item
+   5).** Today it returns the count and taking less is not an error; with no send
+   buffer configured, a 21-byte write became a zero-length FIN and the peer saw a
+   closed stream with no data, silently. The fix is the type, not a comment:
+   `write(bytes) Error!void` takes all of it or `error.NoSpace`, so a short write
+   does not exist; and `end()` becomes `finish()`, which can no longer publish a
+   truncated stream because no write can be truncated. The example checks the
+   count today, which is the workaround this item deletes. Call sites: every
+   `SendStream` test, the three `openStream`/`write`/`end` sequences in
+   `Conn.zig`'s tests, and `examples/echo.zig`.
+2. **Distinct stream buffers must be asserted, not documented (item 6).**
+   `streamsValid` checks lengths and not identity; two slots can point at one
+   ring, and one stream silently overwrites another — the same bug class as
+   shared CRYPTO flights. Add `buffersOverlap` and assert it in `init`, the way
+   `tablesOverlap` already guards the sent tables. The example already hit this
+   by writing `\@splat` over its stream slots and aliasing all four rings; it is
+   one keystroke away.
+3. **Report which streams received data (item 3).** `finish` consumes STREAM
+   frames and reports nothing, so a caller scans `stream_table.iterator()` after
+   every packet. Add to `Opened` a caller-storage list of `{ stream_id, newly
+   readable, newly finished }`, filled at `onStreamFrame`, the same shape as the
+   loss report: the machine states the fact and the caller decides.
+4. **Build a server from a datagram (item 9).** A checked constructor:
+   `Conn.Opening.fromDatagram(bytes)` reading the invariant header, plus a
+   `Conn.Config` path that takes the client's connection ID as both the
+   destination and the source of the Initial keys, and a generated server
+   connection ID. This is also where connection ID derivation lives, which is a
+   decision about the server's identity, not plumbing.
+5. **`writeStreams` should report the window left (item 7).** Returning the
+   remaining bytes in `Packet` keeps the policy with the caller and makes the
+   coupling visible at the call site; the alternative, refusing past
+   `Congestion.canSend`, puts policy inside the machine.
+6. **`openStream` needs a second name (item 4).** Joining a peer-initiated stream
+   and opening one of your own are different acts, and the join needs the peer's
+   per-stream limit, which the machine should carry from the handshake rather than
+   be handed again.
+7. **`writeHandshake` is named for its side effect (item 2).** Installing the
+   spaces a driver reported is not writing a packet; it will probably split in
+   two.
+8. **Acknowledgments need a summary (item 8).** `flowControlOwed` reports what is
+   due in one list; `ackOwed`/`writeAck` make the caller ask per space.
+9. **The twenty lines of caller state (item 1).** A default configuration and a
+   debug assertion that a `Conn` is where it was initialised, since every space
+   holds pointers into the caller's state.
+
+Also worth recording: `zig build interop-bin` never installed its artifact, so
+`just interop` could never have run. A test that cannot start is worse than no
+test, and it survived because quiche is not installed anywhere this repo has run.
