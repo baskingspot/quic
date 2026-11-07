@@ -2393,8 +2393,8 @@ test "RFC 9000 §4.6, closing a stream this endpoint opened grants no credit" {
     // A locally opened unidirectional stream — the client's first is 2 — written
     // and acknowledged to its final size, so its only half is terminal.
     const entry = try client.openStream(2, 64);
-    _ = try entry.send.write("bytes");
-    try entry.send.end();
+    try entry.send.write("bytes");
+    try entry.send.finish();
     var sent: u64 = 0;
     while (entry.send.nextSegment(64)) |next| {
         sent += next.data.len;
@@ -2599,9 +2599,9 @@ test "RFC 9000 §19.8, a packed packet reports its number and the frames it carr
     installApp(&client, &server, client_secret, server_secret);
 
     const first = try client.openStream(0, 64);
-    _ = try first.send.write("alpha");
+    try first.send.write("alpha");
     const second = try client.openStream(4, 64);
-    _ = try second.send.write("beta");
+    try second.send.write("beta");
 
     var offers = [_]Offer{
         .{ .stream_id = 0, .length = 64 },
@@ -2676,7 +2676,7 @@ test "RFC 9000 §4.1, a packet that fits part of an offer says where to resume" 
     installApp(&client, &client, client_secret, client_secret);
 
     const entry = try client.openStream(0, 64);
-    _ = try entry.send.write("0123456789abcdefghij");
+    try entry.send.write("0123456789abcdefghij");
 
     var written: [1]Written = undefined;
     var frame_bytes: [256]u8 = undefined;
@@ -3927,8 +3927,8 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
     installApp(&client, &server, client_secret, server_secret);
 
     const entry = try client.openStream(0, 64);
-    _ = try entry.send.write("stream bytes");
-    try entry.send.end();
+    try entry.send.write("stream bytes");
+    try entry.send.finish();
 
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;

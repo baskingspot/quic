@@ -159,11 +159,11 @@ pub fn main(init: std.process.Init) !void {
     // The client asks for a stream, writes, and offers it to the packetizer. The
     // offer is how much this packet may carry, not how much was written.
     const stream = try client.conn.openStream(0, 4096);
-    // `write` returns how much it took, and taking less is not an error: a
-    // caller that ignores the count asks for 21 bytes and sends none.
+    // `write` takes all of it or returns `error.NoSpace`: there is no short
+    // write to check, and so no way to publish a truncated stream by accident.
     const message = "hello from the client";
-    if (try stream.send.write(message) != message.len) return error.ShortWrite;
-    try stream.send.end();
+    try stream.send.write(message);
+    try stream.send.finish();
 
     var client_written: [1]Conn.Written = undefined;
     const sent = (try client.conn.writeStreams(.{
@@ -195,8 +195,8 @@ pub fn main(init: std.process.Init) !void {
         // endpoint opens its own half of it, which reads like creating a stream
         // rather than joining one.
         const back = try server.conn.openStream(recv.id, 4096);
-        if (try back.send.write(read[0..count]) != count) return error.ShortWrite;
-        try back.send.end();
+        try back.send.write(read[0..count]);
+        try back.send.finish();
         var server_written: [1]Conn.Written = undefined;
         const reply = (try server.conn.writeStreams(.{
             .offers = &.{.{ .stream_id = recv.id, .length = 1024 }},

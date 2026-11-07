@@ -223,6 +223,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `SendStream.write` returns `Error!void`: it appends every byte it is given or
+  refuses the whole write with `error.NoSpace`, so a short write cannot exist and
+  a caller has no count to check. `SendStream.end` is `SendStream.finish`, and it
+  can no longer publish a truncated stream because nothing can be truncated. A
+  caller that ignored the old return value was writing an empty stream and
+  closing it.
 - `Conn.writeStream` is removed, not deprecated: `Conn.writeStreams` replaces it
   and returns the `Conn.Packet` description a resend queue needs. A caller that
   wrote `writeStream(id, max_len, frames, out, now)` writes

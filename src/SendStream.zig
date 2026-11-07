@@ -72,7 +72,7 @@ pending: [pending_capacity]Range = undefined,
 pending_len: usize = 0,
 /// §4.1: the peer's limit for this stream, in absolute bytes.
 limit: u64,
-/// Set by `end`, which is what makes the last byte carry FIN.
+/// Set by `finish`, which is what makes the last byte carry FIN.
 final_size: ?u64 = null,
 /// The application error code to put in RESET_STREAM, once the stream is reset.
 reset_code: ?u64 = null,
@@ -87,26 +87,36 @@ pub fn isTerminal(self: *const SendStream) bool {
     return self.state == .data_recvd or self.state == .reset_recvd;
 }
 
-/// Append the application's bytes. Returns how many were taken, which is short
-/// when the buffer is full.
-pub fn write(self: *SendStream, bytes: []const u8) Error!usize {
+/// Append the application's bytes: all of them, or `error.NoSpace` and nothing
+/// written.
+///
+/// There is no partial write, because a count that can be short is a caller's
+/// check against a silent truncation: a 21-byte write into a buffer too small
+/// for it used to become a zero-length FIN, and the peer saw a closed stream
+/// with no data.
+pub fn write(self: *SendStream, bytes: []const u8) Error!void {
     if (self.final_size != null) return error.Closed;
     if (self.reset_code != null) return error.Closed;
     if (self.state == .data_recvd or self.state == .reset_recvd) return error.Closed;
 
+    // The only mutator of `written` is this function, and it never passes the
+    // end of the buffer, so the subtraction below cannot wrap.
+    std.debug.assert(self.written <= self.buffer.len);
     const space = self.buffer.len - @as(usize, @intCast(self.written));
-    const take = @min(space, bytes.len);
-    @memcpy(self.buffer[@intCast(self.written)..][0..take], bytes[0..take]);
-    self.written += take;
-    return take;
+    if (bytes.len > space) return error.NoSpace;
+
+    @memcpy(self.buffer[@intCast(self.written)..][0..bytes.len], bytes);
+    self.written += bytes.len;
 }
 
 /// Record that the application has no more data.
 ///
 /// This does not end the stream on its own: §3.1 waits for a STREAM frame with
 /// the FIN bit, which `nextSegment` produces once the data is out, as a segment
-/// of length zero at the final size.
-pub fn end(self: *SendStream) Error!void {
+/// of length zero at the final size. The final size is exactly what `write`
+/// accepted, and `write` accepts all of it or none, so this cannot publish a
+/// stream shorter than the application asked for.
+pub fn finish(self: *SendStream) Error!void {
     if (self.final_size != null) return error.Closed;
     if (self.reset_code != null) return error.Closed;
     if (self.isTerminal()) return error.Closed;
@@ -284,8 +294,8 @@ test "RFC 9000 §3.1, the sending state machine" {
     var stream: SendStream = .init(4, &buffer, 1000);
     try testing.expectEqual(State.ready, stream.state);
 
-    try testing.expectEqual(@as(usize, 5), try stream.write("hello"));
-    try testing.expectEqual(@as(usize, 10), try stream.write("-world...."));
+    try stream.write("hello");
+    try stream.write("-world....");
 
     // The first segment opens the stream: Ready to Send.
     const first = stream.nextSegment(8).?;
@@ -305,9 +315,9 @@ test "RFC 9000 §3.1, the sending state machine" {
     // Nothing left to send, and not ended: no segment.
     try testing.expectEqual(@as(?Segment, null), stream.nextSegment(100));
 
-    // Ending produces the zero-length FIN at the final size, which is the
+    // Finishing produces the zero-length FIN at the final size, which is the
     // frame that moves the stream to Data Sent.
-    try stream.end();
+    try stream.finish();
     const fin = stream.nextSegment(100).?;
     try testing.expectEqual(@as(u64, 15), fin.offset);
     try testing.expectEqual(@as(usize, 0), fin.data.len);
@@ -322,17 +332,42 @@ test "RFC 9000 §3.1, the sending state machine" {
     try testing.expect(stream.isTerminal());
 }
 
-test "RFC 9000 §3.1, Data Sent is reached by ending, not by writing" {
+test "RFC 9000 §3.1, a write that does not fit is refused whole" {
+    var buffer: [4]u8 = undefined;
+    var stream: SendStream = .init(0, &buffer, 1000);
+    try stream.write("abc");
+
+    // One byte of room and two offered: an error, not a count the caller has to
+    // compare, and the stream is still exactly where it was.
+    try testing.expectError(error.NoSpace, stream.write("de"));
+    try testing.expectEqual(@as(u64, 3), stream.written);
+    try testing.expectEqualStrings("abc", try stream.data(0, 3));
+
+    // The empty buffer the example hit: before this contract a 21-byte write
+    // took nothing, and the FIN that followed published a stream whose data the
+    // peer never received. The refusal is the only way to say so.
+    var empty: [0]u8 = .{};
+    var starved: SendStream = .init(0, &empty, 1000);
+    try testing.expectError(error.NoSpace, starved.write("hello from the client"));
+    try testing.expectEqual(@as(u64, 0), starved.written);
+    try testing.expectEqual(@as(?Segment, null), starved.nextSegment(16));
+
+    // An empty write is always fine: it appends nothing and cannot be short.
+    try stream.write("");
+    try testing.expectEqual(@as(u64, 3), stream.written);
+}
+
+test "RFC 9000 §3.1, Data Sent is reached by finishing, not by writing" {
     var buffer: [16]u8 = undefined;
     var stream: SendStream = .init(0, &buffer, 1000);
 
-    _ = try stream.write("abcd");
+    try stream.write("abcd");
     _ = stream.nextSegment(4).?;
     try testing.expectEqual(State.send, stream.state);
 
-    // Ending with nothing left to send still needs a FIN segment, so the state
+    // Finishing with nothing left to send still needs a FIN segment, so the state
     // does not move until one is handed out.
-    try stream.end();
+    try stream.finish();
     try testing.expectEqual(State.send, stream.state);
     const fin = stream.nextSegment(1).?;
     try testing.expect(fin.fin);
@@ -341,7 +376,7 @@ test "RFC 9000 §3.1, Data Sent is reached by ending, not by writing" {
 
     // Writing after the end is the application's mistake, not a wire event.
     try testing.expectError(error.Closed, stream.write("e"));
-    try testing.expectError(error.Closed, stream.end());
+    try testing.expectError(error.Closed, stream.finish());
 }
 
 test "RFC 9000 §3.1, reset is legal before the end and refused after" {
@@ -358,15 +393,15 @@ test "RFC 9000 §3.1, reset is legal before the end and refused after" {
 
     // From Send.
     var second: SendStream = .init(0, &buffer, 1000);
-    _ = try second.write("abc");
+    try second.write("abc");
     _ = second.nextSegment(3).?;
     try second.reset(0x200);
     try testing.expectEqual(State.reset_sent, second.state);
 
     // A stream that reached Data Recvd cannot be reset either.
     var third: SendStream = .init(0, &buffer, 1000);
-    _ = try third.write("ab");
-    try third.end();
+    try third.write("ab");
+    try third.finish();
     _ = third.nextSegment(2).?;
     try third.onAck(0, 2);
     try testing.expectEqual(State.data_recvd, third.state);
@@ -376,8 +411,8 @@ test "RFC 9000 §3.1, reset is legal before the end and refused after" {
 test "RFC 9000 §4.1, segments stop at the peer's limit and resume when it moves" {
     var buffer: [32]u8 = undefined;
     var stream: SendStream = .init(0, &buffer, 4);
-    _ = try stream.write("0123456789");
-    try stream.end();
+    try stream.write("0123456789");
+    try stream.finish();
 
     const allowed = stream.nextSegment(16).?;
     try testing.expectEqualStrings("0123", allowed.data);
@@ -401,8 +436,8 @@ test "RFC 9000 §4.1, segments stop at the peer's limit and resume when it moves
 test "RFC 9000 §3.1, acknowledgments arrive out of order and the count is honest" {
     var buffer: [32]u8 = undefined;
     var stream: SendStream = .init(0, &buffer, 1000);
-    _ = try stream.write("0123456789");
-    try stream.end();
+    try stream.write("0123456789");
+    try stream.finish();
     _ = stream.nextSegment(10).?;
 
     // The back half lands first: nothing is contiguous yet.
@@ -425,7 +460,7 @@ test "RFC 9000 §3.1, acknowledgments arrive out of order and the count is hones
 test "RFC 9000 §3.5, STOP_SENDING demands a reset while data is still sendable" {
     var buffer: [16]u8 = undefined;
     var stream: SendStream = .init(0, &buffer, 1000);
-    _ = try stream.write("abc");
+    try stream.write("abc");
 
     // In Send, the reset must go now and carries the peer's code.
     try testing.expect(try stream.onStopSending(0x99));
@@ -434,8 +469,8 @@ test "RFC 9000 §3.5, STOP_SENDING demands a reset while data is still sendable"
 
     // In Data Sent it may be deferred: the answer is false and the state stands.
     var finished: SendStream = .init(0, &buffer, 1000);
-    _ = try finished.write("ab");
-    try finished.end();
+    try finished.write("ab");
+    try finished.finish();
     _ = finished.nextSegment(2).?;
     try testing.expectEqual(State.data_sent, finished.state);
     try testing.expect(!try finished.onStopSending(0x10));
@@ -448,12 +483,12 @@ fn inState(state: State, buffer: []u8) SendStream {
     switch (state) {
         .ready => {},
         .send => {
-            _ = stream.write("abcd") catch unreachable;
+            stream.write("abcd") catch unreachable;
             _ = stream.nextSegment(2);
         },
         .data_sent, .data_recvd => {
-            _ = stream.write("abcd") catch unreachable;
-            stream.end() catch unreachable;
+            stream.write("abcd") catch unreachable;
+            stream.finish() catch unreachable;
             _ = stream.nextSegment(4);
             if (state == .data_recvd) stream.onAck(0, 4) catch unreachable;
         },
@@ -475,15 +510,15 @@ test "RFC 9000 §3.1, every operation in every sending state" {
             var stream = inState(state, &buffer);
             const result = stream.write("x");
             switch (state) {
-                .ready, .send => try testing.expectEqual(@as(usize, 1), try result),
+                .ready, .send => try result,
                 else => try testing.expectError(error.Closed, result),
             }
         }
 
-        // end: the same rule, and idempotence is not allowed either.
+        // finish: the same rule, and idempotence is not allowed either.
         {
             var stream = inState(state, &buffer);
-            const result = stream.end();
+            const result = stream.finish();
             switch (state) {
                 .ready, .send => try result,
                 else => try testing.expectError(error.Closed, result),
@@ -547,8 +582,8 @@ test "RFC 9000 §3.1, an acknowledgment beyond the final size is still an acknow
     // contiguous prefix, which is capped by what it sent.
     var buffer: [8]u8 = undefined;
     var stream: SendStream = .init(0, &buffer, 1000);
-    _ = try stream.write("ab");
-    try stream.end();
+    try stream.write("ab");
+    try stream.finish();
     _ = stream.nextSegment(2).?;
     try stream.onAck(0, 2);
     try testing.expectEqual(State.data_recvd, stream.state);
