@@ -56,10 +56,10 @@ Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix deve
   fit the buffer is CRYPTO_BUFFER_EXCEEDED, never a truncated flight. A Retry
   rekeys the Initial space without going through `discard`, precisely because the
   ClientHello it must re-send is in that buffer.
-- `InitialSpace.zig` is the driver, not a connection: keys, packet numbers,
-  and the received ranges an ACK frame needs, for the Initial level only. When
-  a change would need a timer, a retransmission, a stream, or a handshake, it
-  belongs in a later module and not there.
+- `Conn` is the whole machine now. `InitialSpace` was the Initial-level
+  prototype and is deleted: keys, packet numbers, received ranges, and the ACK
+  an Initial owes are `Conn`'s, in `Conn.Space`. Nothing may reintroduce a
+  second packet-number space type beside it.
 - The TLS handshake is not in this repo. HTTP/3 and QPACK are not either.
   This is RFC 9000: packets, frames, transport parameters, and the loss
   recovery loop.

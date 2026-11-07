@@ -2256,6 +2256,147 @@ test "RFC 9000 §4.6, closing a stream this endpoint opened grants no credit" {
     try testing.expectEqual(@as(u64, 0), client.streams_allowed.uni);
 }
 
+test "RFC 9000 §19.3.1, received numbers become the ACK ranges the wire wants" {
+    const dcid = [_]u8{ 1, 2, 3 };
+    var loss: LossTables = .{};
+    var conn: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{4},
+    });
+
+    // 10, 11, 12 arrive together: one range, no pairs.
+    conn.initial.?.record(10);
+    conn.initial.?.record(11);
+    conn.initial.?.record(12);
+    try testing.expectEqual(@as(u4, 1), conn.initial.?.range_count);
+    try testing.expectEqual(@as(u64, 12), conn.initial.?.ranges[0].largest);
+    try testing.expectEqual(@as(u64, 10), conn.initial.?.ranges[0].smallest);
+
+    var scratch: [ack_payload_len]u8 = undefined;
+    var cursor: Cursor = .init(try ackPayload(&conn.initial.?, &scratch));
+    var ack = (try frame.read(&cursor)).ack;
+    try testing.expectEqual(@as(u64, 12), ack.largest);
+    try testing.expectEqual(@as(u64, 2), ack.first_range);
+    try testing.expectEqual(@as(u64, 0), ack.range_count);
+
+    // A gap at 13 through 19 and a later range at 20..21.
+    conn.initial.?.record(20);
+    conn.initial.?.record(21);
+    try testing.expectEqual(@as(u4, 2), conn.initial.?.range_count);
+    try testing.expectEqual(@as(u64, 21), conn.initial.?.ranges[0].largest);
+    try testing.expectEqual(@as(u64, 12), conn.initial.?.ranges[1].largest);
+
+    var second: [ack_payload_len]u8 = undefined;
+    cursor = .init(try ackPayload(&conn.initial.?, &second));
+    ack = (try frame.read(&cursor)).ack;
+    try testing.expectEqual(@as(u64, 21), ack.largest);
+    try testing.expectEqual(@as(u64, 1), ack.first_range);
+    try testing.expectEqual(@as(u64, 1), ack.range_count);
+
+    // The seven unacknowledged numbers between the ranges are encoded as a gap
+    // of six (§19.3.1).
+    var ranges = ack.ranges();
+    const range = (try ranges.next()).?;
+    try testing.expectEqual(@as(u64, 6), range.gap);
+    try testing.expectEqual(@as(u64, 2), range.length);
+}
+
+test "RFC 9000 §19.3.1, a number that bridges two ranges merges them" {
+    const dcid = [_]u8{5};
+    var loss: LossTables = .{};
+    var conn: Conn = .init(.{
+        .role = .server,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{6},
+    });
+
+    conn.initial.?.record(10);
+    conn.initial.?.record(8);
+    try testing.expectEqual(@as(u4, 2), conn.initial.?.range_count);
+
+    // 9 closes the gap: one range, 8 through 10.
+    conn.initial.?.record(9);
+    try testing.expectEqual(@as(u4, 1), conn.initial.?.range_count);
+    try testing.expectEqual(@as(u64, 10), conn.initial.?.ranges[0].largest);
+    try testing.expectEqual(@as(u64, 8), conn.initial.?.ranges[0].smallest);
+
+    // A duplicate changes nothing.
+    conn.initial.?.record(9);
+    try testing.expectEqual(@as(u4, 1), conn.initial.?.range_count);
+}
+
+test "a full range table forgets the oldest range and only that" {
+    const dcid = [_]u8{7};
+    var loss: LossTables = .{};
+    var conn: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{8},
+    });
+
+    // Two more isolated ranges than the table holds, one per ten numbers.
+    var index: u64 = 0;
+    while (index < range_capacity + 2) : (index += 1) conn.initial.?.record(index * 10);
+
+    try testing.expectEqual(@as(u4, range_capacity), conn.initial.?.range_count);
+    // §13.2.4 allows forgetting: the newest is kept and the oldest two are gone.
+    try testing.expectEqual(@as(u64, (range_capacity + 1) * 10), conn.initial.?.ranges[0].largest);
+    try testing.expectEqual(@as(u64, 20), conn.initial.?.ranges[range_capacity - 1].largest);
+
+    var scratch: [ack_payload_len]u8 = undefined;
+    var cursor: Cursor = .init(try ackPayload(&conn.initial.?, &scratch));
+    const ack = (try frame.read(&cursor)).ack;
+    try testing.expectEqual(@as(u64, range_capacity - 1), ack.range_count);
+}
+
+test "fuzz the datagram walk" {
+    // The parser an attacker reaches: any bytes, any length, with keys they did
+    // not choose. Nothing here may panic, and a packet that opens is either
+    // acted on or dropped by name.
+    try testing.fuzz({}, struct {
+        fn run(_: void, smith: *testing.Smith) anyerror!void {
+            const dcid = [_]u8{ 0x4f, 0x50, 0x51 };
+            var loss: LossTables = .{};
+            var conn: Conn = .init(.{
+                .role = .server,
+                .loss = loss.value(),
+                .original_destination_connection_id = &dcid,
+                .destination_connection_id = &.{ 0x52, 0x53 },
+                .source_connection_id = &dcid,
+            });
+
+            var bytes: [1500]u8 = undefined;
+            const input = bytes[0..smith.slice(&bytes)];
+
+            var acked: [16]Recovery.SentPacket = undefined;
+            var lost: [16]Recovery.SentPacket = undefined;
+            var report: Recovery.Events = .init(&acked, &lost);
+            var plaintext: [1500]u8 = undefined;
+            var frames: [16]frame.Frame = undefined;
+
+            var walk: Datagram = .init(input);
+            while (true) {
+                const opened = walk.next(&conn, &plaintext, &frames, &report, 0) catch |err| switch (err) {
+                    // §12.4: a frame inside a packet that opened is a connection
+                    // error, which is a value here, not a crash.
+                    error.NoSpace => return,
+                    else => return,
+                };
+                // The frames borrow the plaintext buffer, so the next call
+                // invalidates them; the walk only needs to reach the end.
+                if (opened == null) return;
+            }
+        }
+    }.run, .{});
+}
+
 /// The caller's side of the timer, which only the tests here exercise: a
 /// connection owns no timer, so "when do I wake up" is asked of `RecoveryDriver`
 /// over the spaces the machine owns.

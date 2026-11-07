@@ -211,8 +211,13 @@ All notable changes to quic are recorded here. The format follows
   frame cannot reopen it over the same buffers. `Conn.Config` gained
   `max_streams_bidi` and `max_streams_uni`, the counts this endpoint advertised,
   and `init` asserts the table can hold them both.
-
 ### Changed
+
+- `InitialSpace` is deleted. It was the Initial-level prototype the machine
+  replaced, unexported since then and unused, and it carried the second
+  `largest_acked` this package spent a note arguing against. Its range-table
+  tests moved to `Conn.Space.record`, its receive path fuzzing became a target
+  over `Conn.Datagram`, and `AGENTS.md` says where the job lives now.
 
 - `Conn.Space` carries the loss state of its packet number space, and
   `Conn.discard` empties it before the keys (RFC 9002 §6.4), so a timer a

@@ -158,8 +158,8 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 
 State as of the three spaces, the datagram walk, key discard, the TLS seam,
 frame parsing, streams, the receive-side flow control generator, loss recovery,
-the close path, the client's handshake attempt, CRYPTO retention, and the client's
-Retry: 216 tests.
+the close path, the client's handshake attempt, CRYPTO retention, the client's
+Retry, MAX_STREAMS, and the end of `InitialSpace`: 222 tests.
 
 ### The TigerStyle pass
 
@@ -358,9 +358,8 @@ Things that were easy to get wrong and are now pinned by tests:
 3. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
    both callers carry an `unreachable` arm for it. Narrowing the set to
    `error{Truncated}` deletes those arms.
-4. `InitialSpace` is still a file with its own tests and no user. The machine
-   covers everything it did; deleting it takes the duplicated `largest_acked` out
-   of the tree, which is what this note always said would happen.
+4. Nothing else on the list: `InitialSpace` is deleted, its range tests moved to
+   `Conn.Space.record`, and its fuzz target became one over `Conn.Datagram`.
 
 ### Three things the next agent should not re-derive
 

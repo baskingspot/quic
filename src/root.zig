@@ -55,7 +55,6 @@ test {
     _ = frame;
     _ = handshake;
     _ = hkdf;
-    _ = @import("InitialSpace.zig");
     _ = protection;
     _ = Recovery;
     _ = RecoveryDriver;
