@@ -40,8 +40,9 @@ const Endpoint = struct {
     crypto_out_initial: [512]u8 = undefined,
     crypto_out_handshake: [512]u8 = undefined,
 
-    /// One ring per stream. Nothing in the machine notices if two slots share
-    /// one, which is why they are spelled out here.
+    /// One ring and one send buffer per stream. `Conn.init` asserts that no two
+    /// share storage, so a `@splat` over these is a panic on the first packet
+    /// rather than one stream's bytes landing in another's.
     ring_a: [1024]u8 = undefined,
     ring_b: [1024]u8 = undefined,
     send_a: [1024]u8 = undefined,

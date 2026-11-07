@@ -7,6 +7,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.init` asserts that no two stream buffers share storage: not two slots
+  over one ring, and not the send buffer that is also the receive ring of the
+  same stream. A shared buffer is two byte budgets overwriting each other while
+  neither half can detect it. A caller that aliased its storage was silently
+  corrupting both streams and now gets a panic at construction.
 - `examples/echo.zig` is a client and a server over `Conn` with a faked
   handshake, echoing one stream. `just example` builds and runs it. It is the
   first code in the tree that calls the machine the way an application does, and

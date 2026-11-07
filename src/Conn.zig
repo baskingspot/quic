@@ -254,7 +254,10 @@ pub const Config = struct {
 /// the two halves the machine builds when the stream opens.
 ///
 /// `send_buffer` and `recv_buffer` are the caller's, and stay theirs: opening a
-/// stream fills in `send` and `recv` and never moves a byte.
+/// stream fills in `send` and `recv` and never moves a byte. No two of them may
+/// share storage, not across two slots and not between the two halves of one
+/// stream: a shared buffer is two byte budgets that overwrite each other while
+/// neither knows, and `Conn.init` asserts it with `streamsOverlap`.
 pub const Stream = struct {
     /// Where the send half's bytes live.
     send_buffer: []u8 = "",
@@ -1085,26 +1088,63 @@ fn installSpace(
 
 /// Whether the stream configuration can honour the limits it advertises.
 ///
-/// Two invariants, both of them the caller's numbers rather than a peer's
+/// Three invariants, all of them the caller's numbers rather than a peer's
 /// frames. §4.1: a stream may not advertise a window it cannot hold, so a ring
 /// shorter than its limit would turn a legal frame into backpressure. And a
 /// limit with no ring behind it describes a stream that claims to receive and
 /// cannot. The table needs one slot per stream it may hold, or `open` fails at
 /// runtime with a table that was never going to fit.
 ///
+/// The third is identity: no two byte budgets may share storage. Two slots over
+/// one ring, or a send buffer that is also the receive ring, is one stream's
+/// bytes landing where another's already are, and neither half can detect it.
+/// It is the same bug class as two loss tables over one buffer, which
+/// `lossTablesValid` refuses for the same reason.
+///
 /// Kept as a predicate rather than an inline loop so a test can drive every bad
 /// shape directly: the assertion at `init` is a programmer-error check, and
 /// there is no way to expect a panic in this Zig version.
 fn streamsValid(slots: []const StreamTable.Slot, streams: []const Stream) bool {
     if (slots.len != streams.len) return false;
-    for (streams) |entry| {
+    for (streams, 0..) |*entry, index| {
         if (entry.recv_buffer.len == 0) {
             if (entry.recv_limit_bytes != 0) return false;
         } else {
             if (entry.recv_buffer.len < entry.recv_limit_bytes) return false;
         }
+
+        // A stream's own two halves first, then every slot after this one; the
+        // pair before it was compared when it was this one. Comparing a stream
+        // with itself would report its send buffer against itself, so the two
+        // halves are asked separately.
+        if (buffersOverlap(entry.send_buffer, entry.recv_buffer)) return false;
+        for (streams[index + 1 ..]) |*other| {
+            if (streamsOverlap(entry, other)) return false;
+        }
     }
     return true;
+}
+
+/// Whether any of two streams' byte budgets share storage.
+fn streamsOverlap(a: *const Stream, b: *const Stream) bool {
+    if (buffersOverlap(a.send_buffer, b.send_buffer)) return true;
+    if (buffersOverlap(a.send_buffer, b.recv_buffer)) return true;
+    if (buffersOverlap(a.recv_buffer, b.send_buffer)) return true;
+    if (buffersOverlap(a.recv_buffer, b.recv_buffer)) return true;
+    return false;
+}
+
+/// Whether two caller byte buffers share any storage.
+///
+/// An empty buffer holds nothing, so it overlaps nothing, whichever address it
+/// was sliced from.
+fn buffersOverlap(a: []const u8, b: []const u8) bool {
+    if (a.len == 0) return false;
+    if (b.len == 0) return false;
+
+    const a_start = @intFromPtr(a.ptr);
+    const b_start = @intFromPtr(b.ptr);
+    return a_start < b_start + b.len and b_start < a_start + a.len;
 }
 
 /// Whether every space has a sent table to record into.
@@ -3487,6 +3527,7 @@ test "RFC 9000 §12.4, a frame that will not parse is an error and not a dropped
 
 test "a stream configuration that cannot hold its own limits is refused" {
     var ring: [64]u8 = undefined;
+    var other_ring: [64]u8 = undefined;
     var slots: [2]StreamTable.Slot = undefined;
 
     const Case = struct { slots: []const StreamTable.Slot, streams: []const Stream, valid: bool };
@@ -3503,6 +3544,38 @@ test "a stream configuration that cannot hold its own limits is refused" {
         .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .recv_limit_bytes = 0 }, .{} }, .valid = true },
         // One slot short of the streams it would have to hold.
         .{ .slots = slots[0..1], .streams = &.{ .{}, .{} }, .valid = false },
+        // Two slots over one ring: each stream reassembles where the other
+        // already has bytes.
+        .{ .slots = &slots, .streams = &.{
+            .{ .recv_buffer = &ring, .recv_limit_bytes = 64 },
+            .{ .recv_buffer = &ring, .recv_limit_bytes = 64 },
+        }, .valid = false },
+        // The two halves of one bidirectional stream over one buffer.
+        .{ .slots = &slots, .streams = &.{
+            .{ .send_buffer = &ring, .recv_buffer = &ring, .recv_limit_bytes = 64 },
+            .{},
+        }, .valid = false },
+        // Another stream's send buffer is this stream's ring.
+        .{ .slots = &slots, .streams = &.{
+            .{ .send_buffer = &ring, .recv_buffer = &other_ring, .recv_limit_bytes = 64 },
+            .{ .recv_buffer = &ring, .recv_limit_bytes = 64 },
+        }, .valid = false },
+        // A partial overlap is still an overlap, not just an identical slice.
+        .{ .slots = &slots, .streams = &.{
+            .{ .send_buffer = ring[0..16], .recv_buffer = &other_ring, .recv_limit_bytes = 64 },
+            .{ .send_buffer = ring[8..32], .recv_buffer = &other_ring, .recv_limit_bytes = 64 },
+        }, .valid = false },
+        // Abutting is not overlapping: one ends exactly where the next begins.
+        .{ .slots = &slots, .streams = &.{
+            .{ .send_buffer = ring[0..32], .recv_buffer = &.{}, .recv_limit_bytes = 0 },
+            .{ .send_buffer = ring[32..64], .recv_buffer = &other_ring, .recv_limit_bytes = 64 },
+        }, .valid = true },
+        // Each stream with its own storage is the configuration this type asks
+        // for.
+        .{ .slots = &slots, .streams = &.{
+            .{ .send_buffer = &other_ring, .recv_buffer = &ring, .recv_limit_bytes = 64 },
+            .{},
+        }, .valid = true },
     };
 
     for (cases) |case| {
