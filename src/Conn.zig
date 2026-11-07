@@ -1285,36 +1285,192 @@ fn onStreamFrame(self: *Conn, space: SpaceId, frame_stream: frame.Stream) Error!
     try self.receive_window.onStreamProgress(entry.recv.highest - before);
 }
 
-/// Seal the next segment of `id`'s send half into one packet.
+/// One stream's share of a packet: how much of it the caller wants written, in
+/// the caller's order.
+pub const Offer = struct {
+    stream_id: u64,
+    /// The most bytes of this stream to put in this packet.
+    length: u32,
+};
+
+/// One STREAM frame a packed packet carried (§19.8).
+pub const Written = struct {
+    stream_id: u64,
+    /// The wire offset of the first byte, which is the stream's own cursor and
+    /// not the caller's offer.
+    offset: u64,
+    /// How many bytes went. Zero for the frame that carries only the FIN.
+    length: u32,
+    fin: bool,
+};
+
+/// How much of an offer list one packet used.
 ///
-/// Null means there is nothing sendable now: the stream has no new bytes, or the
-/// peer's connection-wide allowance is used up. §4.1 limits compose, so the
-/// segment is clamped by both the stream's limit (inside `nextSegment`) and the
-/// connection's.
-pub fn writeStream(self: *Conn, id: u64, max_len: u32, frames: []u8, out: []u8, now: Duration) Error!?u32 {
-    // Before `nextSegment`, which moves the send half: a closed connection must
-    // not consume a segment it will never put on the wire.
+/// The shape is the contract: a caller that has five streams to fill and room
+/// for three is told exactly where to resume, so a packet is never wasted on a
+/// refusal when part of it would have gone.
+pub const Consumed = struct {
+    /// Offers the machine is finished with: everything sendable went in. A
+    /// stream with nothing to send is finished with too, so it cannot block the
+    /// list behind it. The caller resumes at this index.
+    taken: u32,
+    /// Bytes of `offers[taken]` that went in, when the machine stopped inside
+    /// that offer rather than finishing it. Zero when the next offer was not
+    /// touched at all, so the caller re-offers it unchanged.
+    partial: u32,
+};
+
+/// What one packed packet carried, and the number the peer will call it by.
+pub const Packet = struct {
+    /// How many bytes of `out` are the packet.
+    length: u32,
+    /// The packet number these frames went out under. The machine is the only
+    /// party that knows it, and a resend queue needs the pairing to answer
+    /// "which frames were in packet 5" when that packet is declared lost.
+    number: u64,
+    /// One record per STREAM frame, in wire order, borrowed from the caller's
+    /// storage.
+    frames: []const Written,
+    /// How much of the caller's list this packet used.
+    consumed: Consumed,
+};
+
+/// What a packing call is given.
+pub const Packing = struct {
+    /// The streams to fill from, in the caller's order. This is scheduling, and
+    /// the machine does not do it: which stream deserves the next byte is the
+    /// caller's policy, like congestion control and retransmission.
+    offers: []const Offer,
+    /// The caller's scratch for the encoded frames, as in `writeHandshake`.
+    frames: []u8,
+    /// Where the packet is sealed.
+    out: []u8,
+    /// One record per offer, so it must be at least as long as `offers`.
+    written: []Written,
+    /// The payload bytes the caller will allow here: its congestion window and
+    /// its MTU decision, neither of which the machine owns. The packet is also
+    /// bounded by what `out` can carry and by the peer's connection-wide
+    /// allowance (§4.1).
+    max_payload: u32,
+    /// When the packet leaves.
+    now: Duration,
+};
+
+/// Seal one packet carrying the caller's offers, in order, as STREAM frames.
+///
+/// The machine packs; it does not schedule. The caller says which streams and
+/// how much of each, the machine writes what fits and reports exactly what it
+/// consumed, and the caller re-offers from there. Two answers, not one: `null`
+/// means nothing fit at all — the window had no room — while a returned packet
+/// means the window had room and it was used, even if only part of one offer
+/// went in.
+///
+/// Every refusal is decided before a stream's cursor moves, because a segment
+/// that was taken and not written is data the peer will never be sent.
+pub fn writeStreams(self: *Conn, packing: Packing) Error!?Packet {
     if (self.state != .open) return error.Closed;
-    const entry = self.stream(id) orelse return error.NotOpen;
-    if (!entry.canSend()) return error.NotOpen;
+    // The packet this writes is a 1-RTT one, and the sent table has to have room
+    // for it: §6.1 of RFC 9002 records every packet that asks for an
+    // acknowledgment.
+    const space = try self.spaceFor(.app);
+    if (packing.offers.len == 0) return null;
+    std.debug.assert(packing.written.len >= packing.offers.len);
 
-    const allowance = self.send_window.available();
-    if (allowance == 0) return null;
-    const length: u32 = @intCast(@min(max_len, allowance));
+    // Every offer is checked before any segment is taken, so an error cannot
+    // leave one stream's cursor ahead of a packet that never left.
+    for (packing.offers) |offer| {
+        const entry = self.stream(offer.stream_id) orelse return error.NotOpen;
+        if (!entry.canSend()) return error.NotOpen;
+    }
 
-    const segment = entry.send.nextSegment(length) orelse return null;
-    var writer: Writer = .init(frames);
-    try frame.write(&writer, .{ .stream = .{
-        .id = id,
-        .offset = segment.offset,
-        .data = segment.data,
-        .fin = segment.fin,
-        .length_present = true,
-    } });
+    // §4.1 and §4.2: three numbers bound this packet — the peer's
+    // connection-wide allowance, the caller's budget, and what the output buffer
+    // can carry after the header, the packet number, and the tag.
+    const allowed: u64 = @min(packing.max_payload, self.send_window.available());
+    const room: u32 = @intCast(@min(
+        allowed,
+        @min(@as(u64, packing.frames.len), appPayloadRoom(self, packing.out)),
+    ));
+    if (room == 0) return null;
+    if (!space.recovery.hasRoom()) return error.NoSpace;
 
-    const total = try self.writeFrames(.app, writer.written(), out, .data(now));
-    try self.send_window.onSent(segment.data.len);
-    return total;
+    const number = space.next_packet_number;
+    var writer: Writer = .init(packing.frames);
+    var count: usize = 0;
+    var taken: u32 = 0;
+    var partial: u32 = 0;
+
+    for (packing.offers) |offer| {
+        const entry = self.stream(offer.stream_id) orelse unreachable;
+        const offered = entry.send.peekSegment(offer.length) orelse {
+            // Nothing sendable: the offer is finished with, so the caller moves
+            // past it instead of offering it again forever.
+            taken += 1;
+            continue;
+        };
+
+        const overhead = streamFrameOverhead(offer.stream_id, offered.offset);
+        const left = room - writer.pos;
+        if (left <= overhead) break;
+        const capacity = left - overhead;
+        const length: u32 = @intCast(@min(@as(u64, offered.data.len), capacity));
+
+        // §19.8: FIN rides only the frame that reaches the final size, which is
+        // why trimming an offer can drop the flag and `nextSegment` decides.
+        const segment = entry.send.nextSegment(length) orelse unreachable;
+        // The overhead above is an upper bound on the frame's own bytes, and the
+        // data was clamped to what is left after it, so this cannot run out.
+        frame.write(&writer, .{ .stream = .{
+            .id = offer.stream_id,
+            .offset = segment.offset,
+            .data = segment.data,
+            .fin = segment.fin,
+            .length_present = true,
+        } }) catch unreachable;
+        try self.send_window.onSent(segment.data.len);
+
+        packing.written[count] = .{
+            .stream_id = offer.stream_id,
+            .offset = segment.offset,
+            .length = @intCast(segment.data.len),
+            .fin = segment.fin,
+        };
+        count += 1;
+
+        if (segment.data.len != offered.data.len) {
+            partial = @intCast(segment.data.len);
+            break;
+        }
+        taken += 1;
+    }
+
+    // Nothing went in: no packet, no packet number, and no stream moved.
+    if (count == 0) return null;
+
+    const length = try self.writeFrames(.app, writer.written(), packing.out, .data(packing.now));
+    return .{
+        .length = length,
+        .number = number,
+        .frames = packing.written[0..count],
+        .consumed = .{ .taken = taken, .partial = partial },
+    };
+}
+
+/// The most a STREAM frame for `id` at `offset` costs before its data: the type
+/// byte, the stream ID, the offset, and a length varint at its widest (§19.8).
+fn streamFrameOverhead(stream_id_value: u64, offset: u64) u32 {
+    const size = 1 + varint.size(@intCast(stream_id_value)) +
+        varint.size(@intCast(offset)) + max_varint_len;
+    return @intCast(size);
+}
+
+/// How many payload bytes a 1-RTT packet in `out` can carry: the buffer, less
+/// the short header (§17.3.1), the packet number, and the tag.
+fn appPayloadRoom(self: *const Conn, out: []u8) u32 {
+    const overhead = 1 + self.destination_connection_id.len +
+        @as(usize, self.packet_number_len) + protection.tag_length;
+    if (out.len <= overhead) return 0;
+    return @intCast(@min(out.len - overhead, std.math.maxInt(u32)));
 }
 
 /// §4.2: apply a MAX_DATA the peer sent, raising the connection-wide allowance.
@@ -2395,6 +2551,221 @@ test "fuzz the datagram walk" {
             }
         }
     }.run, .{});
+}
+
+test "RFC 9000 §19.8, a packed packet reports its number and the frames it carried" {
+    const dcid = [_]u8{ 0xd1, 0xd2 };
+    var client_send_a: [64]u8 = undefined;
+    var client_send_b: [64]u8 = undefined;
+    var client_ring: [64]u8 = undefined;
+    var client_ring_b: [64]u8 = undefined;
+    var client_slots: [2]StreamTable.Slot = undefined;
+    var client_streams: [2]Conn.Stream = .{
+        .{ .send_buffer = &client_send_a, .recv_buffer = &client_ring, .recv_limit_bytes = 64 },
+        .{ .send_buffer = &client_send_b, .recv_buffer = &client_ring_b, .recv_limit_bytes = 64 },
+    };
+    var server_ring: [64]u8 = undefined;
+    var server_ring_b: [64]u8 = undefined;
+    var server_slots: [2]StreamTable.Slot = undefined;
+    var server_streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &server_ring, .recv_limit_bytes = 64 },
+        .{ .recv_buffer = &server_ring_b, .recv_limit_bytes = 64 },
+    };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xd3},
+        .stream_slots = &client_slots,
+        .streams = &client_streams,
+        .send_limit = 64,
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0xd3},
+        .source_connection_id = &dcid,
+        .stream_slots = &server_slots,
+        .streams = &server_streams,
+        .receive_limit = 1024,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x41);
+    const server_secret: [protection.secret_length]u8 = @splat(0x42);
+    installApp(&client, &server, client_secret, server_secret);
+
+    const first = try client.openStream(0, 64);
+    _ = try first.send.write("alpha");
+    const second = try client.openStream(4, 64);
+    _ = try second.send.write("beta");
+
+    var offers = [_]Offer{
+        .{ .stream_id = 0, .length = 64 },
+        .{ .stream_id = 4, .length = 64 },
+    };
+    var written: [2]Written = undefined;
+    var frame_bytes: [256]u8 = undefined;
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var parsed: [8]frame.Frame = undefined;
+    var acked: [8]Recovery.SentPacket = undefined;
+    var lost: [8]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+
+    const flight = (try client.writeStreams(.{
+        .offers = &offers,
+        .frames = &frame_bytes,
+        .out = &datagram,
+        .written = &written,
+        .max_payload = 512,
+        .now = 0,
+    })) orelse return error.TestUnexpectedResult;
+
+    // The caller's order is the wire order, and each record says where in the
+    // stream the bytes came from and how many went.
+    try testing.expectEqual(@as(u64, 0), flight.number);
+    try testing.expectEqual(@as(usize, 2), flight.frames.len);
+    try testing.expectEqual(@as(u64, 0), flight.frames[0].stream_id);
+    try testing.expectEqual(@as(u64, 0), flight.frames[0].offset);
+    try testing.expectEqual(@as(u32, 5), flight.frames[0].length);
+    try testing.expectEqual(@as(u64, 4), flight.frames[1].stream_id);
+    try testing.expectEqual(@as(u32, 4), flight.frames[1].length);
+    try testing.expectEqual(Consumed{ .taken = 2, .partial = 0 }, flight.consumed);
+
+    // The peer reads both streams out of that one packet.
+    _ = try server.feed(datagram[0..flight.length], &plaintext, &parsed, &report, 0);
+    const received = server.stream(4) orelse return error.TestUnexpectedResult;
+    var read: [16]u8 = undefined;
+    const count = try received.recv.readInto(&read);
+    try testing.expectEqualStrings("beta", read[0..count]);
+
+    // And the number the machine reported is the number the acknowledgment
+    // names, which is the whole point: the caller's record of packet 0 can now
+    // be dropped, or that record can be resent if packet 0 is declared lost.
+    const ack = try server.writeAck(.app, &datagram, 0);
+    _ = try client.feed(datagram[0..ack], &plaintext, &parsed, &report, 0);
+    try testing.expectEqual(@as(usize, 1), report.ackedPackets().len);
+    try testing.expectEqual(flight.number, report.ackedPackets()[0].packet_number);
+}
+
+test "RFC 9000 §4.1, a packet that fits part of an offer says where to resume" {
+    const dcid = [_]u8{0xd4};
+    var send_buffer: [64]u8 = undefined;
+    var ring: [64]u8 = undefined;
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .send_buffer = &send_buffer, .recv_buffer = &ring, .recv_limit_bytes = 64 },
+        .{},
+    };
+    var loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xd5},
+        .stream_slots = &slots,
+        .streams = &streams,
+        .send_limit = 64,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x43);
+    installApp(&client, &client, client_secret, client_secret);
+
+    const entry = try client.openStream(0, 64);
+    _ = try entry.send.write("0123456789abcdefghij");
+
+    var written: [1]Written = undefined;
+    var frame_bytes: [256]u8 = undefined;
+    var datagram: [512]u8 = undefined;
+
+    // A budget of 20 payload bytes: the frame's own header takes 11 at its
+    // widest, so nine bytes of the stream go in and the rest waits.
+    var offers = [_]Offer{.{ .stream_id = 0, .length = 20 }};
+    const first = (try client.writeStreams(.{
+        .offers = &offers,
+        .frames = &frame_bytes,
+        .out = &datagram,
+        .written = &written,
+        .max_payload = 20,
+        .now = 0,
+    })) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 9), first.frames[0].length);
+    // The offer was not finished, and the answer says exactly how much of it
+    // went: the caller re-offers the last eleven bytes rather than all twenty.
+    try testing.expectEqual(Consumed{ .taken = 0, .partial = 9 }, first.consumed);
+
+    // The re-offer, from where the machine said to resume.
+    offers[0].length = 20 - first.consumed.partial;
+    const second = (try client.writeStreams(.{
+        .offers = offers[first.consumed.taken..],
+        .frames = &frame_bytes,
+        .out = &datagram,
+        .written = &written,
+        .max_payload = 512,
+        .now = 0,
+    })) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 1), second.number);
+    try testing.expectEqual(@as(u32, 11), second.frames[0].length);
+    // §19.8: the offset is the stream's, not the caller's, so the peer sees the
+    // second half exactly where the first ended.
+    try testing.expectEqual(@as(u64, 9), second.frames[0].offset);
+    try testing.expectEqual(Consumed{ .taken = 1, .partial = 0 }, second.consumed);
+}
+
+test "RFC 9000 §4.1, a window with no room is a different answer from a used one" {
+    const dcid = [_]u8{0xd6};
+    var send_buffer: [64]u8 = undefined;
+    var ring: [64]u8 = undefined;
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .send_buffer = &send_buffer, .recv_buffer = &ring, .recv_limit_bytes = 64 },
+        .{},
+    };
+    var loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xd7},
+        .stream_slots = &slots,
+        .streams = &streams,
+        .send_limit = 64,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x44);
+    installApp(&client, &client, client_secret, client_secret);
+
+    const entry = try client.openStream(0, 64);
+    _ = try entry.send.write("bytes");
+
+    var written: [1]Written = undefined;
+    var frame_bytes: [256]u8 = undefined;
+    var datagram: [512]u8 = undefined;
+    const packing: Packing = .{
+        .offers = &.{.{ .stream_id = 0, .length = 64 }},
+        .frames = &frame_bytes,
+        .out = &datagram,
+        .written = &written,
+        .max_payload = 0,
+        .now = 0,
+    };
+
+    // Null, because nothing fit at all — not a partial packet with no frames.
+    try testing.expect((try client.writeStreams(packing)) == null);
+    // And nothing moved: no bytes were marked sent and no packet number was
+    // spent on a packet that did not leave.
+    try testing.expectEqual(@as(u64, 0), entry.send.sent);
+    try testing.expectEqual(@as(u64, 0), client.app.?.next_packet_number);
+
+    // With room, the same call is a packet.
+    var roomy = packing;
+    roomy.max_payload = 512;
+    try testing.expect((try client.writeStreams(roomy)) != null);
+    try testing.expectEqual(@as(u64, 5), entry.send.sent);
 }
 
 /// The caller's side of the timer, which only the tests here exercise: a
@@ -3564,9 +3935,25 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
     var payload: [64]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
-    const sent = (try client.writeStream(0, 64, &payload, &datagram, 0)) orelse
-        return error.TestUnexpectedResult;
-    _ = try server.feed(datagram[0..sent], &plaintext, &events, &report, 0);
+    var written: [1]Written = undefined;
+    const flight = (try client.writeStreams(.{
+        .offers = &.{.{ .stream_id = 0, .length = 64 }},
+        .frames = &payload,
+        .out = &datagram,
+        .written = &written,
+        .max_payload = 64,
+        .now = 0,
+    })) orelse return error.TestUnexpectedResult;
+    // §19.8: the description says which packet the bytes went out under, and the
+    // FIN rode on the segment that reached the final size.
+    try testing.expectEqual(@as(u64, 0), flight.number);
+    try testing.expectEqual(@as(usize, 1), flight.frames.len);
+    try testing.expectEqual(@as(u64, 0), flight.frames[0].stream_id);
+    try testing.expectEqual(@as(u32, 12), flight.frames[0].length);
+    try testing.expect(flight.frames[0].fin);
+    try testing.expectEqual(Consumed{ .taken = 1, .partial = 0 }, flight.consumed);
+
+    _ = try server.feed(datagram[0..flight.length], &plaintext, &events, &report, 0);
 
     const received = server.stream(0) orelse
         return error.TestUnexpectedResult;
@@ -4258,7 +4645,18 @@ test "RFC 9000 §10.2.1, a close is written once and nothing is processed after 
         server.close(.{ .error_code = 0 }, &scratch, &datagram, 0),
     );
     // A stream segment is not consumed by a connection that cannot send it.
-    try testing.expectError(error.Closed, client.writeStream(0, 64, &scratch, &datagram, 0));
+    var described: [1]Written = undefined;
+    try testing.expectError(
+        error.Closed,
+        client.writeStreams(.{
+            .offers = &.{.{ .stream_id = 0, .length = 64 }},
+            .frames = &scratch,
+            .out = &datagram,
+            .written = &described,
+            .max_payload = 64,
+            .now = 0,
+        }),
+    );
     try testing.expectError(error.Closed, client.writeHandshake(&scratch, &datagram, 0));
 }
 

@@ -128,16 +128,33 @@ pub fn reset(self: *SendStream, error_code: u64) Error!void {
 /// Retransmission is the caller's: this only hands out bytes that were never
 /// sent. A caller that needs a lost range again asks `data(offset, len)`.
 pub fn nextSegment(self: *SendStream, max_len: u32) ?Segment {
+    const segment = self.peekSegment(max_len) orelse return null;
+
+    // A packetizer has to know a frame's size before it decides to write it, so
+    // the decision and the taking are separate: `peekSegment` says what would go
+    // and this is what moves the cursor.
+    if (segment.data.len != 0) self.sent += segment.data.len;
+    // §3.1: sending the first STREAM frame is what opens the stream, and sending
+    // the one with FIN ends it. The FIN-only segment is zero bytes at the final
+    // size, where `sent` already is, so the state is the only thing that stops it
+    // being offered again.
+    self.state = if (segment.fin) .data_sent else .send;
+    return segment;
+}
+
+/// What `nextSegment(max_len)` would return, without consuming it.
+///
+/// A caller that packs several streams into one packet has to size each frame
+/// before it commits to it; taking a segment it then cannot write would lose the
+/// bytes, because `nextSegment` moves the stream's cursor.
+pub fn peekSegment(self: *const SendStream, max_len: u32) ?Segment {
     if (self.state != .ready and self.state != .send) return null;
 
     // §19.8: FIN sets the final size, and a frame of length zero at that offset
     // is how a stream whose data is already out ends. It consumes no flow
     // control credit, so the limit does not bound it.
     if (self.final_size) |size| {
-        if (self.sent == size) {
-            self.state = .data_sent;
-            return .{ .offset = size, .data = &.{}, .fin = true };
-        }
+        if (self.sent == size) return .{ .offset = size, .data = &.{}, .fin = true };
     }
 
     if (self.sent >= self.limit) return null;
@@ -147,11 +164,6 @@ pub fn nextSegment(self: *SendStream, max_len: u32) ?Segment {
     const length: u64 = @min(available, max_len);
     const offset = self.sent;
     const fin = if (self.final_size) |size| offset + length == size else false;
-
-    self.sent += length;
-    // §3.1: sending the first STREAM frame is what opens the stream, and
-    // sending the one with FIN ends it.
-    self.state = if (fin) .data_sent else .send;
 
     return .{
         .offset = offset,

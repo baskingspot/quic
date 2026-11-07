@@ -4,8 +4,12 @@ All notable changes to quic are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
-
 ### Added
+
+- `Conn.writeStreams` packs several streams into one packet from the caller's
+  ordered offer list, up to the caller's payload budget, the peer's
+  connection-wide allowance, and the output buffer, and describes what it wrote so
+  a lost packet can be answered from the caller's own record of it.
 
 - `varint` decodes and writes the RFC 9000 §16 variable-length integer, in all
   four widths. `decodeMinimal` rejects a width wider than the value needs, which

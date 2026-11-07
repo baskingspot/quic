@@ -357,16 +357,40 @@ Nothing from the old list: MAX_STREAMS landed with `Conn.closeStream`,
 fuzz target became one over `Conn.Datagram`), and `varint.decode`'s error set is
 `error{Truncated}`.
 
-What is left is a design question, not a slice. **The machine does not schedule.**
-Scheduling is a policy over application intent — which stream deserves the next
-byte — and it belongs to the caller, like congestion control and the resend queue.
-What the machine owes instead is the ability to *pack*: the caller hands it an
-ordered list of (stream, range) and the machine fills a packet up to the MTU and
-the congestion window. That API does not exist yet; `Conn.writeStream` writes one
-segment per call and nothing composes. Designing it means deciding what the
-machine owes back when a range does not fit (a partial, and the caller re-offers
-the rest) and how a packet describes what it carries so the caller's resend queue
-has a description it did not have to build itself. That is the next note.
+### Packing, which is not scheduling
+
+**The machine does not schedule.** Which stream deserves the next byte is a policy
+over application intent, and it belongs to the caller, like congestion control and
+the resend queue. What the machine owes is the ability to *pack*: `Conn.writeStreams`
+takes the caller's ordered list of offers and fills one packet.
+
+Three decisions, all of them the caller's half of the contract:
+
+- **Partial, never refused.** A packet that fits three of five offers and then
+  refuses wastes the window the congestion controller just granted. The machine
+  writes what fits and reports `Consumed{ taken, partial }`: offers it is finished
+  with, and bytes of the next one that went in. The caller re-offers from there. A
+  stream with nothing sendable is finished with too, so an idle stream cannot
+  stall the list behind it.
+- **`null` is a different answer.** Nothing fit at all — the window had no room, or
+  no offer had bytes. That is not the same as a packet that used part of the
+  budget, and the two must not be confused by a caller deciding whether it is
+  application-limited.
+- **The description names the packet number.** `Packet{ length, number, frames,
+  consumed }`, where each `Written` is `{ stream_id, offset, length, fin }`. The
+  machine is the only party that knows which number the caller's ranges went out
+  under, and the resend queue needs exactly that pairing to answer "which frames
+  were in packet 5" — the same question losses answer for everything else.
+
+The offsets in the description are the stream's, not the caller's offer, so a
+caller advancing its own bookkeeping uses what went, not what it offered. And
+`SendStream` grew `peekSegment`: a packer has to size a frame before committing to
+it, because taking a segment it then cannot write loses the bytes — `nextSegment`
+moves the cursor and there is no way back.
+
+`Conn.writeStream` is gone rather than kept beside it. A one-stream caller writes
+one `Offer`; a second path that returns no description is how a resend queue ends
+up missing exactly the packets that were declared lost.
 
 ### Three things the next agent should not re-derive
 
