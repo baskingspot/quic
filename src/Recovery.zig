@@ -30,6 +30,7 @@
 //! loss timer down is how a sender retransmits a packet that was merely late.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const testing = std.testing;
 const frame = @import("frame.zig");
 const varint = @import("varint.zig");
@@ -103,14 +104,22 @@ pub const Timeout = struct {
     probes: u8 = 0,
 };
 
+/// The most sent packets one space tracks, and so the most one call can report.
+///
+/// The report carries one record per packet in flight, so a table larger than
+/// this would have no room to land its records in. `space` asserts the caller's
+/// table against this number, and the arrays below are exactly its size, which
+/// is what keeps a report from running past its storage.
+pub const sent_packets_max: u32 = 64;
+
 /// The sent packets a call reported. The records carry what a congestion
 /// controller needs, because the packets are gone from the space by the time the
 /// caller sees them.
 pub const Events = struct {
-    acked: [64]SentPacket = undefined,
+    acked: [sent_packets_max]SentPacket = undefined,
     acked_len: usize = 0,
     acked_bytes: u32 = 0,
-    lost: [64]SentPacket = undefined,
+    lost: [sent_packets_max]SentPacket = undefined,
     lost_len: usize = 0,
     lost_bytes: u32 = 0,
     /// The send time of the largest lost packet, which is what a controller
@@ -138,14 +147,14 @@ pub const Events = struct {
     }
 
     fn pushAcked(self: *Events, packet: SentPacket) void {
-        std.debug.assert(self.acked_len < self.acked.len);
+        assert(self.acked_len < self.acked.len);
         self.acked[self.acked_len] = packet;
         self.acked_len += 1;
         self.acked_bytes += packet.sent_bytes;
     }
 
     fn pushLost(self: *Events, packet: SentPacket) void {
-        std.debug.assert(self.lost_len < self.lost.len);
+        assert(self.lost_len < self.lost.len);
         self.lost[self.lost_len] = packet;
         self.lost_len += 1;
         self.lost_bytes += packet.sent_bytes;
@@ -264,10 +273,15 @@ pto_count: u5 = 0,
 
 /// A per-space loss detector over caller-owned sent-packet storage.
 ///
-/// `sent` must outlive the sp. Size it for the connection: a packet that
-/// cannot be recorded is a packet whose frames are never retransmitted, so this
-/// returns `error.NoSpace` rather than dropping one.
+/// `sent` must outlive the space. Size it for the connection: a packet that
+/// cannot be recorded is a packet whose frames are never retransmitted, so
+/// `onPacketSent` returns `error.NoSpace` rather than dropping one. Size it at
+/// or below `sent_packets_max`, because a larger table cannot have every packet
+/// in it reported.
 pub fn space(self: *Recovery, sent: []SentPacket) Space {
+    // A table the report cannot describe is a configuration that cannot hold
+    // its own events, so it is a programmer error and not a runtime condition.
+    assert(sent.len <= sent_packets_max);
     return .{ .shared = self, .sent = sent };
 }
 
@@ -295,7 +309,16 @@ pub const Space = struct {
 
     /// The packet numbers this space is still accounting for.
     pub fn inFlight(self: *const Space) []const SentPacket {
+        assert(self.sentValid());
         return self.sent[0..self.sent_len];
+    }
+
+    /// The sent table's own invariant: the count never runs past the caller's
+    /// storage. Both places that move the count assert it, so an index that
+    /// goes one too far, or a decrement that never happened, fails where it
+    /// happened instead of at the next read.
+    pub fn sentValid(self: *const Space) bool {
+        return self.sent_len <= self.sent.len;
     }
 
     /// Note a packet that was sent. `in_flight` is false for a packet that
@@ -310,6 +333,7 @@ pub const Space = struct {
         in_flight: bool,
         sent_bytes: u32,
     ) Error!void {
+        assert(self.sentValid());
         if (self.sent_len == self.sent.len) return error.NoSpace;
         self.sent[self.sent_len] = .{
             .packet_number = packet_number,
@@ -319,6 +343,7 @@ pub const Space = struct {
             .sent_bytes = sent_bytes,
         };
         self.sent_len += 1;
+        assert(self.sentValid());
         if (ack_eliciting and in_flight) self.last_ack_eliciting = now;
     }
 
@@ -357,6 +382,8 @@ pub const Space = struct {
                 largest_send_time = packet.time_sent;
             }
             events.pushAcked(packet);
+            // The tail moved down, so `index` now names the packet that
+            // replaced this one, and the next iteration must not advance it.
             self.remove(index);
         }
 
@@ -513,9 +540,16 @@ pub const Space = struct {
         return false;
     }
 
+    /// Drop the record at `index`, moving the tail down over it. The index and
+    /// the count are the two numbers that can disagree here, so the caller's
+    /// match is asserted into a precondition.
     fn remove(self: *Space, index: usize) void {
+        assert(self.sentValid());
+        assert(index < self.sent_len);
+
         @memmove(self.sent[index .. self.sent_len - 1], self.sent[index + 1 .. self.sent_len]);
         self.sent_len -= 1;
+        assert(self.sentValid());
     }
 };
 
@@ -664,6 +698,37 @@ test "RFC 9002 §6.1.1, the packet threshold declares three older packets lost" 
     // §6.1.2: the rest become lost a loss delay after they were sent, and the
     // timer carries the earliest of them.
     try testing.expectEqual(ms(10) + h.conn.rtt.lossDelay(), sp.loss_time);
+}
+
+test "RFC 9002 §6.1, an acknowledgment covering a full table reports every packet" {
+    // The report is the caller's resend queue input: a packet that is acked but
+    // left out of it stays in the queue forever. So the report is sized by the
+    // same number as the table, and a full table must fill it exactly.
+    var h: Harness = .{};
+    var sp = h.space();
+    try testing.expect(sp.sentValid());
+
+    var number: u64 = 0;
+    while (number < sent_packets_max) : (number += 1) {
+        try sp.onPacketSent(number, ms(10), true, true, 1200);
+    }
+    try testing.expectEqual(@as(usize, sent_packets_max), sp.inFlight().len);
+
+    const all: frame.Ack = .{
+        .largest = sent_packets_max - 1,
+        .delay = 0,
+        .first_range = sent_packets_max - 1,
+        .range_count = 0,
+        .bytes = &.{},
+        .ecn = null,
+    };
+    var events: Events = .{};
+    try sp.onAckReceived(&all, ms(20), .{}, &events);
+
+    try testing.expectEqual(@as(usize, sent_packets_max), events.ackedPackets().len);
+    try testing.expectEqual(@as(usize, 0), events.lostPackets().len);
+    try testing.expectEqual(@as(usize, 0), sp.inFlight().len);
+    try testing.expect(sp.sentValid());
 }
 
 test "RFC 9002 §6.1.2, a gap is lost only by time" {
