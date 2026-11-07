@@ -405,3 +405,56 @@ up missing exactly the packets that were declared lost.
 - `Conn.dropped` counts packets the datagram could not process, and a frame that
   will not parse is not one of them: the packet decrypted, so the peer said
   something invalid and the connection closes (§12.4).
+
+## What the echo example found
+
+`examples/echo.zig` is the first caller that is not a test. Writing it produced
+this list, in the order the friction bit. None of them are bugs; all of them are
+places the machine knows something the caller has to reconstruct.
+
+1. **A twenty-line struct before the first packet.** `Config` needs a `*Recovery`,
+   three sent tables, one ring and one send buffer per stream, CRYPTO storage in
+   both directions, and four buffers per `feed`. There is no default
+   configuration and no type that says "build me one". The rule that a `Conn`
+   must not move — every space holds pointers into the caller's state — is a
+   comment, not a constraint the compiler sees.
+2. **`writeHandshake` is the only way to install 1-RTT keys.** A server with
+   nothing to say calls a function named "write handshake" and gets null, which
+   is how its application space appears. Installing what the driver reported is
+   not the same act as writing a packet, and the API says it is.
+3. **No stream-readiness event.** The machine consumes a STREAM frame and tells
+   nobody which stream moved, so an application scans `stream_table.iterator()`
+   after every packet. Both halves of this example are that scan. The machine
+   knew the stream ID at `onStreamFrame` and reports nothing.
+4. **A peer-opened bidirectional stream needs `openStream`** to become writable,
+   which reads like creating a stream rather than joining one, and wants the
+   peer's per-stream limit again — a number that arrived in the handshake and
+   that the machine never learned.
+5. **`SendStream.write` takes less than it is given and says so only in its
+   return value.** With no send buffer configured, 21 bytes became an empty FIN:
+   the peer sees a closed stream with no data. The example now checks the count,
+   because nothing in the machine will.
+6. **Nothing checks that two stream slots have distinct buffers.**
+   `streamsValid` checks lengths, not identity; the loss path grew a
+   `tablesOverlap` assert for exactly this, and the stream side has nothing.
+7. **The machine's packet description earned its keep in the first draft.** The
+   example dropped `Packet.length` and had no way to delimit the packet for the
+   socket: the send buffer is the caller's, so nothing else knows.
+8. **Recovery's timer and congestion are not connected to the machine.** The
+   caller builds `[]const *Recovery.Space` from `&conn.app.?.recovery`, which
+   pins the connection's address forever, and reconstructs `Recovery.Options`
+   because `Conn.recoveryOptions` is private. `Congestion` is not wired at all:
+   `writeStreams` takes `max_payload` and nothing tells the caller what the
+   controller allows.
+9. **Acknowledgments are pull-only.** `ackOwed`/`writeAck` must be consulted per
+   space per datagram or the peer never learns anything; the example skips it and
+   the closing print shows the bill. `flowControlOwed` reports what is due in one
+   list; acknowledgments have no equivalent summary.
+10. **A server cannot be constructed from a datagram.** This example hardcodes
+    both connection IDs. A real server parses the invariant header, chooses its
+    own connection ID, and builds a `Conn` whose Initial keys come from the
+    client's — a helper would remove the chance of pairing the wrong one.
+
+Not friction, and worth saying: `writeStreams`, `feed`'s event report, and
+`replayCrypto` were used exactly as designed, and the echo needed no reach into
+machine internals.
