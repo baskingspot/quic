@@ -211,7 +211,17 @@ test "RFC 9001 A.2, one bit of the packet and the tag does not verify" {
 test "RFC 9001 A.2, the machine reproduces the client Initial byte for byte" {
     // The golden gate for the connection machine: given the RFC's own payload
     // and packet number, its `writeFrames` must produce the printed packet.
+    var loss: quic.Recovery = .{};
+    var sent_initial: [4]quic.Recovery.SentPacket = undefined;
+    var sent_handshake: [4]quic.Recovery.SentPacket = undefined;
+    var sent_app: [4]quic.Recovery.SentPacket = undefined;
     var conn: quic.Conn = .init(.{
+        .loss = .{
+            .shared = &loss,
+            .sent_initial = &sent_initial,
+            .sent_handshake = &sent_handshake,
+            .sent_app = &sent_app,
+        },
         .role = .client,
         .original_destination_connection_id = &data.dcid,
         .destination_connection_id = &data.dcid,
@@ -221,7 +231,7 @@ test "RFC 9001 A.2, the machine reproduces the client Initial byte for byte" {
     conn.initial.?.next_packet_number = 2;
 
     var out: [1200]u8 = undefined;
-    const length = try conn.writeFrames(.initial, &data.client_payload, &out);
+    const length = try conn.writeFrames(.initial, &data.client_payload, &out, .data(0));
     try testing.expectEqual(@as(u32, data.client_packet.len), length);
     try testing.expectEqualSlices(u8, &data.client_packet, out[0..length]);
 }

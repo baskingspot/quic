@@ -155,9 +155,37 @@ All notable changes to quic are recorded here. The format follows
   counters, and received ranges only. A discarded space no longer takes the
   connection's identity with it, so a space can be created after another one is
   gone.
+- `Conn` drives loss recovery. `Conn.Config` takes `loss`, a `Conn.Loss` of the
+  caller's `Recovery`, its three sent-packet tables, and `max_ack_delay`,
+  `ack_delay_exponent`, and `peer_address_validated`. Each `Conn.Space` holds a
+  `Recovery.Space` over the table for its packet number space, an incoming ACK
+  is acted on instead of handed back (`onAckReceived`, so the RTT sample, the
+  cleared packets, and the loss set land in the caller's `Recovery.Events`), and
+  `Conn.onPeerAddressValidated` is the caller's half of the §6.2.1 rule.
+- `Conn.Write` says what the caller knows about a packet the machine is sealing:
+  its send time, whether it is ack-eliciting (§13.2.1), and whether it is in
+  flight (§7.1 of RFC 9002). `Conn.writeFrames` records every such packet in the
+  sent table, which is what an acknowledgment and the loss timer act on. An
+  ACK-only packet (`Conn.Write.acknowledgment`) is neither, so it takes no room
+  in the table.
 
 ### Changed
 
+- `Conn.Space` carries the loss state of its packet number space, and
+  `Conn.discard` empties it before the keys (RFC 9002 §6.4), so a timer a
+  caller's `RecoveryDriver` already holds for that space has nothing to fire.
+  `Recovery.Space.discard` marks the space discarded, which is what stops
+  §6.2.2.1's anti-deadlock probe from re-arming itself forever.
+- ACK frames no longer appear in `Conn.Opened.frames`: the machine acts on them.
+  A caller that read them from there reads `Recovery.Events.ackedPackets()` and
+  `lostPackets()` after `Conn.feed` instead, and an acknowledgment of a packet
+  number this endpoint never sent is `error.InvalidAckRange` (§19.3.1 of RFC
+  9000).
+- `Conn.feed`, `Conn.Datagram.next`, `Conn.writeFrames`, `Conn.writeAck`,
+  `Conn.writeStream`, and `Conn.writeHandshake` take `now`, because the machine
+  holds no clock and every sent packet has a time (§5.1 of RFC 9002). `feed` and
+  `Datagram.next` also take the caller's `Recovery.Events`, which describes the
+  one call.
 - `Recovery.Events` takes the caller's storage: `Recovery.Events.init(acked,
   lost)` replaces the fixed 64-record arrays, so a space is no longer limited to
   64 packets in flight. A report smaller than the sent table is
