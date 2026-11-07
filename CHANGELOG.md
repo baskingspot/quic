@@ -7,6 +7,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.writeStreams` reports `Packet.remaining`: the payload room the packet was
+  given and did not use, when the offer list ran out before the room did. The
+  congestion window is the caller's, so the machine cannot say how much of it is
+  left; this says whether the last packet bought everything the application had,
+  so a caller writing several packets can tell a full window from an idle stream.
 - `Conn.Opening.fromDatagram` reads a client's first Initial, refuses anything
   that is not one, and copies its two connection IDs into the caller's storage.
   `Opening.serverConfig` turns that into a `Conn.Config` seeded from the

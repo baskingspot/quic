@@ -1540,6 +1540,13 @@ pub const Packet = struct {
     frames: []const Written,
     /// How much of the caller's list this packet used.
     consumed: Consumed,
+    /// Payload room this packet was given and did not use, when its offer list
+    /// ran out before the room did. Zero when the packet stopped on an offer
+    /// that would not fit: it was then full for the list it was given, and the
+    /// bytes reserved for that offer's header are not room a caller could use.
+    /// A caller reads this to know whether the congestion window it granted
+    /// bought everything the application had.
+    remaining: u32,
 };
 
 /// What a packing call is given.
@@ -1574,6 +1581,12 @@ pub const Packing = struct {
 ///
 /// Every refusal is decided before a stream's cursor moves, because a segment
 /// that was taken and not written is data the peer will never be sent.
+///
+/// `Packet.remaining` is the other half of that report: how much of the payload
+/// room this packet was given it did not use. The budget comes from the caller's
+/// congestion controller, which the machine does not own, so a caller writing
+/// several packets asks the controller again and uses `remaining` to learn
+/// whether the last packet was worth the window it spent.
 pub fn writeStreams(self: *Conn, packing: Packing) Error!?Packet {
     if (self.state != .open) return error.Closed;
     // The packet this writes is a 1-RTT one, and the sent table has to have room
@@ -1660,6 +1673,10 @@ pub fn writeStreams(self: *Conn, packing: Packing) Error!?Packet {
         .number = number,
         .frames = packing.written[0..count],
         .consumed = .{ .taken = taken, .partial = partial },
+        // §19.8 frames reserve their widest header before the data is measured,
+        // so a packet that stopped on an offer has bytes in hand that no next
+        // frame could use. That is a full packet, not room for the caller.
+        .remaining = if (taken == packing.offers.len) room - writer.pos else 0,
     };
 }
 
@@ -2917,6 +2934,9 @@ test "RFC 9000 §4.1, a packet that fits part of an offer says where to resume" 
     // The offer was not finished, and the answer says exactly how much of it
     // went: the caller re-offers the last eleven bytes rather than all twenty.
     try testing.expectEqual(Consumed{ .taken = 0, .partial = 9 }, first.consumed);
+    // The budget was spent to the byte, so the packet was not cut short by a
+    // lack of data: the caller's congestion window bought something.
+    try testing.expectEqual(@as(u32, 0), first.remaining);
 
     // The re-offer, from where the machine said to resume.
     offers[0].length = 20 - first.consumed.partial;
@@ -2934,6 +2954,11 @@ test "RFC 9000 §4.1, a packet that fits part of an offer says where to resume" 
     // second half exactly where the first ended.
     try testing.expectEqual(@as(u64, 9), second.frames[0].offset);
     try testing.expectEqual(Consumed{ .taken = 1, .partial = 0 }, second.consumed);
+    // Every byte the stream had went in and the offer list ended. The window
+    // allowed 55 payload bytes here (the peer's 64 less the 9 already sent) and
+    // the frame took 15, so 40 is what the peer's window left rather than what
+    // the packet wasted: a caller can tell the two apart at the call site.
+    try testing.expectEqual(@as(u32, 40), second.remaining);
 }
 
 test "RFC 9000 §4.1, a window with no room is a different answer from a used one" {
