@@ -236,15 +236,47 @@ pub fn read(cursor: *Cursor) Error!Frame {
 }
 
 /// Write one frame.
+///
+/// The prongs below are the §19 families, one helper each, in RFC order. A
+/// helper switches on the arms `write` sends it; a frame that reaches a helper
+/// without a matching arm is a bug, so the helper's `else` is `unreachable`.
 pub fn write(writer: *Writer, value: Frame) Error!void {
     switch (value) {
+        .padding, .ping, .handshake_done => try writeMarker(writer, value),
+        .ack => |ack| try writeAck(writer, ack),
+        .reset_stream, .stop_sending => try writeStreamControl(writer, value),
+        .crypto, .new_token => try writeStreamData(writer, value),
+        .stream => |stream| try writeStream(writer, stream),
+        .max_data,
+        .max_stream_data,
+        .max_streams,
+        .data_blocked,
+        .stream_data_blocked,
+        .streams_blocked,
+        => try writeFlowControl(writer, value),
+        .new_connection_id, .retire_connection_id => try writeConnectionId(writer, value),
+        .path_challenge, .path_response => try writePath(writer, value),
+        .connection_close => |close| try writeConnectionClose(writer, close),
+    }
+}
+
+/// §19.1, §19.2, and §19.20: the frames that carry no field after the type.
+fn writeMarker(writer: *Writer, value: Frame) Error!void {
+    switch (value) {
         .padding => |count| {
-            // A run of one is the minimum: a frame always has its type byte.
+            // A frame is at least its type byte, so a run of zero is not one.
             if (count == 0) return error.InvalidFrameType;
             _ = try writer.reserve(count);
         },
         .ping => try writer.putByte(0x01),
-        .ack => |ack| try writeAck(writer, ack),
+        .handshake_done => try writer.putByte(0x1e),
+        else => unreachable,
+    }
+}
+
+/// §19.4 and §19.5: the two ways to abort one half of a stream.
+fn writeStreamControl(writer: *Writer, value: Frame) Error!void {
+    switch (value) {
         .reset_stream => |reset| {
             try writer.putByte(0x04);
             try writeVarint(writer, reset.stream_id);
@@ -256,6 +288,14 @@ pub fn write(writer: *Writer, value: Frame) Error!void {
             try writeVarint(writer, stop.stream_id);
             try writeVarint(writer, stop.error_code);
         },
+        else => unreachable,
+    }
+}
+
+/// §19.6 and §19.7: the frames that carry bytes for the peer to reassemble,
+/// keyed by an offset at a level or by the connection carrying the token.
+fn writeStreamData(writer: *Writer, value: Frame) Error!void {
+    switch (value) {
         .crypto => |crypto| {
             try writer.putByte(0x06);
             try writeVarint(writer, crypto.offset);
@@ -263,12 +303,20 @@ pub fn write(writer: *Writer, value: Frame) Error!void {
             try writer.put(crypto.data);
         },
         .new_token => |token| {
+            // §19.7: a token of zero bytes is not a NEW_TOKEN frame.
             if (token.len == 0) return error.EmptyToken;
             try writer.putByte(0x07);
             try writeVarint(writer, token.len);
             try writer.put(token);
         },
-        .stream => |stream| try writeStream(writer, stream),
+        else => unreachable,
+    }
+}
+
+/// §19.9 through §19.14: the limits a peer may raise and the signals it raises
+/// when a limit stops it. Each pair is the same field shape under two types.
+fn writeFlowControl(writer: *Writer, value: Frame) Error!void {
+    switch (value) {
         .max_data => |maximum| {
             try writer.putByte(0x10);
             try writeVarint(writer, maximum);
@@ -295,10 +343,19 @@ pub fn write(writer: *Writer, value: Frame) Error!void {
             try writer.putByte(if (streams.direction == .bidi) 0x16 else 0x17);
             try writeVarint(writer, streams.maximum);
         },
+        else => unreachable,
+    }
+}
+
+/// §19.15 and §19.16: a connection ID the peer may use, and the retirement of
+/// one it already holds.
+fn writeConnectionId(writer: *Writer, value: Frame) Error!void {
+    switch (value) {
         .new_connection_id => |id| {
-            if (id.connection_id.len < 1 or id.connection_id.len > 20) {
-                return error.InvalidConnectionId;
-            }
+            // §19.15: a connection ID is 1 to 20 bytes, and Retire Prior To
+            // cannot name a sequence number that does not exist yet.
+            if (id.connection_id.len < 1) return error.InvalidConnectionId;
+            if (id.connection_id.len > 20) return error.InvalidConnectionId;
             if (id.retire_prior_to > id.sequence) return error.InvalidRetirePriorTo;
             try writer.putByte(0x18);
             try writeVarint(writer, id.sequence);
@@ -311,6 +368,13 @@ pub fn write(writer: *Writer, value: Frame) Error!void {
             try writer.putByte(0x19);
             try writeVarint(writer, sequence);
         },
+        else => unreachable,
+    }
+}
+
+/// §19.17 and §19.18: eight opaque bytes, echoed or challenged.
+fn writePath(writer: *Writer, value: Frame) Error!void {
+    switch (value) {
         .path_challenge => |data| {
             try writer.putByte(0x1a);
             try writer.put(&data);
@@ -319,15 +383,18 @@ pub fn write(writer: *Writer, value: Frame) Error!void {
             try writer.putByte(0x1b);
             try writer.put(&data);
         },
-        .connection_close => |close| {
-            try writer.putByte(if (close.application) 0x1d else 0x1c);
-            try writeVarint(writer, close.error_code);
-            if (!close.application) try writeVarint(writer, close.frame_type orelse 0);
-            try writeVarint(writer, close.reason.len);
-            try writer.put(close.reason);
-        },
-        .handshake_done => try writer.putByte(0x1e),
+        else => unreachable,
     }
+}
+
+/// §19.19: the close, in the transport shape that names a frame type and the
+/// application shape that has no such field.
+fn writeConnectionClose(writer: *Writer, close: ConnectionClose) Error!void {
+    try writer.putByte(if (close.application) 0x1d else 0x1c);
+    try writeVarint(writer, close.error_code);
+    if (!close.application) try writeVarint(writer, close.frame_type orelse 0);
+    try writeVarint(writer, close.reason.len);
+    try writer.put(close.reason);
 }
 
 fn readFrameType(cursor: *Cursor) Error!u64 {
