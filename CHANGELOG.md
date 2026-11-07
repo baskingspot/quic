@@ -176,6 +176,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- `Conn` records a packet's number and range only after its frames parse, so a
+  packet with a frame that will not parse is never acknowledged. State that was
+  half-updated on an error path was the audit's first finding: `CryptoStream`
+  now books the run before it copies the bytes, so `error.TooManyGaps` leaves the
+  ring as it found it.
 - `Conn.writeAck` sized its buffers for a single received range, so eight
   fragments could overflow the varint scratch into a panic. Both buffers now
   follow `Conn.range_capacity`.

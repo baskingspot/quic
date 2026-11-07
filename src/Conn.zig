@@ -356,7 +356,10 @@ fn clear(self: *Conn, id: SpaceId) void {
 /// error and leaves the machine untouched, which is what §5.5 requires of a
 /// caller that then drops it.
 pub fn feed(self: *Conn, datagram: []u8, plaintext: []u8, frames: []frame.Frame) Error!Opened {
-    return self.finish(try self.open(try self.locate(datagram), plaintext), frames);
+    const raw = try self.open(try self.locate(datagram), plaintext);
+    const opened = try self.finish(raw, frames);
+    self.commit(raw.id, raw.packet_number);
+    return opened;
 }
 
 /// One packet of a datagram, located and assigned to a space, before it is
@@ -428,12 +431,6 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
         plaintext,
     );
 
-    space.largest_received = if (space.largest_received) |largest|
-        @max(largest, opened.packet_number)
-    else
-        opened.packet_number;
-    space.record(opened.packet_number);
-
     // §17.2.2.1: a server lets its Initial keys go when it first processes a
     // Handshake packet. A client's moment is the first Handshake packet it
     // sends, which `writeHandshake` covers.
@@ -482,6 +479,28 @@ fn finish(self: *Conn, raw: Raw, frames: []frame.Frame) Error!Opened {
         .frames = frames[0..count],
         .payload = raw.payload,
     };
+}
+
+/// Account for a packet whose payload parsed: its number and the range it fills.
+///
+/// Deliberately after `finish`, not inside `open`. An acknowledgment is for a
+/// packet the machine processed (§13.2), and a packet whose frames did not parse
+/// is not one: if parsing fails the connection is closing and the ACK is
+/// worthless, but recording it first would also make a caller that retried the
+/// parse believe the number had already been seen.
+fn commit(self: *Conn, id: SpaceId, number: u64) void {
+    const space = self.spaceMaybe(id) orelse {
+        // The packet opened in this space and nothing between then and here
+        // discards it: a client's Initial keys go on a Handshake send, a
+        // server's on a Handshake packet, and both leave this space alone.
+        std.debug.assert(false);
+        return;
+    };
+    space.largest_received = if (space.largest_received) |largest|
+        @max(largest, number)
+    else
+        number;
+    space.record(number);
 }
 
 /// Give CRYPTO bytes to the driver in order, whatever order they arrived in.
@@ -556,6 +575,7 @@ pub const Datagram = struct {
             // packet to skip: the peer's own bytes arrived intact and say
             // something invalid (§12.4).
             const opened = try conn.finish(raw, frames);
+            conn.commit(raw.id, raw.packet_number);
             return opened;
         }
         return null;
@@ -1482,6 +1502,10 @@ test "RFC 9000 §12.4, a frame that will not parse is an error and not a dropped
     var walk: Datagram = .init(datagram[0..sent]);
     try testing.expectError(error.UnknownFrameType, walk.next(&server, &plaintext, &events));
     try testing.expectEqual(@as(u16, 0), walk.dropped);
+    // §13.2: a packet the machine did not process is not one it acknowledges,
+    // so the range table never heard about this number.
+    try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
+    try testing.expect(!server.ackOwed(.initial));
 
     // The same through one packet. Unprotecting mutates the datagram, so this
     // is a fresh packet rather than the same bytes again.
