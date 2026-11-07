@@ -80,14 +80,17 @@ pub fn onData(self: *CryptoStream, offset: u64, data: []const u8) Error!Delivery
 
     // Everything below the delivered offset is already in the driver's hands.
     const start = @max(offset, self.delivered);
-    self.store(start, data[@intCast(start - offset)..]);
 
     var extent = self.delivered;
     if (start == self.delivered) {
         extent = end;
     } else {
+        // Booking the run is the only step here that can fail, so it goes
+        // first: an error has to leave the stream exactly as it was found, and
+        // the copy below cannot fail once the span check above passed.
         try self.insert(start, end);
     }
+    self.store(start, data[@intCast(start - offset)..]);
 
     // A contiguous run can uncover a stored one behind it.
     while (self.pending_len > 0 and self.pending[0].start <= extent) {
@@ -265,7 +268,16 @@ test "RFC 9000 §19.6, more gaps than the table holds is an error, not a drop" {
     while (index < pending_capacity) : (index += 1) {
         _ = try stream.onData(2 + index * 2, "x");
     }
+    const pending_before = stream.pending_len;
     try testing.expectError(error.TooManyGaps, stream.onData(100, "x"));
+    // The failure moved nothing: the table and the delivered offset are where
+    // they were, and no run was booked for the bytes that were refused.
+    try testing.expectEqual(pending_before, stream.pending_len);
+    try testing.expectEqual(@as(u64, 0), stream.received());
+    for (stream.pending[0..stream.pending_len]) |range| {
+        try testing.expect(range.start != 100);
+    }
+
     // Filling the first gap drains one and makes room again.
     const delivery = try stream.onData(0, "ab");
     try testing.expectEqualStrings("abx", delivery.first);
