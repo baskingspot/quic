@@ -158,7 +158,7 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 
 State as of the three spaces, the datagram walk, key discard, the TLS seam,
 frame parsing, streams, the receive-side flow control generator, loss recovery,
-and the close path: 209 tests.
+the close path, and the client's handshake attempt: 211 tests.
 
 ### The TigerStyle pass
 
@@ -317,26 +317,19 @@ on it.
 
 ### What is still unwired, in the order I would take it
 
-1. The client's side of connection setup, minus the blocked part: `Conn` should
-   own a `connection_setup.Client` so the attempt carries `retried`, `responded`,
-   and `one_rtt_sent`, and report `VersionNegotiation.Action` so a `.abandon` is
-   the caller's to act on. Version negotiation itself needs no new logic:
-   `VersionNegotiation.handle` cannot return a different version because its
-   return type has no such value.
-2. The server's side needs nothing new in `Conn`. A Retry and a Version
-   Negotiation are per-datagram and precede the connection: `Retry.write` and
-   `VersionNegotiation.write` build them, and the interop tool drives both against
-   quiche today. The one addition worth making is a checked constructor from a
-   datagram's invariant header, so a server cannot pair the wrong connection IDs
-   with the keys it derives. After a Retry the server derives Initial keys from
-   its own Source Connection ID, which is the client's new Destination.
-3. MAX_STREAMS when a stream slot frees. The receive-side MAX_DATA and
+1. The client's Retry, once the decision above is made: `Conn.attempt` is
+   already there with `retried`, `responded`, and `one_rtt_sent` maintained by
+   the machine, so the rekey and the token are the whole of what is left.
+   Version negotiation is wired: `Conn.onVersionNegotiation` and the attempt's
+   own history decide `.ignore` against `.abandon`, and the action type cannot
+   name a version this package cannot speak.
+2. MAX_STREAMS when a stream slot frees. The receive-side MAX_DATA and
    MAX_STREAM_DATA generation landed; this is the one limit still never raised.
-4. The stream scheduler that decides which `SendStream` gets the next packet.
-5. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
+3. The stream scheduler that decides which `SendStream` gets the next packet.
+4. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
    both callers carry an `unreachable` arm for it. Narrowing the set to
    `error{Truncated}` deletes those arms.
-6. `InitialSpace` is still a file with its own tests and no user. The machine
+5. `InitialSpace` is still a file with its own tests and no user. The machine
    covers everything it did; deleting it takes the duplicated `largest_acked` out
    of the tree, which is what this note always said would happen.
 
