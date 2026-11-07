@@ -182,6 +182,15 @@ All notable changes to quic are recorded here. The format follows
   which has no "change version" branch, and a server gets `error.WrongRole`
   because it has no attempt. A 1-RTT packet sent records §17.2.5.2's deadline for
   accepting a Retry.
+- `Conn.Config.crypto_sent` is the caller's per-level buffer for the CRYPTO bytes
+  this endpoint sends, and `Conn.replayCrypto(space)` returns them from offset
+  zero (§13.3). A lost Initial or Handshake packet can now be re-sent, which it
+  could not before: the machine handed the bytes to the TLS driver and kept only
+  an offset. The capacity is the caller's, a message that does not fit is
+  `error.NoSpace` before any of it is framed rather than a truncated flight
+  (CRYPTO_BUFFER_EXCEEDED, §20.1), the replay is idempotent, and a discarded
+  space replays nothing. `Conn.Space.crypto_sent_bytes` is gone: the buffer's
+  length is the offset.
 
 ### Changed
 

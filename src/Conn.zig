@@ -199,6 +199,15 @@ pub const Config = struct {
     /// caller sizes it for the largest handshake it expects; a frame that would
     /// reach past what it holds is `error.NoSpace`.
     crypto: CryptoStorage = .{},
+    /// Where the CRYPTO bytes this endpoint sends are kept, per level, so a lost
+    /// handshake packet can be re-sent (§13.3) and a space can be replayed. The
+    /// caller sets the capacity; a message that does not fit is `error.NoSpace`
+    /// rather than a truncated flight, and §20.1 closes that connection with
+    /// CRYPTO_BUFFER_EXCEEDED, which is the same answer a receiver gives when a
+    /// peer's handshake outgrows its buffer. That failure is fatal by design:
+    /// there is no retry to make, because the driver's message has already been
+    /// taken.
+    crypto_sent: CryptoStorage = .{},
     /// The streams this endpoint can hold: the table's slots and the storage
     /// behind them, in the same order. Their length is the stream limit the
     /// machine advertises, so a peer that opens one more is `error.StreamLimit`
@@ -249,10 +258,25 @@ pub const Stream = struct {
     }
 };
 
+/// Three per-level byte buffers, the caller's. `Config.crypto` is where a
+/// level's received CRYPTO data is reassembled and `Config.crypto_sent` is where
+/// the bytes this endpoint sent are kept for §13.3.
 pub const CryptoStorage = struct {
     initial: []u8 = "",
     handshake: []u8 = "",
     app: []u8 = "",
+};
+
+/// The CRYPTO bytes one encryption level has sent, in the caller's storage.
+///
+/// §13.3 of RFC 9000: "data is sent again in CRYPTO frames with the same
+/// offsets" when it is lost, so what a replay needs is the bytes and the offset
+/// they start at. Since the machine writes them in order from zero, `len` is
+/// both the count and the offset of the next byte.
+pub const SentCrypto = struct {
+    bytes: []u8 = "",
+    /// Wire offset of the next byte to send, and the number of bytes kept.
+    len: u32 = 0,
 };
 
 pub const Opened = struct {
@@ -294,9 +318,6 @@ pub const Space = struct {
     /// Received packet numbers, descending and merged, for the ACK frame.
     ranges: [range_capacity]Range = undefined,
     range_count: u4 = 0,
-    /// How much CRYPTO data this endpoint has sent in this space: the offset
-    /// the next CRYPTO frame starts at (§19.6).
-    crypto_sent_bytes: u64 = 0,
 
     pub fn ackOwed(self: *const Space) bool {
         return self.range_count != 0 and self.acked_through != self.largest_received;
@@ -317,7 +338,6 @@ pub const Space = struct {
         self.largest_received = null;
         self.acked_through = null;
         self.range_count = 0;
-        self.crypto_sent_bytes = 0;
     }
 
     /// Note a packet number that arrived, merging it into the ranges an ACK
@@ -405,6 +425,8 @@ parameters: Parameters = .pending,
 /// CRYPTO reassembly per level, over the caller's storage, indexed by
 /// `SpaceId`.
 crypto: [3]CryptoStream,
+/// CRYPTO bytes sent per level, over the caller's storage, indexed the same way.
+crypto_sent: [3]SentCrypto,
 /// The open streams, and the storage behind each one.
 stream_table: StreamTable,
 streams: []Stream,
@@ -423,6 +445,12 @@ pub fn init(config: Config) Conn {
 
     std.debug.assert(streamsValid(config.stream_slots, config.streams));
     std.debug.assert(lossTablesValid(config.loss));
+
+    // §13.3's buffer length is a CRYPTO offset, and offsets are `u32` in this
+    // package. A buffer that cannot be addressed is a configuration error.
+    std.debug.assert(config.crypto_sent.initial.len <= std.math.maxInt(u32));
+    std.debug.assert(config.crypto_sent.handshake.len <= std.math.maxInt(u32));
+    std.debug.assert(config.crypto_sent.app.len <= std.math.maxInt(u32));
 
     const secrets = protection.initialSecrets(config.original_destination_connection_id);
     const suite = protection.Suite.aes_128_gcm;
@@ -451,6 +479,11 @@ pub fn init(config: Config) Conn {
             .init(config.crypto.initial),
             .init(config.crypto.handshake),
             .init(config.crypto.app),
+        },
+        .crypto_sent = .{
+            .{ .bytes = config.crypto_sent.initial },
+            .{ .bytes = config.crypto_sent.handshake },
+            .{ .bytes = config.crypto_sent.app },
         },
         .stream_table = .init(config.stream_slots),
         .streams = config.streams,
@@ -505,12 +538,19 @@ fn discardIfPresent(self: *Conn, id: SpaceId) void {
     self.clear(id);
 }
 
+/// Forget everything a space owned. The keys are already zeroed by
+/// `Space.discard`; this is the rest.
+///
+/// §13.3's CRYPTO send buffer goes with them: there is nothing left to replay,
+/// and a space that comes back — only a rebuilt Initial, after a Retry — starts
+/// its CRYPTO stream at offset zero rather than at a stale one.
 fn clear(self: *Conn, id: SpaceId) void {
     switch (id) {
         .initial => self.initial = null,
         .handshake => self.handshake = null,
         .app => self.app = null,
     }
+    self.crypto_sent[@backingInt(id)].len = 0;
 }
 
 /// Take the first packet of a datagram and return its frames.
@@ -900,20 +940,53 @@ pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8, now: Duration) Error
         .app => .app,
     };
 
-    const space = try self.spaceFor(id);
-    const offset = space.crypto_sent_bytes;
+    _ = try self.spaceFor(id);
+
+    // §13.3: the bytes are kept so a lost packet's CRYPTO data can be sent again
+    // at the same offset, and so a rebuilt space can replay them. The capacity is
+    // the caller's, and a message that does not fit is refused by name here,
+    // before any of it goes on the wire: half a ClientHello fails at the far end
+    // and says nothing useful there. The driver's message is consumed by the
+    // `next` above, so this is the caller's CRYPTO_BUFFER_EXCEEDED (§20.1), not
+    // a call to retry.
+    const sent = &self.crypto_sent[@backingInt(id)];
+    if (message.bytes.len > sent.bytes.len - @as(usize, sent.len)) return error.NoSpace;
+    const offset: u64 = sent.len;
 
     var writer: Writer = .init(frames);
     try frame.write(&writer, .{ .crypto = .{ .offset = offset, .data = message.bytes } });
 
     const total = try self.writeFrames(id, writer.written(), out, .data(now));
-    space.crypto_sent_bytes = offset + message.bytes.len;
+
+    // After the seal: a frame that never left must not be replayed as though it
+    // had, or the peer would see the same offset twice with different data the
+    // next time the machine composed it.
+    std.debug.assert(message.bytes.len <= std.math.maxInt(u32));
+    @memcpy(sent.bytes[sent.len..][0..message.bytes.len], message.bytes);
+    sent.len += @intCast(message.bytes.len);
 
     // §17.2.2.1: the client's Initial keys go when its first Handshake packet
     // is sent. The packet is sealed; nothing needs them again.
     if (id == .handshake and self.role == .client) self.discardIfPresent(.initial);
 
     return total;
+}
+
+/// What a loss in `id`'s space needs to be re-sent: the CRYPTO bytes this
+/// endpoint has sent there, from offset zero (§13.3).
+///
+/// The machine cannot know which of them were acknowledged — an ACK names packet
+/// numbers, and mapping those back to frames is the packet-to-frame table this
+/// design deliberately does not keep — so a replay is the whole flight, and the
+/// peer discards the parts it already has by offset (§19.6).
+///
+/// Idempotent on purpose: the answer is what has been sent in the space, so a
+/// caller that calls twice gets the same bytes and does not have to remember
+/// whether it already replayed. Empty for a space with no keys, so a discarded
+/// space never hands back stale handshake bytes.
+pub fn replayCrypto(self: *const Conn, id: SpaceId) []const u8 {
+    const sent = self.crypto_sent[@backingInt(id)];
+    return sent.bytes[0..sent.len];
 }
 
 /// Install every space the driver can give secrets for, once each. A driver may
@@ -1573,6 +1646,90 @@ test "RFC 9000 §17.2.5.2, a 1-RTT packet ends the window for a Retry" {
     try testing.expect(client.attempt.?.one_rtt_sent);
 }
 
+test "RFC 9000 §13.3, sent CRYPTO bytes are kept and the replay is idempotent" {
+    const dcid = [_]u8{ 0x95, 0x96 };
+    const hello = "ClientHello bytes";
+    const finished = "Finished bytes";
+    const client_secret: [protection.secret_length]u8 = @splat(0x61);
+    const server_secret: [protection.secret_length]u8 = @splat(0x62);
+    var stub: seam.Stub = .{
+        .outbox = &.{
+            .{ .level = .initial, .bytes = hello },
+            .{ .level = .handshake, .bytes = finished },
+        },
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+    };
+    var sent_initial: [64]u8 = undefined;
+    var sent_handshake: [64]u8 = undefined;
+    var loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x97},
+        .tls = stub.driver(),
+        .crypto_sent = .{ .initial = &sent_initial, .handshake = &sent_handshake },
+    });
+
+    var frames: [128]u8 = undefined;
+    var datagram: [512]u8 = undefined;
+    _ = (try client.writeHandshake(&frames, &datagram, 0)) orelse return error.TestUnexpectedResult;
+
+    // §13.3: the bytes are kept where they went out, from offset zero, because
+    // the driver will not offer them a second time.
+    try testing.expectEqualStrings(hello, client.replayCrypto(.initial));
+    // The same call twice is the same answer: a caller does not have to remember
+    // whether it already replayed, and the flight is not consumed by asking.
+    try testing.expectEqualStrings(hello, client.replayCrypto(.initial));
+    // A level with nothing sent has nothing to replay.
+    try testing.expectEqual(@as(usize, 0), client.replayCrypto(.handshake).len);
+
+    // The second message is Handshake-level, and sending it takes the client's
+    // Initial keys (§17.2.2.1). The Initial bytes go with them: a discarded
+    // space hands back nothing rather than a flight nobody can read.
+    _ = (try client.writeHandshake(&frames, &datagram, 0)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(finished, client.replayCrypto(.handshake));
+    try testing.expect(client.initial == null);
+    try testing.expectEqual(@as(usize, 0), client.replayCrypto(.initial).len);
+}
+
+test "RFC 9000 §20.1, a CRYPTO send buffer too small refuses the message" {
+    const dcid = [_]u8{0x98};
+    const hello = "ClientHello bytes that do not fit";
+    const client_secret: [protection.secret_length]u8 = @splat(0x63);
+    const server_secret: [protection.secret_length]u8 = @splat(0x64);
+    var stub: seam.Stub = .{
+        .outbox = &.{.{ .level = .initial, .bytes = hello }},
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+    };
+    var sent_initial: [8]u8 = undefined;
+    var loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x99},
+        .tls = stub.driver(),
+        .crypto_sent = .{ .initial = &sent_initial },
+    });
+
+    var frames: [128]u8 = undefined;
+    var datagram: [512]u8 = undefined;
+    const before = client.initial.?.next_packet_number;
+
+    // The capacity is the caller's and the machine respects it: a message that
+    // does not fit is refused before any of it is framed, because half a
+    // ClientHello fails at the far end and says nothing useful there. §20.1 gives
+    // the caller CRYPTO_BUFFER_EXCEEDED to close with.
+    try testing.expectError(error.NoSpace, client.writeHandshake(&frames, &datagram, 0));
+    // Nothing left: the packet number did not move and there is nothing to
+    // replay. A truncated frame here would look like a sent flight.
+    try testing.expectEqual(before, client.initial.?.next_packet_number);
+    try testing.expectEqual(@as(usize, 0), client.replayCrypto(.initial).len);
+}
+
 /// The caller's side of the timer, which only the tests here exercise: a
 /// connection owns no timer, so "when do I wake up" is asked of `RecoveryDriver`
 /// over the spaces the machine owns.
@@ -1770,7 +1927,6 @@ test "RFC 9001 §4.9, a discarded space keeps no keys and no counters" {
     // acknowledgment already sent.
     var space = conn.initial.?;
     space.next_packet_number = 9;
-    space.crypto_sent_bytes = 1234;
     space.largest_received = 7;
     space.record(7);
     space.acked_through = 7;
@@ -1784,7 +1940,6 @@ test "RFC 9001 §4.9, a discarded space keeps no keys and no counters" {
     try testing.expectEqualSlices(u8, &zeros, &space.send_keys.hp);
     try testing.expectEqualSlices(u8, &zeros, &space.receive_keys.hp);
     try testing.expectEqual(@as(u64, 0), space.next_packet_number);
-    try testing.expectEqual(@as(u64, 0), space.crypto_sent_bytes);
     try testing.expectEqual(@as(?u64, null), space.largest_received);
     try testing.expectEqual(@as(?u64, null), space.acked_through);
     try testing.expectEqual(@as(u4, 0), space.range_count);
@@ -2008,9 +2163,12 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
         .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
     };
 
-    // CRYPTO reassembly storage, which the caller owns (§19.6).
+    // CRYPTO reassembly storage, which the caller owns (§19.6), and the buffer
+    // its own handshake bytes are kept in so a loss can be replayed (§13.3).
     var initial_crypto: [128]u8 = undefined;
     var handshake_crypto: [128]u8 = undefined;
+    var client_sent_initial: [128]u8 = undefined;
+    var client_sent_handshake: [128]u8 = undefined;
 
     var client_loss: LossTables = .{};
 
@@ -2022,6 +2180,7 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
         .source_connection_id = &.{0x7a},
         .tls = client_stub.driver(),
         .transport_parameters = "our parameters",
+        .crypto_sent = .{ .initial = &client_sent_initial, .handshake = &client_sent_handshake },
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{

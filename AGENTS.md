@@ -48,6 +48,12 @@ Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix deve
   §7: it hands back the packets a timeout says to probe and never decides how
   many bytes may be in flight. The caller owns the clock and calls it with
   `Duration` values, so there is no timer, thread, or I/O in it.
+- CRYPTO bytes this endpoint sends are kept in the caller's storage
+  (`Config.crypto_sent`), per level, because §13.3 re-sends lost handshake data
+  at the same offsets and the TLS driver never offers a message twice.
+  `Conn.replayCrypto` returns them from offset zero and is idempotent; a space
+  that is discarded forgets its bytes with its keys, and a message that does not
+  fit the buffer is CRYPTO_BUFFER_EXCEEDED, never a truncated flight.
 - `InitialSpace.zig` is the driver, not a connection: keys, packet numbers,
   and the received ranges an ACK frame needs, for the Initial level only. When
   a change would need a timer, a retransmission, a stream, or a handshake, it
