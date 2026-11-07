@@ -158,7 +158,8 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 
 State as of the three spaces, the datagram walk, key discard, the TLS seam,
 frame parsing, streams, the receive-side flow control generator, loss recovery,
-the close path, and the client's handshake attempt: 211 tests.
+the close path, the client's handshake attempt, and CRYPTO retention: 213
+tests.
 
 ### The TigerStyle pass
 
@@ -288,41 +289,64 @@ table with packets that will be reported lost and resent for nothing.
 caller closes the connection over, and `error_code.forFrameError` names the code,
 so the machine being able to seal a CONNECTION_CLOSE was the missing half.
 
-### The wall in front of the client's Retry path
+### CRYPTO retransmission, which is what Retry was really waiting on
 
-Not an amount of work: a decision. To continue after a Retry the client must send
-the same ClientHello again, because the server never saw it and the Initial keys
-changed with the Destination Connection ID (§5.2 of RFC 9001, §17.2.5.3 of RFC
-9000). The machine cannot do that today. It hands CRYPTO bytes to the TLS driver
-and keeps `crypto_sent_bytes` alone, so the bytes are gone, and the caller's resend
-queue holds frame descriptions — for a CRYPTO frame that is a range with no bytes
-behind it. The same gap means a lost Initial or Handshake packet can never be
-retransmitted at all, Retry or no Retry.
+The wall was never the Retry packet. Continuing after one means sending the same
+ClientHello again, and nothing in the machine could do that: the bytes went to
+the TLS driver, the machine kept `crypto_sent_bytes`, and the caller's resend
+queue holds frame descriptions — for a CRYPTO frame, a range with no bytes behind
+it. The same gap blocked §13.3 for a plain lost Initial or Handshake packet, so
+the fix is not a Retry special case.
 
-Three shapes:
+Approved shape, landed: `Config.crypto_sent` is the caller's buffer per level,
+the machine copies every CRYPTO payload it seals into it after the packet leaves,
+and `Conn.replayCrypto(space)` hands back what has been sent there from offset
+zero.
 
-- **The caller owns the bytes.** `Conn.Config` gains a CRYPTO send buffer per
-  level; the machine copies every CRYPTO payload it writes into it, and
-  `Conn.replayCrypto(space)` writes the unacknowledged ranges again. Storage the
-  caller sizes, one implementation, and handshake loss starts working too.
-- **The driver replays.** `handshake.VTable` gains `replay(level)` and the driver
-  re-offers bytes it already produced. Pushes the storage into the other
-  repository and asks a TLS driver to behave unlike TLS.
-- **A Retry restarts the attempt.** A fresh `Conn` and a fresh driver. Packet
-  numbers restart, which §17.2.5.3 says a client MUST NOT do, and a server may
-  abort the connection over it.
+- **Bounded.** A message that does not fit is `error.NoSpace` before any of it is
+  framed. That failure is fatal by design: there is no retry to make, because
+  `tls.next` has already handed the message over. §20.1 gives the caller
+  CRYPTO_BUFFER_EXCEEDED, which is the same answer a receiver gives a peer whose
+  handshake outgrows its buffer.
+- **Idempotent by space.** The answer is "what has been sent in this space",
+  which only grows, so calling twice returns the same bytes and a caller need not
+  remember whether it replayed. `Conn.discard` forgets the level's bytes with the
+  keys, so a discarded space returns nothing instead of a flight nobody can read.
+- **Why the whole flight and not the unacknowledged part.** An ACK names packet
+  numbers, and turning those back into CRYPTO ranges needs the packet-to-frame
+  table this design refuses to keep. Re-sending a prefix is legal and cheap for a
+  handshake (§19.6 makes the peer drop what it already has by offset).
 
-I would build the first. It is a decision for Matt, so the client Retry path waits
-on it.
+### The Retry path, which is now open
+
+`Conn.attempt` is already maintained (`retried`, `responded`, `one_rtt_sent`),
+and the bytes are now replayable. What is left is one operation, and it has a
+trap in it: **do not route the rekey through `Conn.discard` or
+`Conn.discardIfPresent`.** Both call `clear`, which forgets the level's CRYPTO
+bytes — and the ClientHello that must be re-sent lives in exactly that buffer.
+The rekey builds a new `Recovery.Space` and `Space` value over the same table,
+keeps `next_packet_number` (§17.2.5.3 forbids resetting it), adopts the Retry's
+Source Connection ID as the Destination, and leaves `crypto_sent[initial]`
+alone.
+
+Two smaller pieces it needs:
+
+- a token: `Conn` has no field for the §17.2.2 token that goes in every Initial a
+  client sends, and `packet.writeLong` already takes one, so `writeFrames` needs
+  to pass it for `.initial`.
+- `Conn.onRetry(retry, raw)` wrapping `connection_setup.Retry.validate` and
+  `Client.onRetry`, so the one-Retry rule stays where the state is. The server
+  half needs nothing: a server seeing a retried Initial builds its connection from
+  its own Source Connection ID, which is what `Conn.init` already does when the
+  caller passes it.
 
 ### What is still unwired, in the order I would take it
 
-1. The client's Retry, once the decision above is made: `Conn.attempt` is
-   already there with `retried`, `responded`, and `one_rtt_sent` maintained by
-   the machine, so the rekey and the token are the whole of what is left.
-   Version negotiation is wired: `Conn.onVersionNegotiation` and the attempt's
-   own history decide `.ignore` against `.abandon`, and the action type cannot
-   name a version this package cannot speak.
+1. The client's Retry: the rekey, the token, and `Conn.onRetry`, as the section
+   above lays out. `Conn.attempt` is already maintained, and version negotiation
+   is already wired — `Conn.onVersionNegotiation` and the attempt's own history
+   decide `.ignore` against `.abandon`, and the action type cannot name a version
+   this package cannot speak.
 2. MAX_STREAMS when a stream slot frees. The receive-side MAX_DATA and
    MAX_STREAM_DATA generation landed; this is the one limit still never raised.
 3. The stream scheduler that decides which `SendStream` gets the next packet.
