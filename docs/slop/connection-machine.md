@@ -512,3 +512,64 @@ session starts with an edit and not a decision.
 Also worth recording: `zig build interop-bin` never installed its artifact, so
 `just interop` could never have run. A test that cannot start is worse than no
 test, and it survived because quiche is not installed anywhere this repo has run.
+
+## The queue, landed
+
+All nine, one commit each, `just ci` green between them. The order was the point:
+the type fix went first so nothing built on a `write` that could truncate.
+
+| # | what | commit |
+| --- | --- | --- |
+| 1 | `SendStream.write` takes all of it or `error.NoSpace`; `end` is `finish` | e1c9ce4 |
+| 2 | `Conn.init` refuses two stream buffers over any shared byte | eef66d5 |
+| 3 | `Opened.streams` says which streams a packet made readable or finished | b046237 |
+| 4 | `Conn.Opening.fromDatagram` and `Opening.serverConfig` | 7b58f7a |
+| 5 | `Packet.remaining` reports the granted budget this packet did not use | 31e2bc4 |
+| 6 | `openStream` opens, `joinStream` joins, limits live in `Config.send_streams` | ba53751 |
+| 7 | `installSpaces` installs keys; `writeHandshake` writes a message | 9d91a81 |
+| 8 | `acksOwed` is the acknowledgment summary | 278001b |
+| 9 | `Conn.clientConfig` and the move assertion | 179977c |
+
+Three of them were not shaped the way this note guessed:
+
+- **`Opening` copies, it does not borrow.** `protection.openPacket` rewrites a
+  receive buffer in place, so a pointer into the datagram is dead before the
+  server can send anything. `fromDatagram(bytes, storage)` copies both connection
+  IDs into the caller's storage and refuses with `error.NoSpace` before writing a
+  byte, which is the lesson `onRetry` already taught.
+- **`Packet.remaining` is zero when the packet stopped on an offer.** §19.8 frames
+  reserve their widest header before the data is measured, so a packet that
+  refuses an offer has up to 25 bytes in hand that no next frame could use.
+  Reporting those as room would tell a caller to write a packet that cannot carry
+  anything; the field is the leftover only when the offer list ran out first.
+- **`Conn.clientConfig` and `Opening.serverConfig` replace the identity lines, not
+  the arrays.** A caller still declares its Recovery, its three sent tables, its
+  stream rings, and its CRYPTO buffers. What is left of friction item 1 is the
+  storage bundle, not the configuration.
+
+The example exercises the new surface: server built from the client's datagram,
+streams found from `Opened.streams`, the answer on a joined stream, the server's
+keys from `installSpaces`, and both configs from a constructor.
+
+### What is not wired, in the order the RFC makes it matter
+
+1. **RESET_STREAM and STOP_SENDING are still the caller's.** `ReceiveStream.onReset`
+   and `SendStream.onStopSending` exist and are tested; neither frame reaches them.
+   Both are returned in `Opened.frames`, so a caller can do it, but the machine
+   already has the state and the answer the peer must see. RESET_STREAM also
+   changes what `Opened.streams` should say, which is why it comes first.
+2. **The congestion and timer handles pin the connection's address.**
+   `RecoveryDriver` wants `[]const *Recovery.Space`, which means
+   `&conn.app.?.recovery`; the move assertion now makes a later move loud instead of
+   silent, but the API still forces the caller to hand out an interior address.
+   `Conn.recoveryOptions` is private, so the caller reconstructs `Recovery.Options`
+   from the RFC's defaults. Either a driver built from the connection, borrowing the
+   addresses once inside a type the caller owns, or an options accessor — not both.
+3. **Connection ID changes are not adopted.** The echo keeps the client's and the
+   server's IDs the same length, because a short header's destination length comes
+   from the connection and nothing copies a peer's Source Connection ID into the
+   destination when the two differ. NEW_CONNECTION_ID is not wired either.
+4. **0-RTT**, which the constraints note already records as dropped, not buffered.
+
+The queue in this note is empty; the next session starts at item 1 above, or at
+whatever Matt puts ahead of it.
