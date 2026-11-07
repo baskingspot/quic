@@ -201,6 +201,7 @@ pub const Space = struct {
     /// Note a packet number that arrived, merging it into the ranges an ACK
     /// frame is built from (§19.3.1).
     fn record(self: *Space, pn: u64) void {
+        std.debug.assert(self.range_count <= range_capacity);
         var buf: [range_capacity + 1]Range = undefined;
         var count: usize = 0;
         var inserted = false;
