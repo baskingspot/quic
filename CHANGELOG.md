@@ -192,11 +192,13 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
-- A single ACK frame that covered more than 64 packets wrote past
-  `Recovery.Events`: an assertion failure in a safe build, an out-of-bounds
-  write in a release build. `Recovery.space` now refuses a sent table larger
-  than `Recovery.sent_packets_max` (64), so the table and the report share one
-  bound.
+- A single ACK frame that covered more than 64 packets wrote past the fixed
+  64-record `Recovery.Events` array, against a caller-owned sent table of any
+  length. That was an assertion failure in a safe build and an out-of-bounds
+  write in `ReleaseFast`, latent until an acknowledgment covered 65 packets. A
+  style pass found it, which is the argument for doing one. The report now takes
+  the caller's arrays (`Recovery.Events.init`), and a report shorter than the
+  sent table is `error.NoSpace` before anything moves.
 - `transport.encode` panicked on a parameter value above 2^62 - 1, which has no
   varint encoding, and wrote a connection ID longer than 20 bytes that its own
   decoder refuses. Both are `error.InvalidValue` now.
