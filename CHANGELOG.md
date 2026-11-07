@@ -202,6 +202,15 @@ All notable changes to quic are recorded here. The format follows
   again. `Conn.Config` gained `token`, which every Initial carries (§8.1.2), and
   `retry_storage`, where the adopted connection ID and token are copied so the
   machine never points into a datagram the caller will reuse.
+- `Conn.closeStream` frees a stream's slot once both halves are finished and
+  returns the credit the peer spent on it, which `Conn.flowControlOwed` now
+  offers as a MAX_STREAMS frame (RFC 9000 §4.6, §19.11) and
+  `Conn.onFlowControlSent` records. A stream this endpoint opened frees its slot
+  and grants nothing, because no credit was spent on it. A stream that is not
+  finished is `error.StreamState` rather than a freed slot, so a peer's next
+  frame cannot reopen it over the same buffers. `Conn.Config` gained
+  `max_streams_bidi` and `max_streams_uni`, the counts this endpoint advertised,
+  and `init` asserts the table can hold them both.
 
 ### Changed
 

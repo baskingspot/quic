@@ -126,6 +126,18 @@ pub const Error = protection.Error ||
         WrongRole,
     };
 
+/// §4.6: how many streams this endpoint lets the peer open, per direction.
+///
+/// Two pairs of numbers, not one: `allowed` is what the machine can now hold and
+/// grows as slots come free, while `advertised` is what the peer has actually
+/// been told. The difference between them is exactly the MAX_STREAMS frame that
+/// is owed, which is why deciding is separate from raising here as it is for the
+/// data windows.
+pub const StreamLimits = struct {
+    bidi: u64 = 0,
+    uni: u64 = 0,
+};
+
 /// Where loss recovery's state lives: the caller's, outside the connection.
 ///
 /// `Conn.init` returns by value, so the caller assigns a `Conn` into its own
@@ -229,6 +241,13 @@ pub const Config = struct {
     /// peer advertised in its transport parameters.
     receive_limit: u64 = 0,
     send_limit: u64 = 0,
+    /// §4.6: the initial MAX_STREAMS counts this endpoint advertised in its
+    /// transport parameters, per direction. They are the peer's credit to open
+    /// streams, so the machine has to know them to raise them later, and together
+    /// they may not exceed the table the caller supplied: a peer that opens what
+    /// it was allowed must never find `error.StreamLimit`.
+    max_streams_bidi: u64 = 0,
+    max_streams_uni: u64 = 0,
 };
 
 /// One stream the machine can hold: the buffers and the per-stream limit, then
@@ -451,6 +470,10 @@ streams: []Stream,
 /// gave.
 receive_window: FlowControl,
 send_window: FlowControl.Sender,
+/// §4.6: the stream counts the peer may open now, and the ones it has been told
+/// about.
+streams_allowed: StreamLimits,
+streams_advertised: StreamLimits,
 /// Whether the driver has them yet. One call, before the first flight.
 transport_parameters_set: bool = false,
 
@@ -462,6 +485,9 @@ pub fn init(config: Config) Conn {
 
     std.debug.assert(streamsValid(config.stream_slots, config.streams));
     std.debug.assert(lossTablesValid(config.loss));
+    // §4.6: credit the table cannot back turns a legal peer into a connection
+    // error, so it is refused at construction.
+    std.debug.assert(config.max_streams_bidi + config.max_streams_uni <= config.streams.len);
 
     // §13.3's buffer length is a CRYPTO offset, and offsets are `u32` in this
     // package. A buffer that cannot be addressed is a configuration error.
@@ -508,6 +534,14 @@ pub fn init(config: Config) Conn {
         .streams = config.streams,
         .receive_window = .init(config.receive_limit),
         .send_window = .init(config.send_limit),
+        .streams_allowed = .{
+            .bidi = config.max_streams_bidi,
+            .uni = config.max_streams_uni,
+        },
+        .streams_advertised = .{
+            .bidi = config.max_streams_bidi,
+            .uni = config.max_streams_uni,
+        },
         .initial = .{
             .send_keys = if (config.role == .client) client else server,
             .receive_keys = if (config.role == .client) server else client,
@@ -1172,6 +1206,61 @@ fn streamFor(self: *Conn, id: u64) Error!*Stream {
     return entry;
 }
 
+/// §4.6: free a stream's slot once both halves are finished, so the credit it
+/// spent can be offered to the peer again.
+///
+/// The caller decides this, because it is the only one that knows the
+/// application is finished with the stream: the machine can see that every byte
+/// arrived and every acknowledgment came back, but not that nobody wants the
+/// bytes any more. A stream that is not finished is refused rather than dropped,
+/// because freeing its slot early would let the peer's next frame on that stream
+/// open it again over the same buffers.
+pub fn closeStream(self: *Conn, id: u64) Error!void {
+    const entry = self.stream(id) orelse return error.NotOpen;
+    if (!streamFinished(entry)) return error.StreamState;
+
+    try self.stream_table.close(id);
+    // The buffers are the caller's and stay; the state is this slot's to lose,
+    // so the next stream can use it.
+    entry.halves = .unused;
+    entry.send = undefined;
+    entry.recv = undefined;
+
+    // §4.6: a stream the peer opened spent its credit, and freeing the slot is
+    // what lets that credit come back. A stream this endpoint opened frees a slot
+    // and grants nothing, because no credit was spent on it.
+    const local: stream_id.Initiator = switch (self.role) {
+        .client => .client,
+        .server => .server,
+    };
+    if (stream_id.isLocal(id, local)) return;
+    switch (stream_id.direction(id)) {
+        .bidi => self.streams_allowed.bidi += 1,
+        .uni => self.streams_allowed.uni += 1,
+    }
+}
+
+/// Whether both halves of a stream are in a terminal state (§3.1, §3.2): the
+/// send side has nothing left to acknowledge, and the receive side has nothing
+/// left to read.
+fn streamFinished(entry: *const Stream) bool {
+    const send_done = switch (entry.halves) {
+        .send_only, .both => switch (entry.send.state) {
+            .data_recvd, .reset_recvd => true,
+            .ready, .send, .data_sent, .reset_sent => false,
+        },
+        .unused, .recv_only => true,
+    };
+    if (!send_done) return false;
+    return switch (entry.halves) {
+        .recv_only, .both => switch (entry.recv.state) {
+            .data_read, .reset_read => true,
+            .recv, .size_known, .data_recvd, .reset_recvd => false,
+        },
+        .unused, .send_only => true,
+    };
+}
+
 fn onStreamFrame(self: *Conn, space: SpaceId, frame_stream: frame.Stream) Error!void {
     // §12.4: Initial and Handshake packets carry no STREAM frames.
     if (space != .app) return error.WrongFrameSpace;
@@ -1260,6 +1349,26 @@ pub fn flowControlOwed(self: *Conn, out: []frame.Frame) []frame.Frame {
         out[count] = .{ .max_stream_data = .{ .stream_id = recv.id, .maximum = limit } };
         count += 1;
     }
+
+    // §4.6: freed streams are credit the peer may have again. Only what has
+    // risen is sent, and the two directions are separate counters, so one frame
+    // per direction at most.
+    if (self.streams_allowed.bidi > self.streams_advertised.bidi) {
+        if (count == out.len) return out[0..count];
+        out[count] = .{ .max_streams = .{
+            .direction = .bidi,
+            .maximum = self.streams_allowed.bidi,
+        } };
+        count += 1;
+    }
+    if (self.streams_allowed.uni > self.streams_advertised.uni) {
+        if (count == out.len) return out[0..count];
+        out[count] = .{ .max_streams = .{
+            .direction = .uni,
+            .maximum = self.streams_allowed.uni,
+        } };
+        count += 1;
+    }
     return out[0..count];
 }
 
@@ -1273,6 +1382,12 @@ pub fn onFlowControlSent(self: *Conn, frames: []const frame.Frame) void {
             .max_stream_data => |data| {
                 const entry = self.stream(data.stream_id) orelse continue;
                 if (data.maximum > entry.recv.limit) entry.recv.limit = data.maximum;
+            },
+            // The same rule as MAX_DATA: a limit only ever rises, so a repeated
+            // or reordered frame cannot walk the credit back.
+            .max_streams => |limits| switch (limits.direction) {
+                .bidi => self.streams_advertised.bidi = @max(self.streams_advertised.bidi, limits.maximum),
+                .uni => self.streams_advertised.uni = @max(self.streams_advertised.uni, limits.maximum),
             },
             else => {},
         }
@@ -2009,6 +2124,136 @@ test "RFC 9000 §17.2.5.2, a Retry that is not ours, or is late, is ignored" {
     // A server has no attempt, and says so rather than pretending it ignored a
     // packet it was never meant to see.
     try testing.expectError(error.WrongRole, server.onRetry(&late, retry_bytes[0..length]));
+}
+
+test "RFC 9000 §4.6, a finished stream returns its credit as MAX_STREAMS" {
+    const dcid = [_]u8{0xc1};
+    var ring: [64]u8 = undefined;
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{ .{ .recv_buffer = &ring, .recv_limit_bytes = 64 }, .{} };
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xc2},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0xc2},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 1024,
+        .max_streams_bidi = 1,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x31);
+    const server_secret: [protection.secret_length]u8 = @splat(0x32);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var acked: [8]Recovery.SentPacket = undefined;
+    var lost: [8]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var payload: [64]u8 = undefined;
+    var owed: [4]frame.Frame = undefined;
+
+    // Nothing has closed, so nothing is owed.
+    try testing.expectEqual(@as(usize, 0), server.flowControlOwed(&owed).len);
+
+    // The peer opens stream 0 and finishes it.
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 0,
+        .offset = 0,
+        .data = "done",
+        .fin = true,
+        .length_present = true,
+    } });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    _ = try server.feed(datagram[0..sent], &plaintext, &frames, &report, 0);
+
+    // The receive half has every byte but the application has not read it, so
+    // the stream is not finished and freeing its slot is refused: a peer's next
+    // frame would open it again on the same buffers.
+    try testing.expectError(error.StreamState, server.closeStream(0));
+
+    const entry = server.stream(0) orelse return error.TestUnexpectedResult;
+    var read_buffer: [16]u8 = undefined;
+    const read = try entry.recv.readInto(&read_buffer);
+    try testing.expectEqualStrings("done", read_buffer[0..read]);
+
+    try server.closeStream(0);
+    try testing.expect(server.stream(0) == null);
+
+    // §4.6: the credit comes back as a raise the caller can send, and only once.
+    const due = server.flowControlOwed(&owed);
+    try testing.expectEqual(@as(usize, 1), due.len);
+    try testing.expectEqual(frame.Direction.bidi, due[0].max_streams.direction);
+    try testing.expectEqual(@as(u64, 2), due[0].max_streams.maximum);
+    // Deciding is not raising: until the frame leaves, it is still owed.
+    try testing.expectEqual(@as(usize, 1), server.flowControlOwed(&owed).len);
+    try testing.expectEqual(@as(u64, 1), server.streams_advertised.bidi);
+
+    server.onFlowControlSent(due);
+    try testing.expectEqual(@as(u64, 2), server.streams_advertised.bidi);
+    try testing.expectEqual(@as(usize, 0), server.flowControlOwed(&owed).len);
+
+    // A frame that names a lower count cannot walk the credit back.
+    server.onFlowControlSent(&.{.{ .max_streams = .{ .direction = .bidi, .maximum = 1 } }});
+    try testing.expectEqual(@as(u64, 2), server.streams_advertised.bidi);
+}
+
+test "RFC 9000 §4.6, closing a stream this endpoint opened grants no credit" {
+    const dcid = [_]u8{0xc3};
+    var send_buffer: [64]u8 = undefined;
+    var ring: [64]u8 = undefined;
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .send_buffer = &send_buffer, .recv_buffer = &ring, .recv_limit_bytes = 64 },
+        .{},
+    };
+    var loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xc4},
+        .stream_slots = &slots,
+        .streams = &streams,
+        .send_limit = 64,
+        .max_streams_bidi = 1,
+    });
+
+    var owed: [4]frame.Frame = undefined;
+
+    // A locally opened unidirectional stream — the client's first is 2 — written
+    // and acknowledged to its final size, so its only half is terminal.
+    const entry = try client.openStream(2, 64);
+    _ = try entry.send.write("bytes");
+    try entry.send.end();
+    var sent: u64 = 0;
+    while (entry.send.nextSegment(64)) |next| {
+        sent += next.data.len;
+        try entry.send.onAck(next.offset, @intCast(next.data.len));
+    }
+    try testing.expectEqual(@as(u64, 5), sent);
+    try testing.expectEqual(SendStream.State.data_recvd, entry.send.state);
+
+    try client.closeStream(2);
+    try testing.expect(client.stream(2) == null);
+    // §4.6: the slot is free again, but the peer never spent credit on this
+    // stream, so no MAX_STREAMS is owed and none may be invented.
+    try testing.expectEqual(@as(usize, 0), client.flowControlOwed(&owed).len);
+    try testing.expectEqual(@as(u64, 1), client.streams_allowed.bidi);
+    try testing.expectEqual(@as(u64, 0), client.streams_allowed.uni);
 }
 
 /// The caller's side of the timer, which only the tests here exercise: a
