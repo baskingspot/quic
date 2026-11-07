@@ -145,7 +145,10 @@ the symbol, flag, or error. One line, under Added, Changed, Fixed, or Removed.
 The structure is checked, not trusted: `tools/changelog.zig` runs in `just lint`
 and fails a heading that does not own its line, a heading without a blank line
 above it, a section that is not one of Keep a Changelog's six, or the same section
-twice in one release. Write the heading first, then the bullets under it.
+twice in one release. Its own rules are checked by `--self-test`, which runs
+first over fixtures that must reject and one that must pass; changing a rule
+without changing a fixture is how that test finds out. Write the heading first,
+then the bullets under it.
 
 To release, dispatch the repo's `release.yml` with the version. The workflow
 moves the Unreleased section into a dated heading, sets `.version` in

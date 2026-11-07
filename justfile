@@ -54,6 +54,9 @@ interop:
 lint:
     ziglint
     zig fmt --check src tools build.zig
+    # The validator validates itself first: the fixtures are what tell the next
+    # person who edits it that a rule they changed stopped working.
+    zig run tools/changelog.zig -- --self-test
     zig run tools/changelog.zig
     nix fmt -- --ci
     oxfmt --check README.md AGENTS.md .github
