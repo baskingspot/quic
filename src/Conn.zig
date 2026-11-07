@@ -861,6 +861,8 @@ pub const Datagram = struct {
 /// `now` dates the packet: handshake bytes are ack-eliciting and in flight like
 /// any other (§6.1 of RFC 9002).
 pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8, now: Duration) Error!?u32 {
+    // Before the driver is asked: a message taken from it cannot be given back.
+    if (self.state != .open) return error.Closed;
     const tls = self.tls orelse return null;
 
     switch (self.parameters) {
@@ -1075,6 +1077,9 @@ fn onStreamFrame(self: *Conn, space: SpaceId, frame_stream: frame.Stream) Error!
 /// segment is clamped by both the stream's limit (inside `nextSegment`) and the
 /// connection's.
 pub fn writeStream(self: *Conn, id: u64, max_len: u32, frames: []u8, out: []u8, now: Duration) Error!?u32 {
+    // Before `nextSegment`, which moves the send half: a closed connection must
+    // not consume a segment it will never put on the wire.
+    if (self.state != .open) return error.Closed;
     const entry = self.stream(id) orelse return error.NotOpen;
     if (!entry.canSend()) return error.NotOpen;
 
@@ -1287,6 +1292,7 @@ pub fn ackOwed(self: *Conn, id: SpaceId) bool {
 /// `now` goes with it because every packet is sent at a time, even one no loss
 /// detector will ever ask about.
 pub fn writeAck(self: *Conn, id: SpaceId, out: []u8, now: Duration) Error!u32 {
+    if (self.state != .open) return error.Closed;
     const space = try self.spaceFor(id);
 
     var payload: [ack_payload_len]u8 = undefined;
@@ -1369,8 +1375,10 @@ pub fn close(self: *Conn, args: Close, frames: []u8, out: []u8, now: Duration) E
         .handshake
     else
         .initial;
+    // §10.2.2: a draining endpoint sends no packets at all, not even this one.
+    if (self.state == .draining) return error.Closed;
     // Refused by name before anything is sealed when no space has keys yet.
-    _ = try self.spaceFor(id);
+    if (self.spaceMaybe(id) == null) return error.NoKeys;
 
     var writer: Writer = .init(frames);
     try frame.write(&writer, .{ .connection_close = .{
@@ -3237,8 +3245,15 @@ test "RFC 9000 §10.2.1, a close is written once and nothing is processed after 
 
     // §10.2.1: a closing endpoint answers a packet that arrives too late. The
     // answer is another CONNECTION_CLOSE, and it is the one write a closed
-    // connection still makes.
+    // connection still makes. §10.2.2: a draining one sends nothing at all.
     try testing.expect(try client.close(.{ .error_code = 0 }, &scratch, &datagram, 0) > 0);
+    try testing.expectError(
+        error.Closed,
+        server.close(.{ .error_code = 0 }, &scratch, &datagram, 0),
+    );
+    // A stream segment is not consumed by a connection that cannot send it.
+    try testing.expectError(error.Closed, client.writeStream(0, 64, &scratch, &datagram, 0));
+    try testing.expectError(error.Closed, client.writeHandshake(&scratch, &datagram, 0));
 }
 
 test "RFC 9000 §19.19, an application close carries the application's code" {
