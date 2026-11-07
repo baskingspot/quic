@@ -586,7 +586,6 @@ fn readConnectionClose(cursor: *Cursor, application: bool) Error!ConnectionClose
 fn readVarint(cursor: *Cursor) Error!u64 {
     return varint.decode(cursor) catch |err| switch (err) {
         error.Truncated => return error.Truncated,
-        error.NonMinimal => unreachable,
     };
 }
 

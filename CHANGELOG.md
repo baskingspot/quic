@@ -210,8 +210,12 @@ All notable changes to quic are recorded here. The format follows
   finished is `error.StreamState` rather than a freed slot, so a peer's next
   frame cannot reopen it over the same buffers. `Conn.Config` gained
   `max_streams_bidi` and `max_streams_uni`, the counts this endpoint advertised,
-  and `init` asserts the table can hold them both.
-### Changed
+  and `init` asserts the table can hold them both.### Changed
+
+- `varint.decode` returns `varint.Error`, which is `error{Truncated}`. Its old
+  set named `error.NonMinimal`, which it never returned; `decodeMinimal` keeps
+  that and its own `DecodeError`. The three callers that carried an
+  `unreachable` arm for it lost the arm.
 
 - `InitialSpace` is deleted. It was the Initial-level prototype the machine
   replaced, unexported since then and unused, and it carried the second

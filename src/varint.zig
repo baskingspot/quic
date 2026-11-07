@@ -23,6 +23,14 @@ const varint = @This();
 /// The largest value the encoding can carry: 2^62 - 1.
 pub const max: u64 = (1 << 62) - 1;
 
+/// What a plain `decode` can report. `NonMinimal` belongs to `decodeMinimal`
+/// alone, so it is not here: an error a function cannot return is a branch every
+/// caller has to write and no test can reach.
+pub const Error = error{
+    /// The buffer ended inside the integer. Nothing moved.
+    Truncated,
+};
+
 pub const DecodeError = error{
     /// The buffer ended inside the integer. Nothing moved.
     Truncated,
@@ -50,7 +58,7 @@ pub fn size(value: u62) usize {
 }
 
 /// Read one integer of any width. On `error.Truncated` the cursor does not move.
-pub fn decode(cursor: *Cursor) DecodeError!u64 {
+pub fn decode(cursor: *Cursor) Error!u64 {
     const rest = cursor.rest();
     if (rest.len == 0) return error.Truncated;
     const width = widthOfPrefix(rest[0]);

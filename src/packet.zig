@@ -498,11 +498,9 @@ fn writeVersion(writer: *Writer, version: Version) Error!void {
     try writer.put(&buf);
 }
 
-/// `varint.decode` cannot return `NonMinimal`, but its error set says it can.
 fn readVarint(cursor: *Cursor) Error!u64 {
     return varint.decode(cursor) catch |err| switch (err) {
         error.Truncated => return error.Truncated,
-        error.NonMinimal => unreachable,
     };
 }
 
