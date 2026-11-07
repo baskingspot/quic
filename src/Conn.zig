@@ -436,6 +436,9 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
     // sends, which `writeHandshake` covers.
     if (at.id == .handshake and self.role == .server) self.discardIfPresent(.initial);
 
+    // A packet length is a `u32` everywhere else in this package, because a
+    // datagram is at most 65527 bytes (§12.2), so the narrowing is total.
+    std.debug.assert(at.bytes.len <= std.math.maxInt(u32));
     return .{
         .id = at.id,
         .packet_number = opened.packet_number,

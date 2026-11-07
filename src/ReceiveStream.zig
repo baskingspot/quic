@@ -112,13 +112,22 @@ pub fn nextMaxStreamData(self: *const ReceiveStream) ?u64 {
 
 /// Take a STREAM frame's payload.
 pub fn onData(self: *ReceiveStream, offset: u64, data: []const u8, fin: bool) Error!Stored {
+    // §3.2 lets a receiver discard everything on a stream it has reset, and
+    // §4.5 makes data past the final size a connection error a receiver MAY
+    // raise. This one does not: once the application has read the stream, late
+    // retransmissions are the peer catching up with its own acknowledgments,
+    // not a violation worth closing over.
     if (self.state == .reset_recvd or self.state == .reset_read) return .accepted;
     if (self.state == .data_read) return .accepted;
 
     const end = offset + data.len;
     if (self.final_size) |size| {
         // §4.5: a final size cannot change, and nothing may arrive past it.
-        if (end > size or data.len > 0 and offset >= size) return error.FinalSize;
+        // Split: the two halves are different violations of §4.5.
+        if (end > size) return error.FinalSize;
+        if (data.len > 0) {
+            if (offset >= size) return error.FinalSize;
+        }
         if (fin and end != size) return error.FinalSize;
     } else if (fin) {
         self.final_size = end;
@@ -144,8 +153,11 @@ pub fn onData(self: *ReceiveStream, offset: u64, data: []const u8, fin: bool) Er
 
     if (fin and self.state == .recv) self.state = .size_known;
     if (self.final_size) |size| {
-        if (self.contiguous_end >= size and (self.state == .recv or self.state == .size_known)) {
-            self.state = .data_recvd;
+        if (self.contiguous_end >= size) {
+            switch (self.state) {
+                .recv, .size_known => self.state = .data_recvd,
+                else => {},
+            }
         }
     }
     return .accepted;

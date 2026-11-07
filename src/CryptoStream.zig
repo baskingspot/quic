@@ -115,6 +115,7 @@ fn store(self: *CryptoStream, offset: u64, data: []const u8) void {
 /// The bytes in `[start, end)` as one or two slices of the ring.
 fn slices(self: *const CryptoStream, start: u64, end: u64) Delivery {
     std.debug.assert(start < end);
+    std.debug.assert(end - start <= self.ring.len);
     const capacity: u64 = @intCast(self.ring.len);
     const begin: usize = @intCast(start % capacity);
     const length: usize = @intCast(end - start);
