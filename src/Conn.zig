@@ -39,13 +39,8 @@ const packet = @import("packet.zig");
 const packet_number = @import("packet_number.zig");
 const protection = @import("protection.zig");
 const Recovery = @import("Recovery.zig");
-/// The caller's side of the timer, which the tests exercise from this file: a
-/// connection owns no timer, so "when do I wake up" is asked of the driver over
-/// the spaces it owns.
-const RecoveryDriver = @import("RecoveryDriver.zig");
 const Writer = @import("Writer.zig");
 const varint = @import("varint.zig");
-
 const error_code = @import("error_code.zig");
 
 const Conn = @This();
@@ -1406,6 +1401,11 @@ pub fn close(self: *Conn, args: Close, frames: []u8, out: []u8, now: Duration) E
 fn pings(comptime n: usize) [n]u8 {
     return @splat(0x01);
 }
+/// The caller's side of the timer, which only the tests here exercise: a
+/// connection owns no timer, so "when do I wake up" is asked of `RecoveryDriver`
+/// over the spaces the machine owns.
+const RecoveryDriver = @import("RecoveryDriver.zig");
+
 /// One endpoint's loss state, where a caller keeps it: outside `Conn`.
 ///
 /// A test never reads these tables; `report` is what it reads. They exist so that
