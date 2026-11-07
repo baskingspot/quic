@@ -133,8 +133,23 @@ pub const Stream = struct {
     limit: u64 = 0,
     send: SendStream = undefined,
     recv: ReceiveStream = undefined,
-    has_send: bool = false,
-    open: bool = false,
+    state: State = .unused,
+
+    /// Which halves a slot holds. Exhaustive on purpose: `send` is only valid
+    /// when `state` says so, and a boolean pair could disagree with the slot the
+    /// table points at.
+    pub const State = enum { unused, recv_only, send_only, both };
+
+    pub fn isOpen(self: *const Stream) bool {
+        return self.state != .unused;
+    }
+
+    pub fn canSend(self: *const Stream) bool {
+        return switch (self.state) {
+            .send_only, .both => true,
+            .unused, .recv_only => false,
+        };
+    }
 };
 
 pub const CryptoStorage = struct {
@@ -710,7 +725,7 @@ fn streamOf(slot: *StreamTable.Slot) *Stream {
 
 fn freeStream(self: *Conn) ?usize {
     for (self.streams, 0..) |*entry, index| {
-        if (!entry.open) return index;
+        if (!entry.isOpen()) return index;
     }
     return null;
 }
@@ -724,8 +739,9 @@ pub fn openStream(self: *Conn, id: u64, send_limit: u64) Error!*Stream {
         // A bidirectional stream the peer opened is ours to send on as well.
         if (slot.send != null) return error.AlreadyOpen;
         const existing = streamOf(slot);
+        std.debug.assert(existing.state == .recv_only);
         existing.send = SendStream.init(id, existing.send_buffer, send_limit);
-        existing.has_send = true;
+        existing.state = .both;
         slot.send = &existing.send;
         return existing;
     }
@@ -733,11 +749,11 @@ pub fn openStream(self: *Conn, id: u64, send_limit: u64) Error!*Stream {
     const index = self.freeStream() orelse return error.StreamLimit;
     const entry = &self.streams[index];
     entry.send = SendStream.init(id, entry.send_buffer, send_limit);
-    entry.has_send = true;
-    entry.open = true;
+    entry.state = .send_only;
 
     if (stream_id.direction(id) == .bidi) {
         entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.limit);
+        entry.state = .both;
         _ = try self.stream_table.open(id, &entry.send, &entry.recv);
     } else {
         _ = try self.stream_table.open(id, &entry.send, null);
@@ -757,7 +773,7 @@ fn streamFor(self: *Conn, id: u64) Error!*Stream {
     const index = self.freeStream() orelse return error.StreamLimit;
     const entry = &self.streams[index];
     entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.limit);
-    entry.open = true;
+    entry.state = .recv_only;
     _ = try self.stream_table.open(id, null, &entry.recv);
     return entry;
 }
@@ -794,7 +810,7 @@ fn onStreamFrame(self: *Conn, space: SpaceId, frame_stream: frame.Stream) Error!
 /// connection's.
 pub fn writeStream(self: *Conn, id: u64, max_len: u32, frames: []u8, out: []u8) Error!?u32 {
     const entry = self.stream(id) orelse return error.NotOpen;
-    if (!entry.has_send) return error.NotOpen;
+    if (!entry.canSend()) return error.NotOpen;
 
     const allowance = self.send_window.available();
     if (allowance == 0) return null;
@@ -864,12 +880,8 @@ pub fn writeFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8) Erro
 /// Whether an acknowledgment is owed in `id`'s space: something has been
 /// received there since the last one was sent. A space with no keys owes
 /// nothing, because nothing in it can have arrived.
-pub fn ackOwed(self: *const Conn, id: SpaceId) bool {
-    const space: *const Space = switch (id) {
-        .initial => if (self.initial) |*space| space else return false,
-        .handshake => if (self.handshake) |*space| space else return false,
-        .app => if (self.app) |*space| space else return false,
-    };
+pub fn ackOwed(self: *Conn, id: SpaceId) bool {
+    const space = self.spaceMaybe(id) orelse return false;
     return space.ackOwed();
 }
 
