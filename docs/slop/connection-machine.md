@@ -350,16 +350,23 @@ Things that were easy to get wrong and are now pinned by tests:
   server from the Retry's Source Connection ID, which is where its Initial keys
   come from, and the retried packet opens.
 
-### What is still unwired, in the order I would take it
+### What is still unwired
 
-1. MAX_STREAMS when a stream slot frees. The receive-side MAX_DATA and
-   MAX_STREAM_DATA generation landed; this is the one limit still never raised.
-2. The stream scheduler that decides which `SendStream` gets the next packet.
-3. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
-   both callers carry an `unreachable` arm for it. Narrowing the set to
-   `error{Truncated}` deletes those arms.
-4. Nothing else on the list: `InitialSpace` is deleted, its range tests moved to
-   `Conn.Space.record`, and its fuzz target became one over `Conn.Datagram`.
+Nothing from the old list: MAX_STREAMS landed with `Conn.closeStream`,
+`InitialSpace` is deleted (its range tests moved to `Conn.Space.record` and its
+fuzz target became one over `Conn.Datagram`), and `varint.decode`'s error set is
+`error{Truncated}`.
+
+What is left is a design question, not a slice. **The machine does not schedule.**
+Scheduling is a policy over application intent — which stream deserves the next
+byte — and it belongs to the caller, like congestion control and the resend queue.
+What the machine owes instead is the ability to *pack*: the caller hands it an
+ordered list of (stream, range) and the machine fills a packet up to the MTU and
+the congestion window. That API does not exist yet; `Conn.writeStream` writes one
+segment per call and nothing composes. Designing it means deciding what the
+machine owes back when a range does not fit (a partial, and the caller re-offers
+the rest) and how a packet describes what it carries so the caller's resend queue
+has a description it did not have to build itself. That is the next note.
 
 ### Three things the next agent should not re-derive
 
