@@ -2094,6 +2094,26 @@ pub fn ackOwed(self: *Conn, id: SpaceId) bool {
     return space.ackOwed();
 }
 
+/// Every space that owes an acknowledgment right now, in the order to send them:
+/// Initial, Handshake, then 1-RTT (§13.2.1), written into the caller's array.
+///
+/// The summary `flowControlOwed` is for the window frames, so a caller draining
+/// datagrams does not have to know the three-space enum to ask each one in turn.
+/// A space with no keys, or whose newest packet was already acknowledged, does
+/// not appear, and a closed connection owes nothing. A caller whose array is
+/// shorter than the list gets a prefix, and the rest is still owed the next time
+/// it asks: the answer is recomputed, not consumed.
+pub fn acksOwed(self: *Conn, out: []SpaceId) []const SpaceId {
+    var count: usize = 0;
+    for (std.enums.values(SpaceId)) |id| {
+        if (count == out.len) break;
+        if (!self.ackOwed(id)) continue;
+        out[count] = id;
+        count += 1;
+    }
+    return out[0..count];
+}
+
 /// Seal a packet carrying one ACK frame for everything received in `id`'s
 /// space. An ACK is sent in the space it acknowledges (§13.2.1).
 ///
@@ -3165,11 +3185,18 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     // they are the frames the machine hands to the caller.
     try testing.expectEqual(@as(usize, 4), at_server.frames.len);
     try testing.expect(at_server.frames[0] == .ping);
-    try testing.expect(server.ackOwed(.initial));
+
+    // §13.2.1: the one question a caller asks is which spaces owe an
+    // acknowledgment, and the answer is the list of spaces rather than three
+    // calls it has to remember to make. Only Initial has anything here, and the
+    // Handshake space has no keys, so it cannot appear.
+    var due: [3]SpaceId = undefined;
+    try testing.expectEqualSlices(SpaceId, &.{.initial}, server.acksOwed(&due));
 
     // The server answers with an ACK for packet 0.
     const ack_len = try server.writeAck(.initial, &datagram, 0);
     try testing.expect(!server.ackOwed(.initial));
+    try testing.expectEqual(@as(usize, 0), server.acksOwed(&due).len);
 
     // §13.2: the acknowledgment is the machine's to act on, so it leaves the
     // packet as a sent-packet record rather than as an event for the caller.
@@ -3264,6 +3291,64 @@ test "RFC 9000 §7.2, a server is built from the datagram that called it" {
     try testing.expectError(error.NoSpace, Opening.fromDatagram(datagram[0..sent], &tight));
     const untouched: [9]u8 = @splat(0xff);
     try testing.expectEqualSlices(u8, &untouched, &tight);
+}
+
+test "RFC 9000 §13.2.1, the acknowledgment summary lists the spaces in order" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x71, 0x72 };
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{ 0x73, 0x74 },
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{ 0x73, 0x74 },
+        .source_connection_id = &.{ 0x75, 0x76 },
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x77);
+    const server_secret: [protection.secret_length]u8 = @splat(0x78);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+
+    // One Initial and one 1-RTT packet arrive, each with a PING.
+    const payload = pings(1);
+    const initial_len = try client.writeFrames(.initial, &payload, &datagram, .data(0));
+    _ = try server.feed(datagram[0..initial_len], &plaintext, &frames, &stream_events, &report, 0);
+    const app_len = try client.writeFrames(.app, &payload, &datagram, .data(0));
+    _ = try server.feed(datagram[0..app_len], &plaintext, &frames, &stream_events, &report, 0);
+
+    // §13.2.1: an acknowledgment goes in the space it acknowledges, so the
+    // summary names both spaces, lowest first.
+    var due: [3]SpaceId = undefined;
+    try testing.expectEqualSlices(SpaceId, &.{ .initial, .app }, server.acksOwed(&due));
+
+    // A list that cannot hold them all is a prefix, and nothing is consumed: the
+    // rest is still owed the next time the caller asks.
+    var one: [1]SpaceId = undefined;
+    try testing.expectEqualSlices(SpaceId, &.{.initial}, server.acksOwed(&one));
+
+    // Answering the first space leaves only the second.
+    _ = try server.writeAck(.initial, &datagram, 0);
+    try testing.expectEqualSlices(SpaceId, &.{.app}, server.acksOwed(&due));
+
+    // §10.2.2: a connection that has closed owes nothing at all.
+    var close_frames: [64]u8 = undefined;
+    _ = try server.close(.{ .error_code = 0, .reason = "done" }, &close_frames, &datagram, 0);
+    try testing.expectEqual(@as(usize, 0), server.acksOwed(&due).len);
+    try testing.expect(!server.ackOwed(.app));
 }
 
 test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {

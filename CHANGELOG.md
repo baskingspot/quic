@@ -7,6 +7,10 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.acksOwed` reports every packet number space that owes an acknowledgment
+  in one call, lowest first, as `Conn.flowControlOwed` does for the window
+  frames. `ackOwed` and `writeAck` still take a space; the summary removes the
+  loop where a caller either knew the three-space enum or forgot one.
 - `Conn.installSpaces` installs the packet number spaces the TLS driver has
   reported secrets for, hands over the transport parameters once, and discards
   the Handshake keys on confirmation. It is separate from `writeHandshake`, which
