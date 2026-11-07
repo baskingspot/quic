@@ -49,7 +49,7 @@ pub const Parameters = enum { pending, handed };
 pub const range_capacity = 8;
 
 /// The widest encoding of one integer, from the codec that writes it.
-const max_varint_len = varint.size(varint.max);
+const max_varint_len = varint.size(@intCast(varint.max));
 
 /// The most a gap and its range length can take: two eight-byte varints. A full
 /// table holds `range_capacity` ranges, so at most one fewer pair (§19.3.1).

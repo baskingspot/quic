@@ -39,9 +39,10 @@ pub const EncodeError = error{
 
 /// The width of the encoding of `value`, in bytes: 1, 2, 4, or 8.
 ///
-/// `value` must not exceed `max`, which `write` checks before it calls this.
-pub fn size(value: u64) usize {
-    std.debug.assert(value <= max);
+/// The parameter is `u62`, which is `max`: the type carries the range, so this
+/// function needs no assertion and `write` is the only place that refuses a
+/// value with no encoding.
+pub fn size(value: u62) usize {
     if (value < 1 << 6) return 1;
     if (value < 1 << 14) return 2;
     if (value < 1 << 30) return 4;
@@ -77,7 +78,7 @@ pub fn decodeMinimal(cursor: *Cursor) DecodeError!u64 {
 /// Write `value` in the shortest encoding that carries it.
 pub fn write(writer: *Writer, value: u64) EncodeError!void {
     if (value > max) return error.Overflow;
-    const width = size(value);
+    const width = size(@intCast(value));
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, value, .big);
     const start = buf.len - width;
@@ -95,9 +96,10 @@ fn widthOfPrefix(first: u8) usize {
     return @as(usize, 1) << @intCast(first >> 6);
 }
 
-/// The integer carried by a slice whose width matches the prefix.
-fn assemble(bytes: []const u8) u64 {
-    var value: u64 = bytes[0] & 0x3f;
+/// The integer carried by a slice whose width matches the prefix. The prefix
+/// drops the top two bits, so every width assembles into the 62-bit range.
+fn assemble(bytes: []const u8) u62 {
+    var value: u62 = bytes[0] & 0x3f;
     for (bytes[1..]) |byte| value = (value << 8) | byte;
     return value;
 }
@@ -223,7 +225,7 @@ test "fuzz decode against a bounded model" {
             // announced, which is at least the width the value needs.
             const announced: u32 = @intCast(widthOfPrefix(input[0]));
             try testing.expectEqual(announced, cursor.pos);
-            const width: u32 = @intCast(size(value));
+            const width: u32 = @intCast(size(@intCast(value)));
             try testing.expect(cursor.pos >= width);
 
             var out: [8]u8 = undefined;
