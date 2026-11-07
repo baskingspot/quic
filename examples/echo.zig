@@ -148,6 +148,7 @@ pub fn main(init: std.process.Init) !void {
         .streams = &client.streams,
         .receive_limit = 4096,
         .send_limit = 4096,
+        .send_streams = .{ .bidi_remote = 4096 },
         .max_streams_bidi = 1,
     });
     var wire: [1500]u8 = undefined;
@@ -180,6 +181,9 @@ pub fn main(init: std.process.Init) !void {
     server_config.receive_limit = 4096;
     server_config.send_limit = 4096;
     server_config.max_streams_bidi = 1;
+    // The server answers on streams the client opened, so its limit is the
+    // client's initial_max_stream_data_bidi_local.
+    server_config.send_streams = .{ .bidi_local = 4096 };
     server.start(server_config);
 
     // The server reads the flight, and its call writes nothing but installs
@@ -191,7 +195,7 @@ pub fn main(init: std.process.Init) !void {
 
     // The client asks for a stream, writes, and offers it to the packetizer. The
     // offer is how much this packet may carry, not how much was written.
-    const stream = try client.conn.openStream(0, 4096);
+    const stream = try client.conn.openStream(0);
     // `write` takes all of it or returns `error.NoSpace`: there is no short
     // write to check, and so no way to publish a truncated stream by accident.
     const message = "hello from the client";
@@ -225,9 +229,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("server: stream {d} had {d} bytes\n", .{ changed.stream_id, count });
 
         // A bidirectional stream the peer opened is not writable until this
-        // endpoint opens its own half of it, which reads like creating a stream
-        // rather than joining one.
-        const back = try server.conn.openStream(changed.stream_id, 4096);
+        // endpoint joins it, which is a different act from opening one: nothing
+        // is created, and the limit is the peer's.
+        const back = try server.conn.joinStream(changed.stream_id);
         try back.send.write(read[0..count]);
         try back.send.finish();
         var server_written: [1]Conn.Written = undefined;

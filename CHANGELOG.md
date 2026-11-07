@@ -7,6 +7,16 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.joinStream` takes up the sending half of a stream the peer opened. It is
+  a different act from `Conn.openStream`, which now opens only the stream IDs
+  this endpoint initiates and refuses the peer's with `error.WrongDirection`;
+  joining answers on the peer's stream and a one-way one is refused the same
+  way. A caller that sent on a peer's stream by calling `openStream(id, limit)`
+  calls `joinStream(id)`.
+- `Conn.Config.send_streams` carries the peer's three initial per-stream limits
+  from its transport parameters (`initial_max_stream_data_bidi_remote`,
+  `bidi_local`, and `uni`), so opening or joining a stream takes its limit from
+  the machine instead of a number handed in again at each call.
 - `Conn.writeStreams` reports `Packet.remaining`: the payload room the packet was
   given and did not use, when the offer list ran out before the room did. The
   congestion window is the caller's, so the machine cannot say how much of it is

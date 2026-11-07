@@ -124,6 +124,9 @@ pub const Error = protection.Error ||
         StreamLimit,
         /// §12.4: STREAM frames belong to the application space only.
         WrongFrameSpace,
+        /// §2.1: the stream cannot carry data in this direction, or it is the
+        /// other endpoint's to open.
+        WrongDirection,
         /// §10.2.1 and §10.2.2: this connection has sent or received a
         /// CONNECTION_CLOSE, so it processes no more packets. Only the close
         /// itself may still be written.
@@ -173,6 +176,33 @@ pub const Loss = struct {
             .initial => self.sent_initial,
             .handshake => self.sent_handshake,
             .app => self.sent_app,
+        };
+    }
+};
+
+/// The peer's initial per-stream limits, named by the transport parameter each
+/// one comes from (§18.2).
+///
+/// Three numbers, not one. §4.1 gives a bidirectional stream a different limit
+/// depending on who opened it: `initial_max_stream_data_bidi_remote` is the
+/// peer's credit for the streams this endpoint opens, and
+/// `initial_max_stream_data_bidi_local` is its credit for the streams it opened
+/// itself, which this endpoint joins to answer. A connection can hold both
+/// kinds at once.
+pub const PeerStreamLimits = struct {
+    /// initial_max_stream_data_bidi_remote: a stream this endpoint opens.
+    bidi_remote: u64 = 0,
+    /// initial_max_stream_data_bidi_local: a stream the peer opened and this
+    /// endpoint sends on.
+    bidi_local: u64 = 0,
+    /// initial_max_stream_data_uni: a one-way stream this endpoint opens.
+    uni: u64 = 0,
+
+    /// The limit for a stream this endpoint opens itself.
+    fn forOpening(self: PeerStreamLimits, id: u64) u64 {
+        return switch (stream_id.direction(id)) {
+            .bidi => self.bidi_remote,
+            .uni => self.uni,
         };
     }
 };
@@ -248,6 +278,11 @@ pub const Config = struct {
     /// peer advertised in its transport parameters.
     receive_limit: u64 = 0,
     send_limit: u64 = 0,
+    /// §4.1: the peer's initial per-stream limits, which arrived in its
+    /// transport parameters and stay here: opening or joining a stream is where
+    /// they are needed, and a limit handed in at each call is a second place to
+    /// pair it with the wrong stream.
+    send_streams: PeerStreamLimits = .{},
     /// §4.6: the initial MAX_STREAMS counts this endpoint advertised in its
     /// transport parameters, per direction. They are the peer's credit to open
     /// streams, so the machine has to know them to raise them later, and together
@@ -548,6 +583,9 @@ attempt: ?setup.Client,
 /// here points outside this value, so a copy of a `Conn` does not copy any state
 /// that matters. See `Loss`.
 loss: Loss,
+/// §4.1: the peer's initial per-stream limits, which every `SendStream` is born
+/// with.
+send_streams: PeerStreamLimits,
 /// §18.2: how the delay field of an incoming ACK is scaled.
 ack_delay_exponent: u8,
 /// The peer's `max_ack_delay`, which bounds a reported delay once the handshake
@@ -648,6 +686,7 @@ pub fn init(config: Config) Conn {
         .streams = config.streams,
         .receive_window = .init(config.receive_limit),
         .send_window = .init(config.send_limit),
+        .send_streams = config.send_streams,
         .streams_allowed = .{
             .bidi = config.max_streams_bidi,
             .uni = config.max_streams_uni,
@@ -1325,24 +1364,27 @@ fn freeStream(self: *Conn) ?usize {
 }
 
 /// Open a stream this endpoint initiates (§2.1), with a send half and, for a
-/// bidirectional stream, a receive half too. `send_limit` is the peer's initial
-/// per-stream limit from its transport parameters; MAX_STREAM_DATA raises it
-/// through `Stream.send.onMaxStreamData`.
-pub fn openStream(self: *Conn, id: u64, send_limit: u64) Error!*Stream {
-    if (self.stream_table.get(id)) |slot| {
-        // A bidirectional stream the peer opened is ours to send on as well.
-        if (slot.send != null) return error.AlreadyOpen;
-        const existing = streamOf(slot);
-        std.debug.assert(existing.halves == .recv_only);
-        existing.send = SendStream.init(id, existing.send_buffer, send_limit);
-        existing.halves = .both;
-        slot.send = &existing.send;
-        return existing;
-    }
+/// bidirectional stream, a receive half too.
+///
+/// The sender's initial limit is the peer's, from
+/// `Config.send_streams.bidi_remote` or `.uni` depending on the stream's kind;
+/// MAX_STREAM_DATA raises it through `Stream.send.onMaxStreamData`. An id the
+/// peer initiates is `error.WrongDirection`: that stream already exists on the
+/// receive side, and `joinStream` is how its sending half comes into being.
+pub fn openStream(self: *Conn, id: u64) Error!*Stream {
+    if (self.stream_table.get(id) != null) return error.AlreadyOpen;
+
+    const initiator: stream_id.Initiator = switch (self.role) {
+        .client => .client,
+        .server => .server,
+    };
+    // §2.1: the two low bits say who opens a stream, and this endpoint may only
+    // open its own.
+    if (stream_id.initiator(id) != initiator) return error.WrongDirection;
 
     const index = self.freeStream() orelse return error.StreamLimit;
     const entry = &self.streams[index];
-    entry.send = SendStream.init(id, entry.send_buffer, send_limit);
+    entry.send = SendStream.init(id, entry.send_buffer, self.send_streams.forOpening(id));
     entry.halves = .send_only;
 
     if (stream_id.direction(id) == .bidi) {
@@ -1353,6 +1395,28 @@ pub fn openStream(self: *Conn, id: u64, send_limit: u64) Error!*Stream {
         _ = try self.stream_table.open(id, &entry.send, null);
     }
     return entry;
+}
+
+/// Take up the sending half of a stream the peer opened, so this endpoint can
+/// answer on the same stream (§2.1).
+///
+/// Not the same act as `openStream`: nothing is created, the slot the peer's
+/// frames already opened is reused, and the limit is the peer's
+/// `initial_max_stream_data_bidi_local`, which the machine carried from
+/// `Config.send_streams` rather than being handed again. A one-way stream the
+/// peer opened is `error.WrongDirection`, because §2.1 gives its only direction
+/// to the peer.
+pub fn joinStream(self: *Conn, id: u64) Error!*Stream {
+    const slot = self.stream_table.get(id) orelse return error.NotOpen;
+    if (slot.send != null) return error.AlreadyOpen;
+    if (stream_id.direction(id) != .bidi) return error.WrongDirection;
+
+    const existing = streamOf(slot);
+    std.debug.assert(existing.halves == .recv_only);
+    existing.send = SendStream.init(id, existing.send_buffer, self.send_streams.bidi_local);
+    existing.halves = .both;
+    slot.send = &existing.send;
+    return existing;
 }
 
 /// The stream for an incoming STREAM frame, opening it if this is the first
@@ -2613,6 +2677,7 @@ test "RFC 9000 §4.6, closing a stream this endpoint opened grants no credit" {
         .stream_slots = &slots,
         .streams = &streams,
         .send_limit = 64,
+        .send_streams = .{ .uni = 64 },
         .max_streams_bidi = 1,
     });
 
@@ -2620,7 +2685,7 @@ test "RFC 9000 §4.6, closing a stream this endpoint opened grants no credit" {
 
     // A locally opened unidirectional stream — the client's first is 2 — written
     // and acknowledged to its final size, so its only half is terminal.
-    const entry = try client.openStream(2, 64);
+    const entry = try client.openStream(2);
     try entry.send.write("bytes");
     try entry.send.finish();
     var sent: u64 = 0;
@@ -2818,6 +2883,7 @@ test "RFC 9000 §19.8, a packed packet reports its number and the frames it carr
         .stream_slots = &client_slots,
         .streams = &client_streams,
         .send_limit = 64,
+        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -2834,9 +2900,9 @@ test "RFC 9000 §19.8, a packed packet reports its number and the frames it carr
     const server_secret: [protection.secret_length]u8 = @splat(0x42);
     installApp(&client, &server, client_secret, server_secret);
 
-    const first = try client.openStream(0, 64);
+    const first = try client.openStream(0);
     try first.send.write("alpha");
-    const second = try client.openStream(4, 64);
+    const second = try client.openStream(4);
     try second.send.write("beta");
 
     var offers = [_]Offer{
@@ -2908,11 +2974,12 @@ test "RFC 9000 §4.1, a packet that fits part of an offer says where to resume" 
         .stream_slots = &slots,
         .streams = &streams,
         .send_limit = 64,
+        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x43);
     installApp(&client, &client, client_secret, client_secret);
 
-    const entry = try client.openStream(0, 64);
+    const entry = try client.openStream(0);
     try entry.send.write("0123456789abcdefghij");
 
     var written: [1]Written = undefined;
@@ -2980,11 +3047,12 @@ test "RFC 9000 §4.1, a window with no room is a different answer from a used on
         .stream_slots = &slots,
         .streams = &streams,
         .send_limit = 64,
+        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x44);
     installApp(&client, &client, client_secret, client_secret);
 
-    const entry = try client.openStream(0, 64);
+    const entry = try client.openStream(0);
     _ = try entry.send.write("bytes");
 
     var written: [1]Written = undefined;
@@ -3903,6 +3971,64 @@ test "a stream configuration that cannot hold its own limits is refused" {
     }
 }
 
+test "RFC 9000 §2.1, opening a stream takes the peer's limit for it" {
+    const dcid = [_]u8{ 0x41, 0x42 };
+    var client_rings: [2][8]u8 = .{ undefined, undefined };
+    var client_slots: [2]StreamTable.Slot = undefined;
+    var client_streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &client_rings[0], .recv_limit_bytes = 8 },
+        .{ .recv_buffer = &client_rings[1], .recv_limit_bytes = 8 },
+    };
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x43},
+        .stream_slots = &client_slots,
+        .streams = &client_streams,
+        .send_streams = .{ .bidi_remote = 10, .uni = 30 },
+    });
+
+    var server_rings: [2][8]u8 = .{ undefined, undefined };
+    var server_slots: [2]StreamTable.Slot = undefined;
+    var server_streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &server_rings[0], .recv_limit_bytes = 8 },
+        .{ .recv_buffer = &server_rings[1], .recv_limit_bytes = 8 },
+    };
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x43},
+        .source_connection_id = &dcid,
+        .stream_slots = &server_slots,
+        .streams = &server_streams,
+        .send_streams = .{ .bidi_remote = 11, .bidi_local = 20 },
+    });
+
+    // §4.1: a bidirectional stream this endpoint opens carries the limit the
+    // peer named for the streams it receives, and a one-way stream carries the
+    // one-way number. Two different transport parameters, two different limits.
+    try testing.expectEqual(@as(u64, 10), (try client.openStream(0)).send.limit);
+    try testing.expectEqual(@as(u64, 30), (try client.openStream(2)).send.limit);
+    try testing.expectEqual(@as(u64, 11), (try server.openStream(1)).send.limit);
+
+    // §2.1: the low bits say who opens a stream. Stream 1 is the server's, and
+    // stream 0 is the client's; each endpoint refuses the other's.
+    try testing.expectError(error.WrongDirection, client.openStream(1));
+    try testing.expectError(error.WrongDirection, server.openStream(0));
+
+    // Joining is not opening: with no slot behind the id there is no stream to
+    // widen, and a stream this endpoint opened itself has its sending half
+    // already.
+    try testing.expectError(error.NotOpen, server.joinStream(0));
+    try testing.expectError(error.AlreadyOpen, server.joinStream(1));
+    try testing.expectError(error.AlreadyOpen, client.openStream(0));
+}
+
 test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
@@ -3932,6 +4058,7 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
         .stream_slots = &slots,
         .streams = &streams,
         .receive_limit = 1024,
+        .send_streams = .{ .bidi_local = 64 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x25);
     const server_secret: [protection.secret_length]u8 = @splat(0x26);
@@ -3965,6 +4092,16 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
     try testing.expectEqualStrings("hello stream", read_buffer[0..read]);
     // §4.1: the connection window counts the highest offset, not the bytes.
     try testing.expectEqual(@as(u64, 12), server.receive_window.used);
+
+    // §2.1: the server answers on the same stream by joining it, which reuses
+    // the slot the frame opened and takes the peer's bidi_local limit rather
+    // than a number handed in again.
+    const joined = try server.joinStream(4);
+    try testing.expect(joined == entry);
+    try testing.expectEqual(Conn.Stream.Halves.both, joined.halves);
+    try testing.expectEqual(@as(u64, 64), joined.send.limit);
+    try testing.expectEqual(SendStream.State.ready, joined.send.state);
+    try testing.expectError(error.AlreadyOpen, server.joinStream(4));
 }
 
 test "RFC 9000 §3.2, a packet reports the streams it made readable" {
@@ -4482,6 +4619,7 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
         .stream_slots = &client_slots,
         .streams = &client_streams,
         .send_limit = 64,
+        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -4498,7 +4636,7 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
     const server_secret: [protection.secret_length]u8 = @splat(0x2e);
     installApp(&client, &server, client_secret, server_secret);
 
-    const entry = try client.openStream(0, 64);
+    const entry = try client.openStream(0);
     try entry.send.write("stream bytes");
     try entry.send.finish();
 
