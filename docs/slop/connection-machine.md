@@ -157,7 +157,8 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 ## Where to resume
 
 State as of the three spaces, the datagram walk, key discard, the TLS seam,
-frame parsing, and streams: 198 tests.
+frame parsing, streams, and the receive-side flow control generator: 199
+tests.
 
 ### The TigerStyle pass
 
@@ -184,13 +185,21 @@ byte-identical.
   this same decoder refuses those bytes. Both are `error.InvalidValue` now.
 - `varint.size` is on the `u62` half of the range, so it needs no assertion and
   `varint.write` is the only place that refuses a value with no encoding.
-- `Recovery` had a real overrun, not a style problem: `Events` is 64 records,
+- `Recovery` had a real overrun, not a style problem: `Events` was 64 records,
   the caller's sent table is any size, and one ACK covering more than 64 of them
   tripped the report's assertion, which in a release build is an out-of-bounds
-  write. `Recovery.sent_packets_max` is now the one number for both, `space()`
-  asserts the caller's table against it, and `Space.sentValid` is asserted
-  wherever the count moves. The index-versus-count hazard is the removal loop:
-  `remove` moves the tail down, so the loop must not advance afterwards.
+  write. The report now takes the caller's storage (`Events.init(acked, lost)`),
+  a report smaller than the table is `error.NoSpace` refused before anything
+  moves, and `Space.sentValid` is asserted wherever the count moves. The
+  index-versus-count hazard is the removal loop: `remove` moves the tail down,
+  so the loop must not advance afterwards.
+- Receive-side flow control exists: `Conn.flowControlOwed` reports the MAX_DATA
+  and MAX_STREAM_DATA frames the application's reads have made due, and
+  `Conn.onFlowControlSent` records the raises only once the caller puts them on
+  the wire. `FlowControl` keeps its window and raises when half of it is
+  consumed; `ReceiveStream.nextMaxStreamData` raises when the credit left is
+  under half a ring. Deciding is separate from raising on purpose: a frame that
+  never left must not widen a window.
 
 What exists in `src/Conn.zig`:
 
@@ -234,26 +243,42 @@ and `Stub` for a caller that has no TLS.
 
 What is still unwired, in the order I would take it:
 
-1. `Recovery.Events` is fixed at 64 records, so **one space tracks at most 64
-   packets in flight**. That is below what a fast path needs: 1 Gbps at 50 ms
-   RTT is about 5,200 packets. Lifting it means the caller supplies the two
-   event arrays the way it supplies the sent table, so `Events.init(acked,
-   lost)` takes slices. The bound was made safe and explicit first, on purpose,
-   because this change touches `RecoveryDriver` and every harness.
-2. ACK frames into a `Recovery.Space` per space, and the timer loop over them:
-   that brings the loss half of §6.4, retransmission through the caller's resend
-   queue, and stops ACK frames coming back in `Opened.frames`. Today nothing is
-   acknowledged in the loss sense, nothing is ever declared lost, and no PTO is
-   armed, because `Recovery` has no caller.
-3. The receive side never generates MAX_STREAM_DATA or MAX_DATA. `FlowControl`
-   has the counters that say when a limit should rise and nobody asks them, so
-   a peer that fills a ring window stalls until the idle timeout. MAX_STREAMS
-   has the same gap when a slot frees.
-4. `connection_setup` on the server side, Retry and version negotiation state on
+1. `Recovery` has no caller in `Conn`, so nothing is acknowledged in the loss
+   sense, nothing is ever declared lost, no PTO is armed, and ACK frames still
+   come back in `Opened.frames` as caller events. The shape to build, because it
+   is the one that does not create a self-reference:
+
+   - `Conn.Config` gains `recovery: *Recovery` and three caller-owned sent
+     tables (`sent_initial`, `sent_handshake`, `sent_app`). The `Recovery` must
+     live outside `Conn`: `Recovery.Space` holds `*Recovery`, and `Conn` is
+     returned by value from `init`, so a `Recovery` field inside `Conn` would
+     leave every space pointing at the old address the moment `init`'s result is
+     copied.
+   - `Conn.Space` holds `?Recovery.Space`, created from `Config` on first use and
+     taken away by `Conn.discard`, which also calls `Space.discard()` (§6.4:
+     loss state goes with the keys).
+   - `Conn` has no clock today, so every write and every feed grows a `now:
+     Duration`. `writeFrames` also has to record the packet: whether it is
+     ack-eliciting and in flight is a property of the frames the caller put
+     inside, which the machine never parses, so the caller says it. An options
+     struct keeps the two bools from being swapped.
+   - `feed` gains enough information to route an ACK: `.ack` frames go to
+     `space.recovery.onAckReceived(ack, now, options, events)` and stop coming
+     back in `Opened.frames`. `events` is caller storage, passed in the same way
+     `frames` is. `Options` (`max_ack_delay`, `peer_address_validated`,
+     `handshake_confirmed`) comes from `Config` plus the handshake seam's
+     `confirmed`.
+   - The caller reads `nextTimer`/`onTimeout` through `RecoveryDriver`, which
+     already exists and is tested; `Conn` should not grow a timer loop of its
+     own.
+
+2. `connection_setup` on the server side, Retry and version negotiation state on
    the client side, and the connection close path every error above is waiting
    for.
-5. The stream scheduler that decides which `SendStream` gets the next packet.
-6. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
+3. MAX_STREAMS when a stream slot frees. The receive-side MAX_DATA and
+   MAX_STREAM_DATA generation landed; this is the one limit still never raised.
+4. The stream scheduler that decides which `SendStream` gets the next packet.
+5. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
    both callers carry an `unreachable` arm for it. Narrowing the set to
    `error{Truncated}` deletes those arms.
 
