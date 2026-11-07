@@ -273,17 +273,7 @@ pub fn init(config: Config) Conn {
     std.debug.assert(config.packet_number_len >= 1);
     std.debug.assert(config.packet_number_len <= 4);
 
-    // §4.1: a stream has to hold the window it advertises. A ring smaller than
-    // the limit, or a limit with no ring behind it, is the caller's numbers and
-    // not a peer's frame; it fails here, at setup, instead of surfacing as
-    // `error.NoSpace` from `ReceiveStream`'s backpressure later.
-    for (config.streams) |entry| {
-        if (entry.recv_buffer.len == 0) {
-            std.debug.assert(entry.limit == 0);
-        } else {
-            std.debug.assert(entry.recv_buffer.len >= entry.limit);
-        }
-    }
+    std.debug.assert(streamsValid(config.stream_slots, config.streams));
 
     const secrets = protection.initialSecrets(config.original_destination_connection_id);
     const suite = protection.Suite.aes_128_gcm;
@@ -657,6 +647,30 @@ fn installSpace(
         .handshake => self.handshake = space,
         .app => self.app = space,
     }
+}
+
+/// Whether the stream configuration can honour the limits it advertises.
+///
+/// Two invariants, both of them the caller's numbers rather than a peer's
+/// frames. §4.1: a stream may not advertise a window it cannot hold, so a ring
+/// shorter than its limit would turn a legal frame into backpressure. And a
+/// limit with no ring behind it describes a stream that claims to receive and
+/// cannot. The table needs one slot per stream it may hold, or `open` fails at
+/// runtime with a table that was never going to fit.
+///
+/// Kept as a predicate rather than an inline loop so a test can drive every bad
+/// shape directly: the assertion at `init` is a programmer-error check, and
+/// there is no way to expect a panic in this Zig version.
+fn streamsValid(slots: []const StreamTable.Slot, streams: []const Stream) bool {
+    if (slots.len != streams.len) return false;
+    for (streams) |entry| {
+        if (entry.recv_buffer.len == 0) {
+            if (entry.limit != 0) return false;
+        } else {
+            if (entry.recv_buffer.len < entry.limit) return false;
+        }
+    }
+    return true;
 }
 
 /// The stream with `id`, or null when it is not open.
@@ -1468,6 +1482,31 @@ test "RFC 9000 §12.4, a frame that will not parse is an error and not a dropped
     // is a fresh packet rather than the same bytes again.
     const again = try client.writeFrames(.initial, &bad, &datagram);
     try testing.expectError(error.UnknownFrameType, server.feed(datagram[0..again], &plaintext, &events));
+}
+
+test "a stream configuration that cannot hold its own limits is refused" {
+    var ring: [64]u8 = undefined;
+    var slots: [2]StreamTable.Slot = undefined;
+
+    const Case = struct { slots: []const StreamTable.Slot, streams: []const Stream, valid: bool };
+    const cases = [_]Case{
+        // Nothing configured, and slots that match.
+        .{ .slots = &slots, .streams = &.{ .{}, .{} }, .valid = true },
+        // A ring that holds exactly the window it advertises.
+        .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .limit = 64 }, .{} }, .valid = true },
+        // A ring one byte short of it: §4.1 says it cannot hold what it says.
+        .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .limit = 65 }, .{} }, .valid = false },
+        // A limit with no ring behind it.
+        .{ .slots = &slots, .streams = &.{ .{ .limit = 8 }, .{} }, .valid = false },
+        // A ring with a zero limit is a stream that receives nothing.
+        .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .limit = 0 }, .{} }, .valid = true },
+        // One slot short of the streams it would have to hold.
+        .{ .slots = slots[0..1], .streams = &.{ .{}, .{} }, .valid = false },
+    };
+
+    for (cases) |case| {
+        try testing.expectEqual(case.valid, streamsValid(case.slots, case.streams));
+    }
 }
 
 test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {

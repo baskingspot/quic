@@ -105,9 +105,11 @@ All notable changes to quic are recorded here. The format follows
   `SendStream` segment into a packet clamped by the peer's connection allowance,
   and `Conn.onMaxData` raises that allowance. `Conn.Config` gained `stream_slots`,
   `streams`, `receive_limit`, and `send_limit`; `Conn.Stream` is the caller's
-  per-stream storage. `Conn.init` asserts that every receive ring holds the
-  per-stream limit that stream advertises (§4.1), so a ring that is too small
-  fails at setup instead of turning a peer's frame into `error.NoSpace`.
+  per-stream storage. `Conn.init` asserts `streamsValid`, which checks that every
+  receive ring holds the per-stream limit that stream advertises (§4.1) and that
+  the table has one slot per stream, so a configuration that cannot hold its own
+  windows fails at setup instead of turning a peer's frame into `error.NoSpace`
+  or a runtime table overflow.
 - `Conn` parses the frames of every packet it opens. CRYPTO frames are
   reassembled per level and handed to the TLS driver in order; PADDING is
   consumed; every other frame comes back to the caller as `Conn.Opened.frames`,
