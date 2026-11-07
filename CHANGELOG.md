@@ -195,12 +195,11 @@ All notable changes to quic are recorded here. The format follows
   parameters as opaque bytes, `confirmed`, `alpn`, and `errorCode` for the
   CRYPTO_ERROR range. No record layer, no clock, no allocator, and every slice
   borrowed. `handshake.Stub` is a scripted driver for a caller that has none.
-- `Conn.writeHandshake` drives the TLS seam: it hands the driver this endpoint's
-  transport parameters once, installs every space the driver reports secrets
-  for, writes the driver's next message as a CRYPTO frame at the level it named,
-  and discards the Handshake keys when the driver reports the handshake
-  confirmed (RFC 9001 §4.9.2). `Conn.Config` takes the driver and the encoded
-  parameters; without a driver the call writes nothing.
+- `Conn.writeHandshake` drains the TLS seam's messages: each call installs what
+  the driver reported (`Conn.installSpaces`) and writes its next message as a
+  CRYPTO frame at the level it named, so a caller loops until it returns null.
+  `Conn.Config` takes the driver and the encoded parameters; without a driver the
+  call writes nothing.
 - `Conn.Datagram` walks one datagram packet by packet (RFC 9000 §12.2): long
   headers delimit themselves with their Length field, a short header runs to the
   end, a packet that will not open is counted in `dropped` and the walk
