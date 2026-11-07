@@ -76,8 +76,9 @@ pub fn deadline(self: *const RecoveryDriver, options: Options) Deadline {
 
 /// Fire the deadline if `now` has reached it.
 ///
-/// `events` receives the loss set for a loss timeout. Returns null when there is
-/// nothing to do: no deadline, a deadline still in the future, or a deadline
+/// `events` receives the loss set for a loss timeout, over storage the caller
+/// sized with `Recovery.Events.init`. Returns null when there is nothing to
+/// do: no deadline, a deadline still in the future, or a deadline
 /// that passed while the state moved on (everything acknowledged, keys
 /// discarded), in which case the driver simply forgets it.
 pub fn poll(
@@ -139,7 +140,9 @@ test "RFC 9002 §6.2.1, a probe timeout fires once per arm and backs off" {
     try testing.expectEqual(ms(10) + ms(240), first.at);
 
     // Before the deadline: nothing.
-    var events: Recovery.Events = .{};
+    var events_acked: [64]Recovery.SentPacket = undefined;
+    var events_lost: [64]Recovery.SentPacket = undefined;
+    var events: Recovery.Events = .init(&events_acked, &events_lost);
     try testing.expect((try h.driver.poll(ms(10) + ms(239), .{}, .client, &events)) == null);
 
     // At the deadline: one probe, and the backoff doubled the next arm.
@@ -175,7 +178,9 @@ test "RFC 9002 §6.1.2, a loss deadline fires once" {
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Recovery.Events = .{};
+    var events_acked: [64]Recovery.SentPacket = undefined;
+    var events_lost: [64]Recovery.SentPacket = undefined;
+    var events: Recovery.Events = .init(&events_acked, &events_lost);
     try h.space_a.onAckReceived(&ack, ms(100), .{}, &events);
 
     const due = h.driver.deadline(.{});
@@ -209,7 +214,9 @@ test "RFC 9002 Appendix A.8, a deadline that passes with nothing in flight does 
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Recovery.Events = .{};
+    var events_acked: [64]Recovery.SentPacket = undefined;
+    var events_lost: [64]Recovery.SentPacket = undefined;
+    var events: Recovery.Events = .init(&events_acked, &events_lost);
     try h.space_a.onAckReceived(&ack, ms(20), .{}, &events);
     try testing.expectEqual(Recovery.TimerKind.none, h.driver.deadline(.{}).kind);
 
@@ -254,6 +261,8 @@ test "RFC 9002 §6.4, discarding a space removes its timer and keeps the RTT" {
     try testing.expectEqual(ms(80), h.shared.rtt.smoothed);
 
     // A poll after the discard still does nothing.
-    var events: Recovery.Events = .{};
+    var events_acked: [64]Recovery.SentPacket = undefined;
+    var events_lost: [64]Recovery.SentPacket = undefined;
+    var events: Recovery.Events = .init(&events_acked, &events_lost);
     try testing.expect((try h.driver.poll(ms(1000), .{}, .client, &events)) == null);
 }

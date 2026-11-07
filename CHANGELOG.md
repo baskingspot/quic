@@ -158,6 +158,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `Recovery.Events` takes the caller's storage: `Recovery.Events.init(acked,
+  lost)` replaces the fixed 64-record arrays, so a space is no longer limited to
+  64 packets in flight. A report smaller than the sent table is
+  `error.NoSpace` from `onAckReceived` or `onTimeout`, refused before anything
+  moves. `Recovery.sent_packets_max` is gone.
 - `FlowControl.nextLimit` raises the limit by the window the receiver keeps open,
   not by a fixed 16 KiB: `FlowControl` remembers its window, and a raise is due
   once half of it is consumed. A caller that read a few bytes no longer owes a

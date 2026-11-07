@@ -79,8 +79,9 @@ pub const Options = struct {
 };
 
 pub const Error = error{
-    /// The caller's sent-packet storage has no room for another packet. The
-    /// caller owns that storage and must size it for the connection.
+    /// The caller's storage has no room: either the sent table cannot take
+    /// another packet, or the event report cannot describe every packet the call
+    /// would report. The caller owns both and sizes them for the connection.
     NoSpace,
     /// §19.3.1 of RFC 9000: the ACK's ranges do not describe packet numbers.
     InvalidAckRange,
@@ -104,22 +105,20 @@ pub const Timeout = struct {
     probes: u8 = 0,
 };
 
-/// The most sent packets one space tracks, and so the most one call can report.
-///
-/// The report carries one record per packet in flight, so a table larger than
-/// this would have no room to land its records in. `space` asserts the caller's
-/// table against this number, and the arrays below are exactly its size, which
-/// is what keeps a report from running past its storage.
-pub const sent_packets_max: u32 = 64;
-
 /// The sent packets a call reported. The records carry what a congestion
 /// controller needs, because the packets are gone from the space by the time the
 /// caller sees them.
+///
+/// The storage is the caller's, like the sent table itself: one record per
+/// packet in flight, `acked` for what an acknowledgment cleared and `lost` for
+/// what a timer did. A call that cannot describe every packet in the table
+/// refuses to start rather than reporting part of an event, so the two arrays
+/// must be at least as long as that table.
 pub const Events = struct {
-    acked: [sent_packets_max]SentPacket = undefined,
+    acked: []SentPacket,
     acked_len: usize = 0,
     acked_bytes: u32 = 0,
-    lost: [sent_packets_max]SentPacket = undefined,
+    lost: []SentPacket,
     lost_len: usize = 0,
     lost_bytes: u32 = 0,
     /// The send time of the largest lost packet, which is what a controller
@@ -128,6 +127,20 @@ pub const Events = struct {
     /// §7.6.2: this acknowledgment established persistent congestion. The
     /// controller sets its window to the floor when it sees this.
     persistent_congestion: bool = false,
+
+    /// A report over the caller's storage.
+    pub fn init(acked: []SentPacket, lost: []SentPacket) Events {
+        assert(acked.len > 0);
+        assert(lost.len > 0);
+        return .{ .acked = acked, .lost = lost };
+    }
+
+    /// Whether this report has a place for every record a table of `capacity`
+    /// packets could produce. A call checks this before it looks at anything, so
+    /// a report that is too small leaves the space untouched.
+    pub fn fits(self: *const Events, capacity: usize) bool {
+        return self.acked.len >= capacity and self.lost.len >= capacity;
+    }
 
     pub fn ackedPackets(self: *const Events) []const SentPacket {
         return self.acked[0..self.acked_len];
@@ -275,13 +288,11 @@ pto_count: u5 = 0,
 ///
 /// `sent` must outlive the space. Size it for the connection: a packet that
 /// cannot be recorded is a packet whose frames are never retransmitted, so
-/// `onPacketSent` returns `error.NoSpace` rather than dropping one. Size it at
-/// or below `sent_packets_max`, because a larger table cannot have every packet
-/// in it reported.
+/// `onPacketSent` returns `error.NoSpace` rather than dropping one. The report
+/// the caller passes to `onAckReceived` or `onTimeout` must hold as many
+/// records as this table, or the call refuses with `error.NoSpace`.
 pub fn space(self: *Recovery, sent: []SentPacket) Space {
-    // A table the report cannot describe is a configuration that cannot hold
-    // its own events, so it is a programmer error and not a runtime condition.
-    assert(sent.len <= sent_packets_max);
+    assert(sent.len > 0);
     return .{ .shared = self, .sent = sent };
 }
 
@@ -359,6 +370,11 @@ pub const Space = struct {
         options: Options,
         events: *Events,
     ) Error!void {
+        // One record per packet in the table, so an acknowledgment covering all
+        // of them fits. Refusing here, before anything moves, is what keeps a
+        // small report from truncating an event halfway through.
+        if (!events.fits(self.sent_len)) return error.NoSpace;
+
         events.clear();
 
         self.largest_acked = if (self.largest_acked) |largest|
@@ -509,6 +525,9 @@ pub const Space = struct {
         options: Options,
         events: *Events,
     ) Error!Timeout {
+        // A loss timeout can declare every packet in the table lost at once.
+        if (!events.fits(self.sent_len)) return error.NoSpace;
+
         events.clear();
 
         if (self.loss_time != 0) {
@@ -685,7 +704,9 @@ test "RFC 9002 §6.1.1, the packet threshold declares three older packets lost" 
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     try sp.onAckReceived(&ack, ms(20), .{}, &events);
 
     try expectNumbers(events.ackedPackets(), &.{5});
@@ -702,30 +723,42 @@ test "RFC 9002 §6.1.1, the packet threshold declares three older packets lost" 
 
 test "RFC 9002 §6.1, an acknowledgment covering a full table reports every packet" {
     // The report is the caller's resend queue input: a packet that is acked but
-    // left out of it stays in the queue forever. So the report is sized by the
-    // same number as the table, and a full table must fill it exactly.
+    // left out of it stays in the queue forever. So a report as large as the
+    // table must fill exactly, and a smaller one must be refused rather than
+    // truncate.
     var h: Harness = .{};
     var sp = h.space();
     try testing.expect(sp.sentValid());
 
     var number: u64 = 0;
-    while (number < sent_packets_max) : (number += 1) {
+    while (number < h.sent.len) : (number += 1) {
         try sp.onPacketSent(number, ms(10), true, true, 1200);
     }
-    try testing.expectEqual(@as(usize, sent_packets_max), sp.inFlight().len);
+    try testing.expectEqual(h.sent.len, sp.inFlight().len);
 
+    const last: u64 = @intCast(h.sent.len - 1);
     const all: frame.Ack = .{
-        .largest = sent_packets_max - 1,
+        .largest = last,
         .delay = 0,
-        .first_range = sent_packets_max - 1,
+        .first_range = last,
         .range_count = 0,
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Events = .{};
+
+    // One record short of the table: refused before anything moves.
+    var short_acked: [63]SentPacket = undefined;
+    var short_lost: [64]SentPacket = undefined;
+    var short: Events = .init(&short_acked, &short_lost);
+    try testing.expectError(error.NoSpace, sp.onAckReceived(&all, ms(20), .{}, &short));
+    try testing.expectEqual(h.sent.len, sp.inFlight().len);
+
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     try sp.onAckReceived(&all, ms(20), .{}, &events);
 
-    try testing.expectEqual(@as(usize, sent_packets_max), events.ackedPackets().len);
+    try testing.expectEqual(h.sent.len, events.ackedPackets().len);
     try testing.expectEqual(@as(usize, 0), events.lostPackets().len);
     try testing.expectEqual(@as(usize, 0), sp.inFlight().len);
     try testing.expect(sp.sentValid());
@@ -748,7 +781,9 @@ test "RFC 9002 §6.1.2, a gap is lost only by time" {
 
     // Acknowledged 100ms after it was sent: the first sample sets smoothed to
     // 100ms and the variance to 50ms, so the loss delay is 9/8 of 100ms.
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     try sp.onAckReceived(&only_one, ms(100), .{}, &events);
     try expectNumbers(events.ackedPackets(), &.{1});
     // One packet newer is acked, but the packet threshold needs three, and too
@@ -761,7 +796,9 @@ test "RFC 9002 §6.1.2, a gap is lost only by time" {
     try testing.expectEqual(TimerKind.loss, timer.kind);
     try testing.expectEqual(sp.loss_time, timer.at);
 
-    var timeout_events: Events = .{};
+    var timeout_events_acked: [64]SentPacket = undefined;
+    var timeout_events_lost: [64]SentPacket = undefined;
+    var timeout_events: Events = .init(&timeout_events_acked, &timeout_events_lost);
     const fired = try sp.onTimeout(.client, timer.at, .{}, &timeout_events);
     try testing.expectEqual(TimeoutKind.loss, fired.kind);
     try expectNumbers(timeout_events.lostPackets(), &.{0});
@@ -784,7 +821,9 @@ test "RFC 9002 §6.1, a reordered ACK supersedes nothing and samples nothing" {
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     try sp.onAckReceived(&ack2, ms(200), .{}, &events);
     try expectNumbers(events.ackedPackets(), &.{ 0, 1, 2 });
     try testing.expectEqual(@as(u64, 2), sp.largest_acked.?);
@@ -800,7 +839,9 @@ test "RFC 9002 §6.1, a reordered ACK supersedes nothing and samples nothing" {
         .bytes = &.{},
         .ecn = null,
     };
-    var late_events: Events = .{};
+    var late_events_acked: [64]SentPacket = undefined;
+    var late_events_lost: [64]SentPacket = undefined;
+    var late_events: Events = .init(&late_events_acked, &late_events_lost);
     try sp.onAckReceived(&late, ms(500), .{}, &late_events);
     try testing.expectEqual(@as(usize, 0), late_events.acked_len);
     try testing.expectEqual(@as(u64, 2), sp.largest_acked.?);
@@ -819,7 +860,9 @@ test "RFC 9002 §6.2.1, the PTO period, its backoff, and its reset" {
     try testing.expectEqual(ms(10) + ms(240), timer.at);
 
     // A timeout doubles it.
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     const probe = try sp.onTimeout(.client, timer.at, .{}, &events);
     try testing.expectEqual(TimeoutKind.probe, probe.kind);
     try testing.expectEqual(@as(u8, 2), probe.probes);
@@ -860,7 +903,9 @@ test "RFC 9002 Appendix A.2 and A.8, two spaces share one estimator and one back
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     try initial.onAckReceived(&ack, ms(110), .{}, &events);
     try testing.expectEqual(ms(100), h.conn.rtt.latest);
     try testing.expectEqual(ms(100), handshake.rtt().latest);
@@ -881,7 +926,9 @@ test "RFC 9002 §6.2.1, a client keeps its backoff while it doubts the address" 
     var sp = h.space();
     try sp.onPacketSent(0, 0, true, true, 1200);
 
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     _ = try sp.onTimeout(.client, ms(1000), .{}, &events);
     try testing.expectEqual(@as(u5, 1), h.conn.pto_count);
 
@@ -910,7 +957,9 @@ test "RFC 9002 §6.2.2.1, a client with nothing in flight still arms a probe" {
     try testing.expectEqual(h.conn.rtt.ptoBase(), timer.at);
     try testing.expectEqual(ms(999), timer.at);
 
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     const probe = try sp.onTimeout(.client, timer.at, .{ .peer_address_validated = false }, &events);
     try testing.expectEqual(TimeoutKind.probe, probe.kind);
     // One anti-deadlock packet, not the two of a real PTO.
@@ -941,7 +990,9 @@ test "a fixed event sequence produces exactly one loss set" {
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     try sp.onAckReceived(&ack5, ms(110), .{}, &events);
     try expectNumbers(events.ackedPackets(), &.{5});
     try expectNumbers(events.lostPackets(), &.{ 0, 1, 2 });
@@ -956,7 +1007,9 @@ test "a fixed event sequence produces exactly one loss set" {
         .bytes = &.{},
         .ecn = null,
     };
-    var second: Events = .{};
+    var second_acked: [64]SentPacket = undefined;
+    var second_lost: [64]SentPacket = undefined;
+    var second: Events = .init(&second_acked, &second_lost);
     try sp.onAckReceived(&ack34, ms(150), .{}, &second);
     try expectNumbers(second.ackedPackets(), &.{ 3, 4 });
     try testing.expectEqual(@as(usize, 0), second.lost_len);
@@ -1043,7 +1096,9 @@ test "RFC 9002 §7.6.3, the worked example declares persistent congestion" {
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     try sp.onAckReceived(&ack1, ms(1) + 200_000, .{}, &events);
     try testing.expect(!events.persistent_congestion);
 
@@ -1088,7 +1143,9 @@ test "RFC 9002 §7.6.2, a run that is too quick is not persistent congestion" {
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Events = .{};
+    var events_acked: [64]SentPacket = undefined;
+    var events_lost: [64]SentPacket = undefined;
+    var events: Events = .init(&events_acked, &events_lost);
     try sp.onAckReceived(&ack, ms(4), .{}, &events);
     try expectNumbers(events.lostPackets(), &.{ 0, 1, 2 });
     try testing.expect(!events.persistent_congestion);

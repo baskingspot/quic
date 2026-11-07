@@ -335,7 +335,9 @@ test "RFC 9002 §7.3.2, Recovery's loss event halves the window exactly once" {
         .bytes = &.{},
         .ecn = null,
     };
-    var events: Recovery.Events = .{};
+    var events_acked: [64]Recovery.SentPacket = undefined;
+    var events_lost: [64]Recovery.SentPacket = undefined;
+    var events: Recovery.Events = .init(&events_acked, &events_lost);
     try space.onAckReceived(&ack, ms(30), .{}, &events);
     try testing.expectEqual(@as(usize, 3), events.lostPackets().len);
     try testing.expectEqual(@as(u32, 3600), events.lost_bytes);
