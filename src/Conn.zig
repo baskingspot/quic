@@ -323,8 +323,30 @@ pub const Opened = struct {
     /// here. This is what the caller has to handle itself, and it is the whole
     /// of it.
     frames: []frame.Frame,
+    /// The streams this packet changed, one record per stream, in the order
+    /// their first frame arrived. Borrowed from the caller's `stream_events`
+    /// list and empty when no STREAM frame changed what the application can
+    /// see.
+    streams: []const StreamEvent,
     /// The decrypted payload, borrowed from the caller's plaintext buffer.
     payload: []u8,
+};
+
+/// One stream a packet changed.
+///
+/// The machine knows both facts at the frame that caused them, and a caller
+/// otherwise re-derives them by walking the stream table after every packet
+/// (§3.2, §4.5). A record appears only when one of the two became true in this
+/// packet: a retransmitted frame, or one that fills a gap beyond the read
+/// point, changes nothing the caller can act on yet.
+pub const StreamEvent = struct {
+    stream_id: u64,
+    /// The contiguous run from the read point grew, so a read now returns bytes
+    /// it would not have returned before.
+    readable: bool,
+    /// The peer's FIN is known and this packet supplied the last byte of it, so
+    /// the stream is Data Recvd and a read runs to the final size.
+    finished: bool,
 };
 
 /// One packet number space: its keys, its counters, and the ranges it has
@@ -624,11 +646,17 @@ fn clear(self: *Conn, id: SpaceId) void {
 /// has to hold one record per packet the space has in flight, because a call
 /// that cannot describe every packet it clears refuses before it starts
 /// (RFC 9002 A.7). Size `events` at least as long as that space's table.
+///
+/// `stream_events` is the caller's storage for which streams this packet
+/// changed, one record per stream, returned in `Opened.streams`. It needs one
+/// entry per distinct stream a single packet may name, so a table's length is
+/// always enough.
 pub fn feed(
     self: *Conn,
     datagram: []u8,
     plaintext: []u8,
     frames: []frame.Frame,
+    stream_events: []StreamEvent,
     events: *Recovery.Events,
     now: Duration,
 ) Error!Opened {
@@ -637,7 +665,7 @@ pub fn feed(
     if (self.state != .open) return error.Closed;
 
     const raw = try self.open(try self.locate(datagram), plaintext);
-    const opened = try self.finish(raw, frames, events, now);
+    const opened = try self.finish(raw, frames, stream_events, events, now);
     self.commit(raw.id, raw.packet_number);
     return opened;
 }
@@ -747,6 +775,7 @@ fn finish(
     self: *Conn,
     raw: Raw,
     frames: []frame.Frame,
+    stream_events: []StreamEvent,
     events: *Recovery.Events,
     now: Duration,
 ) Error!Opened {
@@ -757,10 +786,16 @@ fn finish(
 
     var cursor: Cursor = .init(raw.payload);
     var count: usize = 0;
+    var stream_count: usize = 0;
     while (!cursor.atEnd()) {
         switch (try frame.read(&cursor)) {
             .crypto => |crypto| try self.feedCrypto(raw.id, crypto.offset, crypto.data),
-            .stream => |frame_stream| try self.onStreamFrame(raw.id, frame_stream),
+            .stream => |frame_stream| try self.onStreamFrame(
+                raw.id,
+                frame_stream,
+                stream_events,
+                &stream_count,
+            ),
             .ack => |ack| try self.onAck(raw.id, ack, events, now),
             .padding => {},
             .connection_close => |value| {
@@ -787,6 +822,7 @@ fn finish(
         .header_len = raw.header_len,
         .packet_len = raw.packet_len,
         .frames = frames[0..count],
+        .streams = stream_events[0..stream_count],
         .payload = raw.payload,
     };
 }
@@ -916,6 +952,7 @@ pub const Datagram = struct {
         conn: *Conn,
         plaintext: []u8,
         frames: []frame.Frame,
+        stream_events: []StreamEvent,
         events: *Recovery.Events,
         now: Duration,
     ) Error!?Opened {
@@ -948,7 +985,7 @@ pub const Datagram = struct {
             // Once the packet opened, a bad frame is a connection error, not a
             // packet to skip: the peer's own bytes arrived intact and say
             // something invalid (§12.4).
-            const opened = try conn.finish(raw, frames, events, now);
+            const opened = try conn.finish(raw, frames, stream_events, events, now);
             conn.commit(raw.id, raw.packet_number);
             return opened;
         }
@@ -1301,12 +1338,24 @@ fn streamFinished(entry: *const Stream) bool {
     };
 }
 
-fn onStreamFrame(self: *Conn, space: SpaceId, frame_stream: frame.Stream) Error!void {
+fn onStreamFrame(
+    self: *Conn,
+    space: SpaceId,
+    frame_stream: frame.Stream,
+    stream_events: []StreamEvent,
+    stream_count: *usize,
+) Error!void {
     // §12.4: Initial and Handshake packets carry no STREAM frames.
     if (space != .app) return error.WrongFrameSpace;
 
     const entry = try self.streamFor(frame_stream.id);
     const before = entry.recv.highest;
+    // §3.2: what the application can see is the contiguous run from its read
+    // point, so that end and the Data Recvd state are what a report is about.
+    // Both are read before the frame lands; the transitions afterwards are the
+    // facts the caller could not have known.
+    const readable_before = entry.recv.contiguous_end;
+    const done_before = entry.recv.state == .data_recvd;
     switch (try entry.recv.onData(frame_stream.offset, frame_stream.data, frame_stream.fin)) {
         .accepted => {},
         // The ring is smaller than the window this stream advertised. The
@@ -1323,6 +1372,35 @@ fn onStreamFrame(self: *Conn, space: SpaceId, frame_stream: frame.Stream) Error!
     // trusting a reordering inside `ReceiveStream` never to lower it.
     std.debug.assert(entry.recv.highest >= before);
     try self.receive_window.onStreamProgress(entry.recv.highest - before);
+
+    const news: StreamEvent = .{
+        .stream_id = frame_stream.id,
+        .readable = entry.recv.contiguous_end > readable_before,
+        .finished = entry.recv.state == .data_recvd and !done_before,
+    };
+    // A frame that only filled a gap beyond the read point, or repeated bytes,
+    // changes no answer the application can see yet.
+    if (!news.readable and !news.finished) return;
+    try noteStreamEvent(stream_events, stream_count, news);
+}
+
+/// Record one stream's change in the caller's list.
+///
+/// One record per stream: a packet may carry several frames for one stream, and
+/// the flags are facts about the packet rather than about the frame. A list too
+/// small to name a stream the packet changed is `error.NoSpace`, never a
+/// silently missing record.
+fn noteStreamEvent(events: []StreamEvent, count: *usize, event: StreamEvent) Error!void {
+    for (events[0..count.*]) |*existing| {
+        if (existing.stream_id != event.stream_id) continue;
+        existing.readable = existing.readable or event.readable;
+        existing.finished = existing.finished or event.finished;
+        return;
+    }
+
+    if (count.* == events.len) return error.NoSpace;
+    events[count.*] = event;
+    count.* += 1;
 }
 
 /// One stream's share of a packet: how much of it the caller wants written, in
@@ -2011,11 +2089,12 @@ test "RFC 9000 §6.2, a version negotiation counts only before the server has sp
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     var datagram: [256]u8 = undefined;
     var plaintext: [256]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     const sent = try server.writeFrames(.initial, &pings(1), &datagram, .data(0));
-    _ = try answered.feed(datagram[0..sent], &plaintext, &frames, &report, 0);
+    _ = try answered.feed(datagram[0..sent], &plaintext, &frames, &stream_events, &report, 0);
     try testing.expectEqual(
         setup.VersionNegotiation.Action.ignore,
         try answered.onVersionNegotiation(&offers),
@@ -2252,9 +2331,10 @@ test "RFC 9000 §17.2.5.3, a Retry rekeys the Initial space and keeps its packet
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     var plaintext: [512]u8 = undefined;
     var frames_in: [8]frame.Frame = undefined;
-    const opened = try server.feed(datagram[0..resent], &plaintext, &frames_in, &report, 0);
+    const opened = try server.feed(datagram[0..resent], &plaintext, &frames_in, &stream_events, &report, 0);
     try testing.expectEqual(.initial, opened.space);
     try testing.expectEqual(@as(u64, 1), opened.packet_number);
 }
@@ -2306,7 +2386,8 @@ test "RFC 9000 §17.2.5.2, a Retry that is not ours, or is late, is ignored" {
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
-    _ = try client.feed(datagram[0..sent], &plaintext, &frames, &report, 0);
+    var stream_events: [16]StreamEvent = undefined;
+    _ = try client.feed(datagram[0..sent], &plaintext, &frames, &stream_events, &report, 0);
 
     const length = try setup.Retry.write(&retry_bytes, &dcid, .{
         .destination_connection_id = &client_scid,
@@ -2354,6 +2435,7 @@ test "RFC 9000 §4.6, a finished stream returns its credit as MAX_STREAMS" {
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
@@ -2373,7 +2455,7 @@ test "RFC 9000 §4.6, a finished stream returns its credit as MAX_STREAMS" {
         .length_present = true,
     } });
     const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
-    _ = try server.feed(datagram[0..sent], &plaintext, &frames, &report, 0);
+    _ = try server.feed(datagram[0..sent], &plaintext, &frames, &stream_events, &report, 0);
 
     // The receive half has every byte but the application has not read it, so
     // the stream is not finished and freeing its slot is refused: a peer's next
@@ -2574,12 +2656,20 @@ test "fuzz the datagram walk" {
             var acked: [16]Recovery.SentPacket = undefined;
             var lost: [16]Recovery.SentPacket = undefined;
             var report: Recovery.Events = .init(&acked, &lost);
+            var stream_events: [16]StreamEvent = undefined;
             var plaintext: [1500]u8 = undefined;
             var frames: [16]frame.Frame = undefined;
 
             var walk: Datagram = .init(input);
             while (true) {
-                const opened = walk.next(&conn, &plaintext, &frames, &report, 0) catch |err| switch (err) {
+                const opened = walk.next(
+                    &conn,
+                    &plaintext,
+                    &frames,
+                    &stream_events,
+                    &report,
+                    0,
+                ) catch |err| switch (err) {
                     // §12.4: a frame inside a packet that opened is a connection
                     // error, which is a value here, not a crash.
                     error.NoSpace => return,
@@ -2655,6 +2745,7 @@ test "RFC 9000 §19.8, a packed packet reports its number and the frames it carr
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
 
     const flight = (try client.writeStreams(.{
         .offers = &offers,
@@ -2677,7 +2768,7 @@ test "RFC 9000 §19.8, a packed packet reports its number and the frames it carr
     try testing.expectEqual(Consumed{ .taken = 2, .partial = 0 }, flight.consumed);
 
     // The peer reads both streams out of that one packet.
-    _ = try server.feed(datagram[0..flight.length], &plaintext, &parsed, &report, 0);
+    _ = try server.feed(datagram[0..flight.length], &plaintext, &parsed, &stream_events, &report, 0);
     const received = server.stream(4) orelse return error.TestUnexpectedResult;
     var read: [16]u8 = undefined;
     const count = try received.recv.readInto(&read);
@@ -2687,7 +2778,7 @@ test "RFC 9000 §19.8, a packed packet reports its number and the frames it carr
     // names, which is the whole point: the caller's record of packet 0 can now
     // be dropped, or that record can be resent if packet 0 is declared lost.
     const ack = try server.writeAck(.app, &datagram, 0);
-    _ = try client.feed(datagram[0..ack], &plaintext, &parsed, &report, 0);
+    _ = try client.feed(datagram[0..ack], &plaintext, &parsed, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 1), report.ackedPackets().len);
     try testing.expectEqual(flight.number, report.ackedPackets()[0].packet_number);
 }
@@ -2839,6 +2930,7 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -2867,7 +2959,7 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     var frames: [8]frame.Frame = undefined;
 
     const sent = try client.writeFrames(.initial, &payload, &datagram, .data(0));
-    const at_server = try server.feed(datagram[0..sent], &plaintext, &frames, &report, 0);
+    const at_server = try server.feed(datagram[0..sent], &plaintext, &frames, &stream_events, &report, 0);
     try testing.expectEqual(.initial, at_server.space);
     try testing.expectEqual(@as(u64, 0), at_server.packet_number);
     // §19.1 and §19.2: padding and PING have nothing for the machine to do, so
@@ -2882,7 +2974,7 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
 
     // §13.2: the acknowledgment is the machine's to act on, so it leaves the
     // packet as a sent-packet record rather than as an event for the caller.
-    const at_client = try client.feed(datagram[0..ack_len], &plaintext, &frames, &report, 0);
+    const at_client = try client.feed(datagram[0..ack_len], &plaintext, &frames, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 0), at_client.frames.len);
     try testing.expectEqual(@as(usize, 1), report.ackedPackets().len);
     try testing.expectEqual(@as(u64, 0), report.ackedPackets()[0].packet_number);
@@ -2893,6 +2985,7 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 3, 1, 4, 1, 5 };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -2924,7 +3017,7 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     var frames: [8]frame.Frame = undefined;
 
     const sent = try client.writeFrames(.handshake, &payload, &datagram, .data(0));
-    const opened = try server.feed(datagram[0..sent], &plaintext, &frames, &report, 0);
+    const opened = try server.feed(datagram[0..sent], &plaintext, &frames, &stream_events, &report, 0);
 
     try testing.expectEqual(.handshake, opened.space);
     try testing.expectEqual(@as(usize, 3), opened.frames.len);
@@ -2941,7 +3034,7 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     // record and leaves the Initial space alone, which is what makes the
     // acknowledgment land in the right space's loss state.
     const ack_len = try server.writeAck(.handshake, &datagram, 0);
-    const at_client = try client.feed(datagram[0..ack_len], &plaintext, &frames, &report, 0);
+    const at_client = try client.feed(datagram[0..ack_len], &plaintext, &frames, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 0), at_client.frames.len);
     try testing.expectEqual(@as(usize, 1), report.ackedPackets().len);
     try testing.expectEqual(@as(usize, 0), client.handshake.?.recovery.inFlight().len);
@@ -2952,6 +3045,7 @@ test "RFC 9000 §12.3, a space with no keys is an error and not a second kind of
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 2, 7, 1, 8 };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -2982,7 +3076,14 @@ test "RFC 9000 §12.3, a space with no keys is an error and not a second kind of
     var frames: [8]frame.Frame = undefined;
     const sent = try client.writeFrames(.handshake, &payload, &datagram, .data(0));
 
-    try testing.expectError(error.NoKeys, server.feed(datagram[0..sent], &plaintext, &frames, &report, 0));
+    try testing.expectError(error.NoKeys, server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
     try testing.expectError(error.NoKeys, server.writeFrames(.handshake, "\x01", &datagram, .data(0)));
     try testing.expectError(error.NoKeys, server.writeAck(.app, &datagram, 0));
     // Nothing was recorded, so nothing is owed.
@@ -3027,6 +3128,7 @@ test "RFC 9000 §17.2.2.1, a packet for a discarded space is dropped and the con
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0xe1, 0xe2 };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -3057,7 +3159,7 @@ test "RFC 9000 §17.2.2.1, a packet for a discarded space is dropped and the con
     // once it processes a Handshake packet. It does, and then the late Initial
     // that arrives next is dropped rather than decrypted under a dead key.
     const stale = try client.writeFrames(.initial, &payload, &datagram, .data(0));
-    _ = try server.feed(datagram[0..stale], &plaintext, &frames, &report, 0);
+    _ = try server.feed(datagram[0..stale], &plaintext, &frames, &stream_events, &report, 0);
     try server.discard(.initial);
     try testing.expectError(error.NoKeys, server.spaceFor(.initial));
     try testing.expect(!server.ackOwed(.initial));
@@ -3065,20 +3167,20 @@ test "RFC 9000 §17.2.2.1, a packet for a discarded space is dropped and the con
 
     const late = try client.writeFrames(.initial, &payload, &datagram, .data(0));
     var walk: Datagram = .init(datagram[0..late]);
-    try testing.expect((try walk.next(&server, &plaintext, &frames, &report, 0)) == null);
+    try testing.expect((try walk.next(&server, &plaintext, &frames, &stream_events, &report, 0)) == null);
     try testing.expectEqual(@as(u16, 1), walk.dropped);
 
     // The rest of the connection is untouched: the Handshake space opens what
     // the client sends there, because the connection IDs are the connection's.
     const handshake = try client.writeFrames(.handshake, &payload, &datagram, .data(0));
-    const opened = try server.feed(datagram[0..handshake], &plaintext, &frames, &report, 0);
+    const opened = try server.feed(datagram[0..handshake], &plaintext, &frames, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 3), opened.frames.len);
     try testing.expectEqual(@as(?u64, 0), server.handshake.?.largest_received);
 
     // And the server can still write: discarding a space does not take the
     // connection's identity or its packet number width with it.
     const ack = try server.writeAck(.handshake, &datagram, 0);
-    const at_client = try client.feed(datagram[0..ack], &plaintext, &frames, &report, 0);
+    const at_client = try client.feed(datagram[0..ack], &plaintext, &frames, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 0), at_client.frames.len);
     try testing.expectEqual(@as(usize, 1), report.ackedPackets().len);
     try testing.expectEqual(@as(usize, 0), client.handshake.?.recovery.inFlight().len);
@@ -3112,6 +3214,7 @@ test "RFC 9000 §17.3.1, the application space writes a short header and opens o
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     // A short header omits the connection ID length, so the two ends have to
     // agree on it: the client names the server's ID and the server names the
     // client's.
@@ -3149,7 +3252,7 @@ test "RFC 9000 §17.3.1, the application space writes a short header and opens o
     try testing.expectEqual(@as(u8, 0x00), datagram[0] & 0x80);
     try testing.expectEqualSlices(u8, &server_id, datagram[1..][0..server_id.len]);
 
-    const opened = try server.feed(datagram[0..sent], &plaintext, &events, &report, 0);
+    const opened = try server.feed(datagram[0..sent], &plaintext, &events, &stream_events, &report, 0);
     try testing.expectEqual(.app, opened.space);
     try testing.expectEqual(@as(usize, 2), opened.frames.len);
     try testing.expectEqual(@as(?u64, 0), server.app.?.largest_received);
@@ -3216,6 +3319,7 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x71, 0x72 };
     const client_secret: [protection.secret_length]u8 = @splat(0x5a);
     const server_secret: [protection.secret_length]u8 = @splat(0x5b);
@@ -3291,7 +3395,7 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
 
     // The server unprotects it, reassembles the CRYPTO frame, and hands the
     // bytes to its driver at the level the packet belonged to.
-    const at_server = try server.feed(datagram[0..first], &plaintext, &events, &report, 0);
+    const at_server = try server.feed(datagram[0..first], &plaintext, &events, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 0), at_server.frames.len);
     try testing.expectEqual(seam.Level.initial, server_stub.fed_level.?);
     try testing.expectEqualStrings(hello, server_stub.fed[0..server_stub.fed_len]);
@@ -3310,7 +3414,7 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
     try testing.expect(client.handshake != null);
     try testing.expectEqual(@as(?Space, null), client.initial);
 
-    const at_server_handshake = try server.feed(datagram[0..second], &plaintext, &events, &report, 0);
+    const at_server_handshake = try server.feed(datagram[0..second], &plaintext, &events, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 0), at_server_handshake.frames.len);
     try testing.expectEqual(seam.Level.handshake, server_stub.fed_level.?);
     // A new level starts its CRYPTO stream at zero again (§19.6).
@@ -3324,7 +3428,7 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
 
     const app_payload = pings(2);
     const app_packet = try client.writeFrames(.app, &app_payload, &datagram, .data(0));
-    const opened_app = try server.feed(datagram[0..app_packet], &plaintext, &events, &report, 0);
+    const opened_app = try server.feed(datagram[0..app_packet], &plaintext, &events, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 2), opened_app.frames.len);
 
     // §4.9.2: confirmation takes the Handshake keys, and 1-RTT carries on.
@@ -3430,6 +3534,7 @@ test "RFC 9000 §19.6, CRYPTO frames that arrive out of order reach the driver i
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x61, 0x62 };
     const client_secret: [protection.secret_length]u8 = @splat(0x31);
     const server_secret: [protection.secret_length]u8 = @splat(0x32);
@@ -3467,14 +3572,14 @@ test "RFC 9000 §19.6, CRYPTO frames that arrive out of order reach the driver i
     var writer: Writer = .init(&payload);
     try frame.write(&writer, .{ .crypto = .{ .offset = 6, .data = "world" } });
     const sent_late = try client.writeFrames(.initial, writer.written(), &datagram, .data(0));
-    _ = try server.feed(datagram[0..sent_late], &plaintext, &events, &report, 0);
+    _ = try server.feed(datagram[0..sent_late], &plaintext, &events, &stream_events, &report, 0);
     try testing.expectEqual(@as(u32, 0), stub.fed_calls);
 
     // The frame before it fills the gap and both halves leave in order.
     var head_writer: Writer = .init(&payload);
     try frame.write(&head_writer, .{ .crypto = .{ .offset = 0, .data = "hello " } });
     const sent_early = try client.writeFrames(.initial, head_writer.written(), &datagram, .data(0));
-    const opened = try server.feed(datagram[0..sent_early], &plaintext, &events, &report, 0);
+    const opened = try server.feed(datagram[0..sent_early], &plaintext, &events, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 0), opened.frames.len);
     try testing.expectEqual(@as(u32, 1), stub.fed_calls);
     try testing.expectEqualStrings("hello world", stub.fed[0..stub.fed_len]);
@@ -3484,6 +3589,7 @@ test "RFC 9000 §12.4, a frame that will not parse is an error and not a dropped
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{0x63};
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -3512,7 +3618,14 @@ test "RFC 9000 §12.4, a frame that will not parse is an error and not a dropped
     // The packet opened: its bytes are the peer's and they say something
     // invalid, which closes the connection (§12.4). Nothing is dropped.
     var walk: Datagram = .init(datagram[0..sent]);
-    try testing.expectError(error.UnknownFrameType, walk.next(&server, &plaintext, &events, &report, 0));
+    try testing.expectError(error.UnknownFrameType, walk.next(
+        &server,
+        &plaintext,
+        &events,
+        &stream_events,
+        &report,
+        0,
+    ));
     try testing.expectEqual(@as(u16, 0), walk.dropped);
     // §13.2: a packet the machine did not process is not one it acknowledges,
     // so the range table never heard about this number.
@@ -3522,7 +3635,14 @@ test "RFC 9000 §12.4, a frame that will not parse is an error and not a dropped
     // The same through one packet. Unprotecting mutates the datagram, so this
     // is a fresh packet rather than the same bytes again.
     const again = try client.writeFrames(.initial, &bad, &datagram, .data(0));
-    try testing.expectError(error.UnknownFrameType, server.feed(datagram[0..again], &plaintext, &events, &report, 0));
+    try testing.expectError(error.UnknownFrameType, server.feed(
+        datagram[0..again],
+        &plaintext,
+        &events,
+        &stream_events,
+        &report,
+        0,
+    ));
 }
 
 test "a stream configuration that cannot hold its own limits is refused" {
@@ -3587,6 +3707,7 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x21, 0x22 };
     var ring: [64]u8 = undefined;
     var slots: [2]StreamTable.Slot = undefined;
@@ -3631,7 +3752,7 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
     } });
     const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
 
-    const opened = try server.feed(datagram[0..sent], &plaintext, &events, &report, 0);
+    const opened = try server.feed(datagram[0..sent], &plaintext, &events, &stream_events, &report, 0);
     // The machine has a home for STREAM frames now, so none come back.
     try testing.expectEqual(@as(usize, 0), opened.frames.len);
 
@@ -3646,10 +3767,162 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
     try testing.expectEqual(@as(u64, 12), server.receive_window.used);
 }
 
+test "RFC 9000 §3.2, a packet reports the streams it made readable" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [8]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x31, 0x32 };
+    var rings: [2][64]u8 = .{ undefined, undefined };
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &rings[0], .recv_limit_bytes = 64 },
+        .{ .recv_buffer = &rings[1], .recv_limit_bytes = 64 },
+    };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x3a},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x3a},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 1024,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x35);
+    const server_secret: [protection.secret_length]u8 = @splat(0x36);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var payload: [128]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var writer: Writer = .init(&payload);
+
+    // In order and without FIN: the stream is readable for the first time.
+    try frame.write(&writer, .{ .stream = .{
+        .id = 4,
+        .offset = 0,
+        .data = "hello",
+        .fin = false,
+        .length_present = true,
+    } });
+    const first_sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const first = try server.feed(datagram[0..first_sent], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(@as(usize, 1), first.streams.len);
+    try testing.expectEqual(@as(u64, 4), first.streams[0].stream_id);
+    try testing.expect(first.streams[0].readable);
+    try testing.expect(!first.streams[0].finished);
+
+    // Past a gap: the bytes are held, and nothing the application can read has
+    // changed, so there is no record and no reason to look at the stream.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 4,
+        .offset = 10,
+        .data = "world",
+        .fin = false,
+        .length_present = true,
+    } });
+    const held_sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const held = try server.feed(datagram[0..held_sent], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(@as(usize, 0), held.streams.len);
+
+    // Filling the gap joins the two runs into one readable extent.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 4,
+        .offset = 5,
+        .data = "abcde",
+        .fin = false,
+        .length_present = true,
+    } });
+    const joined_sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const joined = try server.feed(datagram[0..joined_sent], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(@as(usize, 1), joined.streams.len);
+    try testing.expect(joined.streams[0].readable);
+    try testing.expect(!joined.streams[0].finished);
+
+    // §3.2: the FIN arrives alone at the final size, which completes the
+    // stream. That is the second fact, and the stream is not readable again.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 4,
+        .offset = 15,
+        .data = "",
+        .fin = true,
+        .length_present = true,
+    } });
+    const done_sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const done = try server.feed(datagram[0..done_sent], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(@as(usize, 1), done.streams.len);
+    try testing.expect(!done.streams[0].readable);
+    try testing.expect(done.streams[0].finished);
+
+    // A retransmission the peer sent before its acknowledgment arrived is
+    // accepted and reported to nobody: it changed no answer.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 4,
+        .offset = 0,
+        .data = "hello",
+        .fin = false,
+        .length_present = true,
+    } });
+    const again_sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const again = try server.feed(datagram[0..again_sent], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(@as(usize, 0), again.streams.len);
+
+    // One record per stream: two frames for stream 8 in one packet are one
+    // fact, with the FIN making both flags true.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 8,
+        .offset = 0,
+        .data = "ab",
+        .fin = false,
+        .length_present = true,
+    } });
+    try frame.write(&writer, .{ .stream = .{
+        .id = 8,
+        .offset = 2,
+        .data = "cd",
+        .fin = true,
+        .length_present = true,
+    } });
+    const pair_sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const pair = try server.feed(datagram[0..pair_sent], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(@as(usize, 1), pair.streams.len);
+    try testing.expectEqual(@as(u64, 8), pair.streams[0].stream_id);
+    try testing.expect(pair.streams[0].readable);
+    try testing.expect(pair.streams[0].finished);
+
+    // A list with no room refuses instead of losing the fact.
+    var none: [0]StreamEvent = .{};
+    var count: usize = 0;
+    try testing.expectError(error.NoSpace, noteStreamEvent(&none, &count, .{
+        .stream_id = 0,
+        .readable = true,
+        .finished = false,
+    }));
+    try testing.expectEqual(@as(usize, 0), count);
+}
+
 test "RFC 9000 §4.2, reading a ring is what makes a window raise due" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{0x24};
     var ring: [64]u8 = undefined;
     var slots: [1]StreamTable.Slot = undefined;
@@ -3694,7 +3967,7 @@ test "RFC 9000 §4.2, reading a ring is what makes a window raise due" {
         .length_present = true,
     } });
     const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
-    _ = try server.feed(datagram[0..sent], &plaintext, &events, &report, 0);
+    _ = try server.feed(datagram[0..sent], &plaintext, &events, &stream_events, &report, 0);
 
     // §4.2: arriving bytes open nothing. The window is tied to what the
     // application consumed, so a peer cannot make the receiver advertise credit
@@ -3735,6 +4008,7 @@ test "RFC 9000 §4.6, a full stream table is peer-visible and not a dropped pack
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{0x23};
     var ring: [64]u8 = undefined;
     var slots: [1]StreamTable.Slot = undefined;
@@ -3790,7 +4064,7 @@ test "RFC 9000 §4.6, a full stream table is peer-visible and not a dropped pack
     // §4.6: the connection closes with STREAM_LIMIT_ERROR, so the caller must
     // see it. The walk does not swallow it the way it swallows a bad tag.
     var walk: Datagram = .init(datagram[0..sent]);
-    try testing.expectError(error.StreamLimit, walk.next(&server, &plaintext, &events, &report, 0));
+    try testing.expectError(error.StreamLimit, walk.next(&server, &plaintext, &events, &stream_events, &report, 0));
     try testing.expectEqual(@as(u16, 0), walk.dropped);
 }
 
@@ -3798,6 +4072,7 @@ test "RFC 9000 §4.1, a peer past the stream limit is a connection error" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x24, 0x25 };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -3841,7 +4116,14 @@ test "RFC 9000 §4.1, a peer past the stream limit is a connection error" {
     } });
     const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
 
-    try testing.expectError(error.FlowControl, server.feed(datagram[0..sent], &plaintext, &events, &report, 0));
+    try testing.expectError(error.FlowControl, server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &events,
+        &stream_events,
+        &report,
+        0,
+    ));
     // The connection window was not touched: the stream refused it first.
     try testing.expectEqual(@as(u64, 0), server.receive_window.used);
 }
@@ -3850,6 +4132,7 @@ test "RFC 9000 §4.1, a peer past the connection limit is a connection error" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x26, 0x27 };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -3904,7 +4187,14 @@ test "RFC 9000 §4.1, a peer past the connection limit is a connection error" {
     } });
     const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
 
-    try testing.expectError(error.FlowControl, server.feed(datagram[0..sent], &plaintext, &events, &report, 0));
+    try testing.expectError(error.FlowControl, server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &events,
+        &stream_events,
+        &report,
+        0,
+    ));
     // The first stream's five bytes were counted before the second blew it.
     try testing.expectEqual(@as(u64, 5), server.receive_window.used);
 }
@@ -3913,6 +4203,7 @@ test "RFC 9000 §12.4, a STREAM frame in an Initial packet is a connection error
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{0x28};
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -3951,7 +4242,14 @@ test "RFC 9000 §12.4, a STREAM frame in an Initial packet is a connection error
     } });
     const sent = try client.writeFrames(.initial, writer.written(), &datagram, .data(0));
 
-    try testing.expectError(error.WrongFrameSpace, server.feed(datagram[0..sent], &plaintext, &events, &report, 0));
+    try testing.expectError(error.WrongFrameSpace, server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &events,
+        &stream_events,
+        &report,
+        0,
+    ));
     try testing.expect(server.stream(0) == null);
 }
 
@@ -3959,6 +4257,7 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x29, 0x2a };
     var send_buffer: [64]u8 = undefined;
     var client_ring: [64]u8 = undefined;
@@ -4026,7 +4325,7 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
     try testing.expect(flight.frames[0].fin);
     try testing.expectEqual(Consumed{ .taken = 1, .partial = 0 }, flight.consumed);
 
-    _ = try server.feed(datagram[0..flight.length], &plaintext, &events, &report, 0);
+    _ = try server.feed(datagram[0..flight.length], &plaintext, &events, &stream_events, &report, 0);
 
     const received = server.stream(0) orelse
         return error.TestUnexpectedResult;
@@ -4046,6 +4345,7 @@ test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram"
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x0d, 0x0e };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -4079,20 +4379,20 @@ test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram"
     var plaintext: [512]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
-    const first = (try datagram.next(&client, &plaintext, &events, &report, 0)) orelse
+    const first = (try datagram.next(&client, &plaintext, &events, &stream_events, &report, 0)) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqual(.initial, first.space);
     try testing.expectEqual(@as(usize, 3), first.frames.len);
     try testing.expectEqual(@as(?u64, 0), client.initial.?.largest_received);
     try testing.expectEqual(@as(?u64, null), client.handshake.?.largest_received);
 
-    const second = (try datagram.next(&client, &plaintext, &events, &report, 0)) orelse
+    const second = (try datagram.next(&client, &plaintext, &events, &stream_events, &report, 0)) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqual(.handshake, second.space);
     try testing.expectEqual(@as(usize, 2), second.frames.len);
     try testing.expectEqual(@as(?u64, 0), client.handshake.?.largest_received);
 
-    try testing.expect((try datagram.next(&client, &plaintext, &events, &report, 0)) == null);
+    try testing.expect((try datagram.next(&client, &plaintext, &events, &stream_events, &report, 0)) == null);
     try testing.expectEqual(@as(u16, 0), datagram.dropped);
     // Both spaces are accounted for separately, which is what the client needs
     // to answer each level with an ACK of its own (§13.2.1).
@@ -4104,6 +4404,7 @@ test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next i
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x1d, 0x1e };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -4136,7 +4437,7 @@ test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next i
 
     var plaintext: [512]u8 = undefined;
     var events: [8]frame.Frame = undefined;
-    const opened = (try datagram.next(&client, &plaintext, &events, &report, 0)) orelse
+    const opened = (try datagram.next(&client, &plaintext, &events, &stream_events, &report, 0)) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqual(.handshake, opened.space);
     try testing.expectEqual(@as(usize, 2), opened.frames.len);
@@ -4151,6 +4452,7 @@ test "RFC 9000 §12.2, a short header ends the datagram and nothing is read past
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const server_id = [_]u8{ 0x31, 0x32 };
     const client_id = [_]u8{ 0x41, 0x42 };
     var client_loss: LossTables = .{};
@@ -4182,17 +4484,17 @@ test "RFC 9000 §12.2, a short header ends the datagram and nothing is read past
 
     var plaintext: [512]u8 = undefined;
     var events: [8]frame.Frame = undefined;
-    const initial = (try datagram.next(&server, &plaintext, &events, &report, 0)) orelse
+    const initial = (try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqual(.initial, initial.space);
     try testing.expectEqual(@as(usize, 2), initial.frames.len);
-    const app = (try datagram.next(&server, &plaintext, &events, &report, 0)) orelse
+    const app = (try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqual(.app, app.space);
     try testing.expectEqual(@as(usize, 3), app.frames.len);
     // The whole tail of the datagram belonged to that packet.
     try testing.expectEqual(@as(u32, @intCast(app_len)), app.packet_len);
-    try testing.expect((try datagram.next(&server, &plaintext, &events, &report, 0)) == null);
+    try testing.expect((try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) == null);
     try testing.expectEqual(@as(u16, 0), datagram.dropped);
 }
 
@@ -4200,6 +4502,7 @@ test "RFC 9000 §12.2, bytes with no readable end stop the walk without an error
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{0x5d};
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -4228,10 +4531,10 @@ test "RFC 9000 §12.2, bytes with no readable end stop the walk without an error
 
     var plaintext: [512]u8 = undefined;
     var events: [8]frame.Frame = undefined;
-    const opened = (try datagram.next(&server, &plaintext, &events, &report, 0)) orelse
+    const opened = (try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqual(@as(usize, 3), opened.frames.len);
-    try testing.expect((try datagram.next(&server, &plaintext, &events, &report, 0)) == null);
+    try testing.expect((try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) == null);
     try testing.expectEqual(@as(u16, 1), datagram.dropped);
 }
 
@@ -4239,6 +4542,7 @@ test "RFC 9000 §12.2, coalesced packets: only the first is taken, the length sa
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 1, 2, 3 };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -4263,13 +4567,13 @@ test "RFC 9000 §12.2, coalesced packets: only the first is taken, the length sa
     const first = try client.writeFrames(.initial, &pings(2), &combined, .data(0));
     const second = try client.writeFrames(.initial, &pings(2), combined[first..], .data(0));
 
-    const opened = try server.feed(&combined, &plaintext, &events, &report, 0);
+    const opened = try server.feed(&combined, &plaintext, &events, &stream_events, &report, 0);
     try testing.expectEqual(@as(u32, @intCast(first)), opened.packet_len);
     try testing.expectEqual(@as(u64, 0), opened.packet_number);
 
     // The caller continues where the machine said the packet ended.
     const tail = combined[opened.packet_len..][0 .. first + second - opened.packet_len];
-    const next = try server.feed(tail, &plaintext, &events, &report, 0);
+    const next = try server.feed(tail, &plaintext, &events, &stream_events, &report, 0);
     try testing.expectEqual(@as(u64, 1), next.packet_number);
 }
 
@@ -4277,6 +4581,7 @@ test "RFC 9001 §5.5, a packet that will not unprotect changes nothing" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 4, 5, 6 };
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -4304,7 +4609,7 @@ test "RFC 9001 §5.5, a packet that will not unprotect changes nothing" {
     datagram[sent - 20] ^= 0x01;
     try testing.expectError(
         error.AuthenticationFailed,
-        server.feed(datagram[0..sent], &plaintext, &events, &report, 0),
+        server.feed(datagram[0..sent], &plaintext, &events, &stream_events, &report, 0),
     );
     try testing.expect(!server.ackOwed(.initial));
     try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
@@ -4349,6 +4654,7 @@ test "RFC 9002 §6.1.1, an acknowledgment is what declares the gap lost" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
 
     var client_loss: LossTables = .{};
     var client: Conn = .init(.{
@@ -4381,12 +4687,12 @@ test "RFC 9002 §6.1.1, an acknowledgment is what declares the gap lost" {
     try testing.expectEqual(@as(usize, 3), client.initial.?.recovery.inFlight().len);
 
     const fourth = try client.writeFrames(.initial, &pings(1), &datagram, .data(ms(10)));
-    _ = try server.feed(datagram[0..fourth], &plaintext, &frames, &report, ms(20));
+    _ = try server.feed(datagram[0..fourth], &plaintext, &frames, &stream_events, &report, ms(20));
     const ack_len = try server.writeAck(.initial, &datagram, ms(20));
 
     // §6.1.1: three packets newer than 0 are not needed; one acknowledgment of
     // packet 3 with nothing else in flight puts packet 0 outside the threshold.
-    const at_client = try client.feed(datagram[0..ack_len], &plaintext, &frames, &report, ms(20));
+    const at_client = try client.feed(datagram[0..ack_len], &plaintext, &frames, &stream_events, &report, ms(20));
     try testing.expectEqual(@as(usize, 0), at_client.frames.len);
     try testing.expectEqual(@as(usize, 1), report.ackedPackets().len);
     try testing.expectEqual(@as(u64, 3), report.ackedPackets()[0].packet_number);
@@ -4505,6 +4811,7 @@ test "RFC 9000 §19.3.1, an acknowledgment of a packet never sent is a connectio
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
@@ -4518,7 +4825,7 @@ test "RFC 9000 §19.3.1, an acknowledgment of a packet never sent is a connectio
 
     try testing.expectError(
         error.InvalidAckRange,
-        client.feed(datagram[0..ack_len], &plaintext, &frames, &report, 0),
+        client.feed(datagram[0..ack_len], &plaintext, &frames, &stream_events, &report, 0),
     );
     // The acknowledgement was refused before the estimator moved.
     try testing.expectEqual(@as(bool, false), client_loss.shared.rtt.first);
@@ -4588,6 +4895,7 @@ test "RFC 9000 §18.2, a received ACK delay is scaled by this endpoint's exponen
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
@@ -4607,7 +4915,7 @@ test "RFC 9000 §18.2, a received ACK delay is scaled by this endpoint's exponen
     } });
     const quiet: Write = .{ .now = 0, .ack_eliciting = false, .in_flight = false };
     const first = try server.writeFrames(.initial, writer.written(), &datagram, quiet);
-    _ = try client.feed(datagram[0..first], &plaintext, &frames, &report, ms(100));
+    _ = try client.feed(datagram[0..first], &plaintext, &frames, &stream_events, &report, ms(100));
     try testing.expectEqual(ms(100), client_loss.shared.rtt.smoothed);
 
     // A second sample of 200ms whose ACK reports 1000 microseconds: at exponent
@@ -4624,7 +4932,7 @@ test "RFC 9000 §18.2, a received ACK delay is scaled by this endpoint's exponen
         .ecn = null,
     } });
     const second = try server.writeFrames(.initial, writer.written(), &datagram, quiet);
-    _ = try client.feed(datagram[0..second], &plaintext, &frames, &report, ms(300));
+    _ = try client.feed(datagram[0..second], &plaintext, &frames, &stream_events, &report, ms(300));
     // `latest` is the raw sample; the delay is subtracted from the value the
     // average takes (§5.3), not from the round trip itself.
     try testing.expectEqual(ms(200), client_loss.shared.rtt.latest);
@@ -4653,6 +4961,7 @@ test "RFC 9000 §10.2.1, a close is written once and nothing is processed after 
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
@@ -4678,7 +4987,7 @@ test "RFC 9000 §10.2.1, a close is written once and nothing is processed after 
     try testing.expectEqual(@as(usize, 1), client.initial.?.recovery.inFlight().len);
 
     // The peer reads it, learns the code, and enters the draining state.
-    const opened = try server.feed(datagram[0..length], &plaintext, &frames, &report, 0);
+    const opened = try server.feed(datagram[0..length], &plaintext, &frames, &stream_events, &report, 0);
     try testing.expectEqual(.initial, opened.space);
     try testing.expectEqual(State.draining, server.state);
     try testing.expectEqual(@as(usize, 1), opened.frames.len);
@@ -4692,11 +5001,11 @@ test "RFC 9000 §10.2.1, a close is written once and nothing is processed after 
     // a draining one, and it sends nothing at all.
     try testing.expectError(
         error.Closed,
-        client.feed(late[0..late_length], &plaintext, &frames, &report, 0),
+        client.feed(late[0..late_length], &plaintext, &frames, &stream_events, &report, 0),
     );
     try testing.expectError(
         error.Closed,
-        server.feed(late[0..late_length], &plaintext, &frames, &report, 0),
+        server.feed(late[0..late_length], &plaintext, &frames, &stream_events, &report, 0),
     );
     try testing.expectError(
         error.Closed,
@@ -4758,6 +5067,7 @@ test "RFC 9000 §19.19, an application close carries the application's code" {
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
@@ -4766,7 +5076,7 @@ test "RFC 9000 §19.19, an application close carries the application's code" {
     // 1-RTT keys exist, so the close goes there and the peer reads it in the
     // application space (§10.2.1).
     const length = try client.close(.{ .application = true, .error_code = 0x42 }, &scratch, &datagram, 0);
-    const opened = try server.feed(datagram[0..length], &plaintext, &frames, &report, 0);
+    const opened = try server.feed(datagram[0..length], &plaintext, &frames, &stream_events, &report, 0);
     try testing.expectEqual(.app, opened.space);
     const received = opened.frames[0].connection_close;
     try testing.expect(received.application);

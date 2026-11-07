@@ -53,6 +53,7 @@ const Endpoint = struct {
     conn: Conn = undefined,
     plaintext: [1500]u8 = undefined,
     parsed: [16]frame.Frame = undefined,
+    stream_events: [16]Conn.StreamEvent = undefined,
 
     fn loss(self: *Endpoint) Conn.Loss {
         return .{
@@ -75,7 +76,14 @@ const Endpoint = struct {
     /// One call per packet, which is the whole of what a caller must give the
     /// machine to read one.
     fn feed(self: *Endpoint, bytes: []u8, at: u64) !Conn.Opened {
-        return self.conn.feed(bytes, &self.plaintext, &self.parsed, &self.events, at);
+        return self.conn.feed(
+            bytes,
+            &self.plaintext,
+            &self.parsed,
+            &self.stream_events,
+            &self.events,
+            at,
+        );
     }
 };
 
@@ -181,26 +189,26 @@ pub fn main(init: std.process.Init) !void {
         sent.consumed.taken,
     });
 
-    // The server reads the packet. The machine consumed the STREAM frame and
-    // told nobody which stream it was for, so the application goes looking.
-    _ = try server.feed(wire[0..sent.length], now(io));
+    // The server reads the packet. The machine says which streams the packet
+    // made readable, so the application does not scan its own table.
+    const at_server = try server.feed(wire[0..sent.length], now(io));
     var echoed: u32 = 0;
-    for (server.conn.stream_table.iterator()) |slot| {
-        const recv = slot.recv orelse continue;
+    for (at_server.streams) |changed| {
+        const incoming = server.conn.stream(changed.stream_id) orelse continue;
         var read: [1024]u8 = undefined;
-        const count = try recv.readInto(&read);
+        const count = try incoming.recv.readInto(&read);
         if (count == 0) continue;
-        std.debug.print("server: stream {d} had {d} bytes\n", .{ recv.id, count });
+        std.debug.print("server: stream {d} had {d} bytes\n", .{ changed.stream_id, count });
 
         // A bidirectional stream the peer opened is not writable until this
         // endpoint opens its own half of it, which reads like creating a stream
         // rather than joining one.
-        const back = try server.conn.openStream(recv.id, 4096);
+        const back = try server.conn.openStream(changed.stream_id, 4096);
         try back.send.write(read[0..count]);
         try back.send.finish();
         var server_written: [1]Conn.Written = undefined;
         const reply = (try server.conn.writeStreams(.{
-            .offers = &.{.{ .stream_id = recv.id, .length = 1024 }},
+            .offers = &.{.{ .stream_id = changed.stream_id, .length = 1024 }},
             .frames = &frames,
             .out = &wire,
             .written = &server_written,
@@ -211,13 +219,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("server: echoed in packet {d}\n", .{reply.number});
     }
 
-    // The client reads the echo the same way: scan, read, and nothing told it
-    // which stream to look at.
-    _ = try client.feed(wire[0..echoed], now(io));
-    const reply = client.conn.stream(0) orelse return error.NotOpen;
-    var read_back: [1024]u8 = undefined;
-    const count = try reply.recv.readInto(&read_back);
-    std.debug.print("client: read back \"{s}\"\n", .{read_back[0..count]});
+    // The client reads the echo the same way: the same report, on its side.
+    const at_client = try client.feed(wire[0..echoed], now(io));
+    for (at_client.streams) |changed| {
+        const echoed_back = client.conn.stream(changed.stream_id) orelse continue;
+        var read_back: [1024]u8 = undefined;
+        const count = try echoed_back.recv.readInto(&read_back);
+        std.debug.print("client: read back \"{s}\"\n", .{read_back[0..count]});
+    }
 
     // Nothing here ever acknowledged a packet, so both ends still hold
     // everything in flight. A real loop asks `ackOwed`/`writeAck` and runs

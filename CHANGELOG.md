@@ -7,6 +7,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.feed` and `Conn.Datagram.next` report the streams a packet changed, in a
+  caller-owned list returned as `Opened.streams`: one record per stream with
+  `readable` set when new bytes became contiguous and `finished` set when the
+  FIN completed the stream. Both calls take the list next to the frames array,
+  and a frame that changed nothing the application can see adds no record. An
+  application no longer scans the stream table after every packet.
 - `Conn.init` asserts that no two stream buffers share storage: not two slots
   over one ring, and not the send buffer that is also the receive ring of the
   same stream. A shared buffer is two byte budgets overwriting each other while
