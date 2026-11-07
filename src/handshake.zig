@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const protection = @import("protection.zig");
 
 const handshake = @This();
 
@@ -55,6 +56,38 @@ pub const Error = error{
     /// A call this driver's state does not allow, such as transport parameters
     /// set after the first message left.
     UnexpectedCall,
+    /// The negotiated cipher suite is one this package does not implement. It is
+    /// a refusal, never a substitution.
+    UnsupportedCipherSuite,
+};
+
+/// The TLS 1.3 cipher suites of RFC 8446 §B.4, as the driver names them.
+///
+/// The names are the registry's, so a driver says what it negotiated and the
+/// machine says whether it can protect packets with it. Keeping this separate
+/// from `protection.Suite` is the point: that type is what this package can do,
+/// and this one is what TLS may pick, which is two different sets. Reporting a
+/// suite this package cannot do is a named error, not a quiet fall back to
+/// AES-128-GCM.
+pub const Suite = enum {
+    aes_128_gcm_sha256,
+    aes_256_gcm_sha384,
+    chacha20_poly1305_sha256,
+    aes_128_ccm_sha256,
+    aes_128_ccm_8_sha256,
+
+    /// The AEAD this package protects packets with for the suite, if it has one.
+    pub fn protectionSuite(self: Suite) Error!protection.Suite {
+        return switch (self) {
+            .aes_128_gcm_sha256 => .aes_128_gcm,
+            .chacha20_poly1305_sha256 => .chacha20_poly1305,
+            // Named so a driver can report them and be refused. AES-256-GCM
+            // needs SHA-384 for the key schedule, and the CCM suites are not
+            // implemented at all; neither is a default this package may quietly
+            // replace.
+            .aes_256_gcm_sha384, .aes_128_ccm_sha256, .aes_128_ccm_8_sha256 => error.UnsupportedCipherSuite,
+        };
+    }
 };
 
 /// One level's traffic secrets. The pair is the same for both roles and the
@@ -78,6 +111,11 @@ pub const VTable = struct {
     /// Handshake bytes that arrived at a level, in order, with gaps and
     /// duplicates already resolved by the machine.
     feed: *const fn (ctx: *anyopaque, level: Level, bytes: []const u8) Error!void,
+    /// The cipher suite the handshake settled on. Required, and asked before any
+    /// key is derived: a default here is how a machine ends up using AES-128-GCM
+    /// against a peer that negotiated something else, which fails in a way no
+    /// test of ours would catch.
+    suite: *const fn (ctx: *anyopaque) Suite,
     /// The next handshake bytes to send, or null when there are none. A caller
     /// drains until null.
     next: *const fn (ctx: *anyopaque) Error!?Message,
@@ -108,6 +146,10 @@ pub const Driver = struct {
 
     pub fn feed(self: Driver, level: Level, bytes: []const u8) Error!void {
         return self.vtable.feed(self.ctx, level, bytes);
+    }
+
+    pub fn suite(self: Driver) Suite {
+        return self.vtable.suite(self.ctx);
     }
 
     pub fn next(self: Driver) Error!?Message {
@@ -153,6 +195,8 @@ pub const Stub = struct {
     app_secrets: ?Secrets = null,
     peer_parameters: ?[]const u8 = null,
     alpn_protocol: ?[]const u8 = null,
+    /// What `suite` reports.
+    cipher_suite: Suite = .aes_128_gcm_sha256,
     confirmed: bool = false,
     /// What `errorCode` reports after a failed call.
     failure: u64 = 0,
@@ -172,6 +216,7 @@ pub const Stub = struct {
 
     pub const vtable: VTable = .{
         .feed = feed,
+        .suite = suite,
         .next = next,
         .secrets = secrets,
         .setTransportParameters = setTransportParameters,
@@ -193,6 +238,11 @@ pub const Stub = struct {
         self.fed_len += @intCast(bytes.len);
         self.fed_level = level;
         self.fed_calls += 1;
+    }
+
+    fn suite(ctx: *anyopaque) Suite {
+        const self: *Stub = @ptrCast(@alignCast(ctx));
+        return self.cipher_suite;
     }
 
     fn next(ctx: *anyopaque) Error!?Message {
@@ -284,6 +334,7 @@ test "the seam binds a driver's context and passes levels through" {
     try testing.expect((try driver.secrets(.app)) == null);
 
     try testing.expectEqualStrings("h3", driver.alpn().?);
+    try testing.expectEqual(Suite.aes_128_gcm_sha256, driver.suite());
     try testing.expect(!driver.confirmed());
     // Nothing is set up for them after the first message.
     try testing.expectError(error.UnexpectedCall, driver.setTransportParameters("too late"));
@@ -293,6 +344,17 @@ test "the seam binds a driver's context and passes levels through" {
     stub.failure = 0x100 + 40;
     try testing.expectError(error.HandshakeFailed, driver.next());
     try testing.expectEqual(@as(u64, 0x128), driver.errorCode());
+}
+
+test "RFC 8446 §B.4, a suite this package cannot do is refused by name" {
+    try testing.expectEqual(protection.Suite.aes_128_gcm, try Suite.aes_128_gcm_sha256.protectionSuite());
+    try testing.expectEqual(protection.Suite.chacha20_poly1305, try Suite.chacha20_poly1305_sha256.protectionSuite());
+
+    // The rest exist in the registry and not in this package. Each is a refusal,
+    // never a substitution.
+    inline for (.{ Suite.aes_256_gcm_sha384, Suite.aes_128_ccm_sha256, Suite.aes_128_ccm_8_sha256 }) |suite| {
+        try testing.expectError(error.UnsupportedCipherSuite, suite.protectionSuite());
+    }
 }
 
 test "the seam reports a buffer that has no room instead of growing one" {

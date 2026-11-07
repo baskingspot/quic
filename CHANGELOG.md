@@ -96,6 +96,21 @@ All notable changes to quic are recorded here. The format follows
   including `preferred_address`. It refuses a duplicate, an out-of-range value,
   and a server-only parameter sent by a client, and it ignores a parameter this
   version does not define.
+- `Conn` parses the frames of every packet it opens. CRYPTO frames are
+  reassembled per level and handed to the TLS driver in order; PADDING is
+  consumed; every other frame comes back to the caller as `Conn.Opened.frames`,
+  borrowed from the payload and in wire order, because the machine has no home
+  for it yet. A frame that will not parse is a connection error (§12.4) and not
+  a dropped packet: only a packet that will not unprotect is dropped.
+- `CryptoStream` reassembles one encryption level's CRYPTO stream (RFC 9000
+  §19.6) over a ring the caller owns: bytes that arrive past a gap wait there,
+  and every run that becomes contiguous comes back as one or two borrowed
+  slices. A frame that would put the end of the stream further past what the
+  ring holds is `error.NoSpace`, never a silent truncation.
+- `handshake.Suite` names the five TLS 1.3 cipher suites, and
+  `handshake.VTable.suite` is a required call: the machine derives keys for the
+  suite the driver reports or refuses with `error.UnsupportedCipherSuite`. It
+  never falls back to AES-128-GCM.
 - `handshake` is the TLS seam: a vtable of eight calls that a driver implements
   and the machine calls — `feed` with CRYPTO payloads per level, `next` for the
   bytes to send back, `secrets` per level, our and the peer's transport
@@ -125,6 +140,10 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `Conn.feed` and `Conn.Datagram.next` take a caller array for the frames the
+  machine did not act on, and `Conn.Opened` carries `space`, the parsed `frames`,
+  and `payload` instead of the raw payload alone. `Conn.Config` gained `crypto`,
+  the CRYPTO reassembly storage per level.
 - `Conn` discards the Initial keys at the two moments RFC 9000 §17.2.2.1 names:
   a client's first Handshake packet sent, a server's first one processed. A
   late Initial packet after that is dropped by the datagram walk.

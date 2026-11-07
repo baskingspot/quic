@@ -20,6 +20,7 @@
 const std = @import("std");
 const testing = std.testing;
 const Cursor = @import("Cursor.zig");
+const CryptoStream = @import("CryptoStream.zig");
 const frame = @import("frame.zig");
 const seam = @import("handshake.zig");
 const packet = @import("packet.zig");
@@ -50,7 +51,7 @@ pub const Role = enum { client, server };
 /// 1-RTT packets share the application data space.
 pub const SpaceId = enum { initial, handshake, app };
 
-pub const Error = protection.Error || packet.Error || frame.Error || seam.Error || error{
+pub const Error = protection.Error || packet.Error || frame.Error || seam.Error || CryptoStream.Error || error{
     /// No traffic keys are installed for the space. Handshake and application
     /// keys arrive from the TLS driver, and the space is absent until then.
     NoKeys,
@@ -79,14 +80,29 @@ pub const Config = struct {
     /// carries opaquely in the handshake (§8.2). Handed to the driver once,
     /// before its first message.
     transport_parameters: []const u8 = "",
+    /// Reassembly storage for the CRYPTO stream at each level (§19.6). The
+    /// caller sizes it for the largest handshake it expects; a frame that would
+    /// reach past what it holds is `error.NoSpace`.
+    crypto: CryptoStorage = .{},
+};
+
+pub const CryptoStorage = struct {
+    initial: []u8 = "",
+    handshake: []u8 = "",
+    app: []u8 = "",
 };
 
 pub const Opened = struct {
+    space: SpaceId,
     packet_number: u64,
-    /// The frames the packet carried, written into the caller's buffer.
-    frames: []u8,
     header_len: u32,
     packet_len: u32,
+    /// The frames the machine did not act on, in wire order, borrowed from
+    /// `payload`. CRYPTO frames are absent: they went to the driver. This is
+    /// what the caller has to handle itself, and it is the whole of it.
+    frames: []frame.Frame,
+    /// The decrypted payload, borrowed from the caller's plaintext buffer.
+    payload: []u8,
 };
 
 /// One packet number space: its keys, its counters, and the ranges it has
@@ -189,6 +205,9 @@ app: ?Space = null,
 tls: ?seam.Driver,
 /// Encoded transport parameters for the driver, set before its first message.
 transport_parameters: []const u8,
+/// CRYPTO reassembly per level, over the caller's storage, indexed by
+/// `SpaceId`.
+crypto: [3]CryptoStream,
 /// Whether the driver has them yet. One call, before the first flight.
 transport_parameters_set: bool = false,
 
@@ -208,6 +227,11 @@ pub fn init(config: Config) Conn {
         .source_connection_id = config.source_connection_id,
         .tls = config.tls,
         .transport_parameters = config.transport_parameters,
+        .crypto = .{
+            .init(config.crypto.initial),
+            .init(config.crypto.handshake),
+            .init(config.crypto.app),
+        },
         .initial = .{
             .send_keys = if (config.role == .client) client else server,
             .receive_keys = if (config.role == .client) server else client,
@@ -266,8 +290,8 @@ fn clear(self: *Conn, id: SpaceId) void {
 /// `plaintext` receives the payload. A packet that will not unprotect is an
 /// error and leaves the machine untouched, which is what §5.5 requires of a
 /// caller that then drops it.
-pub fn feed(self: *Conn, datagram: []u8, plaintext: []u8) Error!Opened {
-    return self.open(try self.locate(datagram), plaintext);
+pub fn feed(self: *Conn, datagram: []u8, plaintext: []u8, frames: []frame.Frame) Error!Opened {
+    return self.finish(try self.open(try self.locate(datagram), plaintext), frames);
 }
 
 /// One packet of a datagram, located and assigned to a space, before it is
@@ -316,7 +340,19 @@ fn locate(self: *const Conn, bytes: []u8) Error!Located {
     };
 }
 
-fn open(self: *Conn, at: Located, plaintext: []u8) Error!Opened {
+/// A packet that opened, before its frames are parsed: the part of `Opened`
+/// that says which space and packet number the payload belongs to.
+const Raw = struct {
+    id: SpaceId,
+    packet_number: u64,
+    header_len: u32,
+    packet_len: u32,
+    payload: []u8,
+};
+
+/// Unprotect one packet and account for it: the packet number, the received
+/// range, and the key discards §17.2.2.1 orders.
+fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
     const space = try self.spaceFor(at.id);
 
     const opened = try protection.openPacket(
@@ -339,11 +375,64 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Opened {
     if (at.id == .handshake and self.role == .server) self.discardIfPresent(.initial);
 
     return .{
+        .id = at.id,
         .packet_number = opened.packet_number,
-        .frames = opened.payload,
         .header_len = opened.header_len,
         .packet_len = @intCast(at.bytes.len),
+        .payload = opened.payload,
     };
+}
+
+/// Parse the payload's frames and act on the ones the machine owns.
+///
+/// A CRYPTO frame is reassembled per level and handed to the driver (§19.6), and
+/// PADDING has no meaning to hand anyone (§19.1). Everything else is written to
+/// the caller's array in wire order, because the machine has no home for it yet:
+/// an ACK goes to `Recovery` when the machine owns one, a STREAM frame to its
+/// stream, and until then the caller is the only place either can land.
+///
+/// A frame that will not parse is a connection error (§12.4), not a dropped
+/// packet: the datagram walk drops undecryptable packets and nothing else.
+fn finish(self: *Conn, raw: Raw, frames: []frame.Frame) Error!Opened {
+    var cursor: Cursor = .init(raw.payload);
+    var count: usize = 0;
+    while (!cursor.atEnd()) {
+        switch (try frame.read(&cursor)) {
+            .crypto => |crypto| try self.feedCrypto(raw.id, crypto.offset, crypto.data),
+            .padding => {},
+            else => |parsed| {
+                if (count == frames.len) return error.NoSpace;
+                frames[count] = parsed;
+                count += 1;
+            },
+        }
+    }
+
+    return .{
+        .space = raw.id,
+        .packet_number = raw.packet_number,
+        .header_len = raw.header_len,
+        .packet_len = raw.packet_len,
+        .frames = frames[0..count],
+        .payload = raw.payload,
+    };
+}
+
+/// Give CRYPTO bytes to the driver in order, whatever order they arrived in.
+///
+/// Without a driver the bytes are consumed and go nowhere, which keeps a
+/// driver-less machine usable for packet-level work.
+fn feedCrypto(self: *Conn, id: SpaceId, offset: u64, data: []const u8) Error!void {
+    const tls = self.tls orelse return;
+
+    const delivery = try self.crypto[@backingInt(id)].onData(offset, data);
+    const level: seam.Level = switch (id) {
+        .initial => .initial,
+        .handshake => .handshake,
+        .app => .app,
+    };
+    if (delivery.first.len != 0) try tls.feed(level, delivery.first);
+    if (delivery.second.len != 0) try tls.feed(level, delivery.second);
 }
 
 /// A datagram, walked one packet at a time.
@@ -376,7 +465,7 @@ pub const Datagram = struct {
 
     /// The next packet that opened, or null when there is nothing left to
     /// process. The frames are valid until the next call.
-    pub fn next(self: *Datagram, conn: *Conn, plaintext: []u8) Error!?Opened {
+    pub fn next(self: *Datagram, conn: *Conn, plaintext: []u8, frames: []frame.Frame) Error!?Opened {
         while (self.cursor.remaining() > 0) {
             const rest = self.bytes[self.cursor.pos..];
             const at = conn.locate(rest) catch {
@@ -388,15 +477,20 @@ pub const Datagram = struct {
             };
             _ = self.cursor.skip(@intCast(at.bytes.len));
 
-            return conn.open(at, plaintext) catch |err| switch (err) {
+            const raw = conn.open(at, plaintext) catch |err| switch (err) {
                 // The plaintext buffer is the caller's to size, and running out
                 // of it is not the peer's doing: report it, do not drop it.
-                error.NoSpace => err,
+                error.NoSpace => return err,
                 else => {
                     self.dropped += 1;
                     continue;
                 },
             };
+            // Once the packet opened, a bad frame is a connection error, not a
+            // packet to skip: the peer's own bytes arrived intact and say
+            // something invalid (§12.4).
+            const opened = try conn.finish(raw, frames);
+            return opened;
         }
         return null;
     }
@@ -453,24 +547,30 @@ pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8) Error!?u32 {
 /// Install every space the driver can give secrets for, once each. A driver may
 /// report a level on every call; the machine asks only while a space is missing.
 fn installSecrets(self: *Conn, tls: seam.Driver) Error!void {
+    if (self.handshake != null and self.app != null) return;
+
+    // Asked once per install and never defaulted: a machine that picked a suite
+    // would protect packets the peer cannot read.
+    const suite = try tls.suite().protectionSuite();
     if (self.handshake == null) {
-        if (try tls.secrets(.handshake)) |secrets| try self.installSpace(.handshake, secrets);
+        if (try tls.secrets(.handshake)) |secrets| try self.installSpace(.handshake, secrets, suite);
     }
     if (self.app == null) {
-        if (try tls.secrets(.app)) |secrets| try self.installSpace(.app, secrets);
+        if (try tls.secrets(.app)) |secrets| try self.installSpace(.app, secrets, suite);
     }
 }
 
-/// Build a space from the secrets a driver reported.
-///
-/// The suite is AES-128-GCM, the default §5.5 of RFC 9001 gives and the one the
-/// Initial space uses. A driver that negotiates ChaCha20-Poly1305 has no way to
-/// say so yet: the seam reports secrets and not the suite, so that is a vtable
-/// addition and not something to guess at here.
-fn installSpace(self: *Conn, id: SpaceId, secrets: seam.Secrets) Error!void {
+/// Build a space from the secrets a driver reported, with the suite it
+/// negotiated.
+fn installSpace(
+    self: *Conn,
+    id: SpaceId,
+    secrets: seam.Secrets,
+    suite: protection.Suite,
+) Error!void {
     std.debug.assert(id != .initial);
-    const client = try protection.deriveKeys(secrets.client, .aes_128_gcm);
-    const server = try protection.deriveKeys(secrets.server, .aes_128_gcm);
+    const client = try protection.deriveKeys(secrets.client, suite);
+    const server = try protection.deriveKeys(secrets.server, suite);
     const space: Space = .{
         .send_keys = if (self.role == .client) client else server,
         .receive_keys = if (self.role == .client) server else client,
@@ -576,6 +676,13 @@ pub fn writeAck(self: *Conn, id: SpaceId, out: []u8) Error!u32 {
     return total;
 }
 
+/// A payload of `n` PING frames (§19.2): one byte, no fields, and nothing for
+/// the machine to act on, which makes it the cheapest valid thing a test can
+/// seal into a packet.
+fn pings(comptime n: usize) [n]u8 {
+    return @splat(0x01);
+}
+
 test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     var client: Conn = .init(.{
@@ -597,19 +704,26 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     // Nothing has arrived yet, so there is nothing to acknowledge.
     try testing.expectError(error.NothingToAcknowledge, server.writeAck(.initial, &datagram));
 
-    const sent = try client.writeFrames(.initial, "a payload with enough bytes to sample", &datagram);
-    const at_server = try server.feed(datagram[0..sent], &plaintext);
+    const payload = pings(4);
+    var frames: [8]frame.Frame = undefined;
+
+    const sent = try client.writeFrames(.initial, &payload, &datagram);
+    const at_server = try server.feed(datagram[0..sent], &plaintext, &frames);
+    try testing.expectEqual(.initial, at_server.space);
     try testing.expectEqual(@as(u64, 0), at_server.packet_number);
-    try testing.expectEqualStrings("a payload with enough bytes to sample", at_server.frames);
+    // §19.1 and §19.2: padding and PING have nothing for the machine to do, so
+    // they are the frames the machine hands to the caller.
+    try testing.expectEqual(@as(usize, 4), at_server.frames.len);
+    try testing.expect(at_server.frames[0] == .ping);
     try testing.expect(server.ackOwed(.initial));
 
     // The server answers with an ACK for packet 0.
     const ack_len = try server.writeAck(.initial, &datagram);
     try testing.expect(!server.ackOwed(.initial));
 
-    const at_client = try client.feed(datagram[0..ack_len], &plaintext);
-    var cursor = Cursor.init(at_client.frames);
-    const ack = (try frame.read(&cursor)).ack;
+    const at_client = try client.feed(datagram[0..ack_len], &plaintext, &frames);
+    try testing.expectEqual(@as(usize, 1), at_client.frames.len);
+    const ack = at_client.frames[0].ack;
     try testing.expectEqual(@as(u64, 0), ack.largest);
     try testing.expectEqual(@as(u64, 0), ack.first_range);
     try testing.expectEqual(@as(u64, 0), ack.range_count);
@@ -639,10 +753,14 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
 
-    const sent = try client.writeFrames(.handshake, "handshake bytes to sample", &datagram);
-    const opened = try server.feed(datagram[0..sent], &plaintext);
+    const payload = pings(3);
+    var frames: [8]frame.Frame = undefined;
 
-    try testing.expectEqualStrings("handshake bytes to sample", opened.frames);
+    const sent = try client.writeFrames(.handshake, &payload, &datagram);
+    const opened = try server.feed(datagram[0..sent], &plaintext, &frames);
+
+    try testing.expectEqual(.handshake, opened.space);
+    try testing.expectEqual(@as(usize, 3), opened.frames.len);
     try testing.expectEqual(@as(u64, 0), opened.packet_number);
     try testing.expectEqual(@as(?u64, 0), server.handshake.?.largest_received);
     // Not the Initial space: a server that has processed a Handshake packet has
@@ -654,9 +772,8 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     // And the acknowledgment is a Handshake packet, which is the only space the
     // client can read it in (§13.2.1).
     const ack_len = try server.writeAck(.handshake, &datagram);
-    const at_client = try client.feed(datagram[0..ack_len], &plaintext);
-    var cursor = Cursor.init(at_client.frames);
-    try testing.expectEqual(@as(u64, 0), (try frame.read(&cursor)).ack.largest);
+    const at_client = try client.feed(datagram[0..ack_len], &plaintext, &frames);
+    try testing.expectEqual(@as(u64, 0), at_client.frames[0].ack.largest);
     try testing.expectEqual(@as(?u64, null), client.initial.?.largest_received);
 }
 
@@ -683,10 +800,12 @@ test "RFC 9000 §12.3, a space with no keys is an error and not a second kind of
 
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
-    const sent = try client.writeFrames(.handshake, "handshake bytes to sample", &datagram);
+    const payload = pings(3);
+    var frames: [8]frame.Frame = undefined;
+    const sent = try client.writeFrames(.handshake, &payload, &datagram);
 
-    try testing.expectError(error.NoKeys, server.feed(datagram[0..sent], &plaintext));
-    try testing.expectError(error.NoKeys, server.writeFrames(.handshake, "x", &datagram));
+    try testing.expectError(error.NoKeys, server.feed(datagram[0..sent], &plaintext, &frames));
+    try testing.expectError(error.NoKeys, server.writeFrames(.handshake, "\x01", &datagram));
     try testing.expectError(error.NoKeys, server.writeAck(.app, &datagram));
     // Nothing was recorded, so nothing is owed.
     try testing.expect(!server.ackOwed(.handshake));
@@ -746,34 +865,37 @@ test "RFC 9000 §17.2.2.1, a packet for a discarded space is dropped and the con
 
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    const payload = pings(3);
 
     // The server has read an Initial, and §17.2.2.1 says it can let the keys go
     // once it processes a Handshake packet. It does, and then the late Initial
     // that arrives next is dropped rather than decrypted under a dead key.
-    const stale = try client.writeFrames(.initial, "initial payload bytes", &datagram);
-    _ = try server.feed(datagram[0..stale], &plaintext);
+    const stale = try client.writeFrames(.initial, &payload, &datagram);
+    _ = try server.feed(datagram[0..stale], &plaintext, &frames);
     try server.discard(.initial);
     try testing.expectError(error.NoKeys, server.spaceFor(.initial));
     try testing.expect(!server.ackOwed(.initial));
-    try testing.expectError(error.NoKeys, server.writeFrames(.initial, "x", &datagram));
+    try testing.expectError(error.NoKeys, server.writeFrames(.initial, "\x01", &datagram));
 
-    const late = try client.writeFrames(.initial, "a late initial payload", &datagram);
+    const late = try client.writeFrames(.initial, &payload, &datagram);
     var walk: Datagram = .init(datagram[0..late]);
-    try testing.expect((try walk.next(&server, &plaintext)) == null);
+    try testing.expect((try walk.next(&server, &plaintext, &frames)) == null);
     try testing.expectEqual(@as(u16, 1), walk.dropped);
 
     // The rest of the connection is untouched: the Handshake space opens what
     // the client sends there, because the connection IDs are the connection's.
-    const handshake = try client.writeFrames(.handshake, "handshake payload bytes", &datagram);
-    const opened = try server.feed(datagram[0..handshake], &plaintext);
-    try testing.expectEqualStrings("handshake payload bytes", opened.frames);
+    const handshake = try client.writeFrames(.handshake, &payload, &datagram);
+    const opened = try server.feed(datagram[0..handshake], &plaintext, &frames);
+    try testing.expectEqual(@as(usize, 3), opened.frames.len);
     try testing.expectEqual(@as(?u64, 0), server.handshake.?.largest_received);
 
     // And the server can still write: discarding a space does not take the
     // connection's identity or its packet number width with it.
     const ack = try server.writeAck(.handshake, &datagram);
-    const at_client = try client.feed(datagram[0..ack], &plaintext);
-    try testing.expect(at_client.frames.len > 0);
+    const at_client = try client.feed(datagram[0..ack], &plaintext, &frames);
+    try testing.expectEqual(@as(usize, 1), at_client.frames.len);
+    try testing.expect(at_client.frames[0] == .ack);
 }
 
 test "RFC 9001 §4.9.2, the Handshake keys can go while the application keys stay" {
@@ -823,15 +945,18 @@ test "RFC 9000 §17.3.1, the application space writes a short header and opens o
 
     var datagram: [512]u8 = undefined;
     var plaintext: [512]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+    const payload = pings(2);
 
-    const sent = try client.writeFrames(.app, "a one-rtt payload to sample", &datagram);
+    const sent = try client.writeFrames(.app, &payload, &datagram);
     // §17.3.1: the form bit is clear, and the destination connection ID has no
     // length on the wire.
     try testing.expectEqual(@as(u8, 0x00), datagram[0] & 0x80);
     try testing.expectEqualSlices(u8, &server_id, datagram[1..][0..server_id.len]);
 
-    const opened = try server.feed(datagram[0..sent], &plaintext);
-    try testing.expectEqualStrings("a one-rtt payload to sample", opened.frames);
+    const opened = try server.feed(datagram[0..sent], &plaintext, &events);
+    try testing.expectEqual(.app, opened.space);
+    try testing.expectEqual(@as(usize, 2), opened.frames.len);
     try testing.expectEqual(@as(?u64, 0), server.app.?.largest_received);
     try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
     // The whole rest of the datagram is the packet: a short header has no
@@ -872,9 +997,9 @@ test "RFC 9000 §19.3, eight received ranges do not overflow the ACK path" {
         .destination_connection_id = &.{0xcc},
         .source_connection_id = &dcid,
     });
-    const at_client = try client.feed(out[0..ack_len], &plaintext);
-    var cursor = Cursor.init(at_client.frames);
-    const ack = (try frame.read(&cursor)).ack;
+    var events: [8]frame.Frame = undefined;
+    const at_client = try client.feed(out[0..ack_len], &plaintext, &events);
+    const ack = at_client.frames[0].ack;
     try testing.expectEqual(@as(u64, 7), ack.range_count);
     try testing.expectEqual(server.initial.?.ranges[0].largest, ack.largest);
 }
@@ -889,9 +1014,9 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
     const hello = "ClientHello bytes in one CRYPTO frame";
     const finished = "Finished bytes";
 
-    // The driver stands in for baskingspot/tls: two messages at two levels, and
-    // both levels' secrets reported from the start.
-    var stub: seam.Stub = .{
+    // Both ends stand in for baskingspot/tls: the same secrets on each, the
+    // client with two messages to send, and each recording what it is fed.
+    var client_stub: seam.Stub = .{
         .outbox = &.{
             .{ .level = .initial, .bytes = hello },
             .{ .level = .handshake, .bytes = finished },
@@ -900,13 +1025,21 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
         .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
         .alpn_protocol = "h3",
     };
+    var server_stub: seam.Stub = .{
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+        .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
+    };
+
+    // CRYPTO reassembly storage, which the caller owns (§19.6).
+    var initial_crypto: [128]u8 = undefined;
+    var handshake_crypto: [128]u8 = undefined;
 
     var client: Conn = .init(.{
         .role = .client,
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x7a},
-        .tls = stub.driver(),
+        .tls = client_stub.driver(),
         .transport_parameters = "our parameters",
     });
     var server: Conn = .init(.{
@@ -916,76 +1049,69 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
         // The same bytes the client puts in a destination: a short header
         // carries no length, so the two ends have to agree on one (§17.3.1).
         .source_connection_id = &dcid,
+        .tls = server_stub.driver(),
+        .crypto = .{ .initial = &initial_crypto, .handshake = &handshake_crypto },
     });
 
     var datagram: [512]u8 = undefined;
-    var frames: [256]u8 = undefined;
+    var payload: [256]u8 = undefined;
     var plaintext: [512]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
 
     // The ClientHello leaves in an Initial packet, and the driver had this
     // endpoint's transport parameters before it produced that message (§8.2).
-    const first = (try client.writeHandshake(&frames, &datagram)) orelse return error.TestUnexpectedResult;
-    try testing.expect(stub.parameters_set);
-    try testing.expectEqualStrings("our parameters", stub.parameters[0..stub.parameters_len]);
+    const first = (try client.writeHandshake(&payload, &datagram)) orelse return error.TestUnexpectedResult;
+    try testing.expect(client_stub.parameters_set);
+    try testing.expectEqualStrings("our parameters", client_stub.parameters[0..client_stub.parameters_len]);
     // The stub reported both levels up front, so the machine installed them
     // before it needed them; the Initial keys are still here, because no
     // Handshake packet has gone out yet.
     try testing.expect(client.initial != null);
 
-    const at_server = try server.feed(datagram[0..first], &plaintext);
-    var cursor = Cursor.init(at_server.frames);
-    const hello_frame = (try frame.read(&cursor)).crypto;
-    try testing.expectEqual(@as(u64, 0), hello_frame.offset);
-    try testing.expectEqualStrings(hello, hello_frame.data);
+    // The server unprotects it, reassembles the CRYPTO frame, and hands the
+    // bytes to its driver at the level the packet belonged to.
+    const at_server = try server.feed(datagram[0..first], &plaintext, &events);
+    try testing.expectEqual(@as(usize, 0), at_server.frames.len);
+    try testing.expectEqual(seam.Level.initial, server_stub.fed_level.?);
+    try testing.expectEqualStrings(hello, server_stub.fed[0..server_stub.fed_len]);
 
-    // The server's own driver is out of this test's scope, so its Handshake
-    // keys are planted; the client's come from the stub through the machine.
-    plantSpace(
-        &server,
-        .handshake,
-        try protection.deriveKeys(&server_secret, .aes_128_gcm),
-        try protection.deriveKeys(&client_secret, .aes_128_gcm),
-    );
+    // The server's own driver has nothing to send, but the call installs the
+    // spaces its secrets describe, which is how its Handshake keys arrive.
+    try testing.expect((try server.writeHandshake(&payload, &datagram)) == null);
+    try testing.expect(server.handshake != null);
+    try testing.expect(server.app != null);
 
     // The Finished bytes go out in a Handshake packet, in a space the machine
     // built from the driver's secrets. §17.2.2.1 then takes the client's
     // Initial keys, because its first Handshake packet has been sent.
-    const second = (try client.writeHandshake(&frames, &datagram)) orelse return error.TestUnexpectedResult;
+    const second = (try client.writeHandshake(&payload, &datagram)) orelse return error.TestUnexpectedResult;
     try testing.expect(client.handshake != null);
     try testing.expectEqual(@as(?Space, null), client.initial);
 
-    const at_server_handshake = try server.feed(datagram[0..second], &plaintext);
-    var handshake_cursor = Cursor.init(at_server_handshake.frames);
-    const finished_frame = (try frame.read(&handshake_cursor)).crypto;
+    const at_server_handshake = try server.feed(datagram[0..second], &plaintext, &events);
+    try testing.expectEqual(@as(usize, 0), at_server_handshake.frames.len);
+    try testing.expectEqual(seam.Level.handshake, server_stub.fed_level.?);
     // A new level starts its CRYPTO stream at zero again (§19.6).
-    try testing.expectEqual(@as(u64, 0), finished_frame.offset);
-    try testing.expectEqualStrings(finished, finished_frame.data);
+    try testing.expectEqualStrings(finished, server_stub.fed[hello.len..server_stub.fed_len]);
     // And the server's Initial keys went when it processed that packet.
     try testing.expectEqual(@as(?Space, null), server.initial);
 
-    // The driver has nothing left, but the application space it reported is
-    // installed anyway.
-    try testing.expect((try client.writeHandshake(&frames, &datagram)) == null);
-    try testing.expect(client.app != null);
+    // The driver has nothing left to send, and 1-RTT traffic flows both ways.
+    try testing.expect((try client.writeHandshake(&payload, &datagram)) == null);
     try testing.expectEqualStrings("h3", client.tls.?.alpn().?);
 
-    plantSpace(
-        &server,
-        .app,
-        try protection.deriveKeys(&app_server_secret, .aes_128_gcm),
-        try protection.deriveKeys(&app_client_secret, .aes_128_gcm),
-    );
-    const app_packet = try client.writeFrames(.app, "one-rtt payload bytes", &datagram);
-    const opened_app = try server.feed(datagram[0..app_packet], &plaintext);
-    try testing.expectEqualStrings("one-rtt payload bytes", opened_app.frames);
+    const app_payload = pings(2);
+    const app_packet = try client.writeFrames(.app, &app_payload, &datagram);
+    const opened_app = try server.feed(datagram[0..app_packet], &plaintext, &events);
+    try testing.expectEqual(@as(usize, 2), opened_app.frames.len);
 
     // §4.9.2: confirmation takes the Handshake keys, and 1-RTT carries on.
-    stub.confirmed = true;
-    try testing.expect((try client.writeHandshake(&frames, &datagram)) == null);
+    client_stub.confirmed = true;
+    try testing.expect((try client.writeHandshake(&payload, &datagram)) == null);
     try testing.expectEqual(@as(?Space, null), client.handshake);
     try testing.expect(client.app != null);
-    try testing.expectError(error.NoKeys, client.writeFrames(.handshake, "x", &datagram));
-    _ = try client.writeFrames(.app, "still here", &datagram);
+    try testing.expectError(error.NoKeys, client.writeFrames(.handshake, "\x01", &datagram));
+    _ = try client.writeFrames(.app, &app_payload, &datagram);
 }
 
 test "RFC 9000 §20.1, a driver failure carries the CRYPTO_ERROR to close with" {
@@ -1007,6 +1133,31 @@ test "RFC 9000 §20.1, a driver failure carries the CRYPTO_ERROR to close with" 
     try testing.expectEqual(@as(u64, 0x150), client.tls.?.errorCode());
 }
 
+test "RFC 8446 §B.4, a suite this package cannot do is refused, never substituted" {
+    const dcid = [_]u8{0x95};
+    const sha384: [48]u8 = @splat(0x33);
+    var stub: seam.Stub = .{
+        .cipher_suite = .aes_256_gcm_sha384,
+        .handshake_secrets = .{ .client = &sha384, .server = &sha384 },
+    };
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x9b},
+        .tls = stub.driver(),
+    });
+
+    var datagram: [512]u8 = undefined;
+    var frames: [256]u8 = undefined;
+    // The driver says AES-256-GCM, which needs SHA-384 and is not implemented.
+    // The machine refuses by name rather than deriving AES-128-GCM and hoping
+    // the peer notices.
+    try testing.expectError(error.UnsupportedCipherSuite, client.writeHandshake(&frames, &datagram));
+    try testing.expectEqual(@as(?Space, null), client.handshake);
+    try testing.expectEqual(@as(?Space, null), client.app);
+}
+
 test "RFC 9001 §5.1, a driver's 48-byte secret is refused rather than truncated" {
     const dcid = [_]u8{0x91};
     const sha384: [48]u8 = @splat(0x33);
@@ -1023,8 +1174,9 @@ test "RFC 9001 §5.1, a driver's 48-byte secret is refused rather than truncated
 
     var datagram: [512]u8 = undefined;
     var frames: [256]u8 = undefined;
-    // TLS_AES_256_GCM_SHA384 hands out 48-byte secrets and this package does not
-    // implement it, so the space is not installed under a truncated key.
+    // A driver that says AES-128-GCM and hands out a 48-byte secret has told two
+    // different stories; `deriveKeys` refuses the length, so no space is built
+    // from a key schedule that does not belong to it.
     try testing.expectError(error.SecretLengthMismatch, client.writeHandshake(&frames, &datagram));
     try testing.expectEqual(@as(?Space, null), client.handshake);
     try testing.expectEqual(@as(?Space, null), client.app);
@@ -1042,6 +1194,86 @@ test "an endpoint with no driver has no handshake to write" {
     var datagram: [512]u8 = undefined;
     var frames: [256]u8 = undefined;
     try testing.expect((try conn.writeHandshake(&frames, &datagram)) == null);
+}
+
+test "RFC 9000 §19.6, CRYPTO frames that arrive out of order reach the driver in order" {
+    const dcid = [_]u8{ 0x61, 0x62 };
+    const client_secret: [protection.secret_length]u8 = @splat(0x31);
+    const server_secret: [protection.secret_length]u8 = @splat(0x32);
+    var stub: seam.Stub = .{
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+    };
+    var initial_crypto: [64]u8 = undefined;
+
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x6a},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x6a},
+        .source_connection_id = &.{0x6b},
+        .tls = stub.driver(),
+        .crypto = .{ .initial = &initial_crypto },
+    });
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var payload: [64]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+
+    // The second half of the message first: it is buffered, not delivered.
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .crypto = .{ .offset = 6, .data = "world" } });
+    const sent_late = try client.writeFrames(.initial, writer.written(), &datagram);
+    _ = try server.feed(datagram[0..sent_late], &plaintext, &events);
+    try testing.expectEqual(@as(u32, 0), stub.fed_calls);
+
+    // The frame before it fills the gap and both halves leave in order.
+    var head_writer: Writer = .init(&payload);
+    try frame.write(&head_writer, .{ .crypto = .{ .offset = 0, .data = "hello " } });
+    const sent_early = try client.writeFrames(.initial, head_writer.written(), &datagram);
+    const opened = try server.feed(datagram[0..sent_early], &plaintext, &events);
+    try testing.expectEqual(@as(usize, 0), opened.frames.len);
+    try testing.expectEqual(@as(u32, 1), stub.fed_calls);
+    try testing.expectEqualStrings("hello world", stub.fed[0..stub.fed_len]);
+}
+
+test "RFC 9000 §12.4, a frame that will not parse is an error and not a dropped packet" {
+    const dcid = [_]u8{0x63};
+    var client: Conn = .init(.{
+        .role = .client,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x6c},
+    });
+    var server: Conn = .init(.{
+        .role = .server,
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x6c},
+        .source_connection_id = &.{0x6d},
+    });
+
+    var datagram: [256]u8 = undefined;
+    var plaintext: [256]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+    // 0x3f is a one-byte frame type the registry does not define.
+    const bad = [_]u8{0x3f};
+    const sent = try client.writeFrames(.initial, &bad, &datagram);
+
+    // The packet opened: its bytes are the peer's and they say something
+    // invalid, which closes the connection (§12.4). Nothing is dropped.
+    var walk: Datagram = .init(datagram[0..sent]);
+    try testing.expectError(error.UnknownFrameType, walk.next(&server, &plaintext, &events));
+    try testing.expectEqual(@as(u16, 0), walk.dropped);
+
+    // The same through one packet. Unprotecting mutates the datagram, so this
+    // is a fresh packet rather than the same bytes again.
+    const again = try client.writeFrames(.initial, &bad, &datagram);
+    try testing.expectError(error.UnknownFrameType, server.feed(datagram[0..again], &plaintext, &events));
 }
 
 test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram" {
@@ -1065,22 +1297,27 @@ test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram"
     // The flight the server cannot know the client can read: both levels in
     // one datagram, because it is one datagram's worth of network.
     var flight: [1024]u8 = undefined;
-    const initial_len = try server.writeFrames(.initial, "initial payload bytes", &flight);
-    const handshake_len = try server.writeFrames(.handshake, "handshake payload bytes", flight[initial_len..]);
+    const initial_payload = pings(3);
+    const handshake_payload = pings(2);
+    const initial_len = try server.writeFrames(.initial, &initial_payload, &flight);
+    const handshake_len = try server.writeFrames(.handshake, &handshake_payload, flight[initial_len..]);
     var datagram: Datagram = .init(flight[0 .. initial_len + handshake_len]);
 
     var plaintext: [512]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
 
-    const first = (try datagram.next(&client, &plaintext)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("initial payload bytes", first.frames);
+    const first = (try datagram.next(&client, &plaintext, &events)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(.initial, first.space);
+    try testing.expectEqual(@as(usize, 3), first.frames.len);
     try testing.expectEqual(@as(?u64, 0), client.initial.?.largest_received);
     try testing.expectEqual(@as(?u64, null), client.handshake.?.largest_received);
 
-    const second = (try datagram.next(&client, &plaintext)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("handshake payload bytes", second.frames);
+    const second = (try datagram.next(&client, &plaintext, &events)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(.handshake, second.space);
+    try testing.expectEqual(@as(usize, 2), second.frames.len);
     try testing.expectEqual(@as(?u64, 0), client.handshake.?.largest_received);
 
-    try testing.expect((try datagram.next(&client, &plaintext)) == null);
+    try testing.expect((try datagram.next(&client, &plaintext, &events)) == null);
     try testing.expectEqual(@as(u16, 0), datagram.dropped);
     // Both spaces are accounted for separately, which is what the client needs
     // to answer each level with an ACK of its own (§13.2.1).
@@ -1107,8 +1344,8 @@ test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next i
     installHandshake(&client, &server, client_secret, server_secret);
 
     var flight: [1024]u8 = undefined;
-    const initial_len = try server.writeFrames(.initial, "initial payload bytes", &flight);
-    const handshake_len = try server.writeFrames(.handshake, "handshake payload bytes", flight[initial_len..]);
+    const initial_len = try server.writeFrames(.initial, &pings(3), &flight);
+    const handshake_len = try server.writeFrames(.handshake, &pings(2), flight[initial_len..]);
     var datagram: Datagram = .init(flight[0 .. initial_len + handshake_len]);
 
     // A bit in the Initial's authentication tag. An attacker on the path can do
@@ -1116,8 +1353,10 @@ test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next i
     datagram.bytes[initial_len - 8] ^= 0x01;
 
     var plaintext: [512]u8 = undefined;
-    const opened = (try datagram.next(&client, &plaintext)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("handshake payload bytes", opened.frames);
+    var events: [8]frame.Frame = undefined;
+    const opened = (try datagram.next(&client, &plaintext, &events)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(.handshake, opened.space);
+    try testing.expectEqual(@as(usize, 2), opened.frames.len);
     try testing.expectEqual(@as(?u64, null), client.initial.?.largest_received);
     try testing.expectEqual(@as(?u64, 0), client.handshake.?.largest_received);
     try testing.expectEqual(@as(u16, 1), datagram.dropped);
@@ -1147,18 +1386,21 @@ test "RFC 9000 §12.2, a short header ends the datagram and nothing is read past
     // A long header, then a short one: legal, and the short one is last
     // because its length is the rest of the datagram.
     var flight: [1024]u8 = undefined;
-    const initial_len = try client.writeFrames(.initial, "initial payload bytes", &flight);
-    const app_len = try client.writeFrames(.app, "one-rtt payload bytes", flight[initial_len..]);
+    const initial_len = try client.writeFrames(.initial, &pings(2), &flight);
+    const app_len = try client.writeFrames(.app, &pings(3), flight[initial_len..]);
     var datagram: Datagram = .init(flight[0 .. initial_len + app_len]);
 
     var plaintext: [512]u8 = undefined;
-    const initial = (try datagram.next(&server, &plaintext)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("initial payload bytes", initial.frames);
-    const app = (try datagram.next(&server, &plaintext)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("one-rtt payload bytes", app.frames);
+    var events: [8]frame.Frame = undefined;
+    const initial = (try datagram.next(&server, &plaintext, &events)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(.initial, initial.space);
+    try testing.expectEqual(@as(usize, 2), initial.frames.len);
+    const app = (try datagram.next(&server, &plaintext, &events)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(.app, app.space);
+    try testing.expectEqual(@as(usize, 3), app.frames.len);
     // The whole tail of the datagram belonged to that packet.
     try testing.expectEqual(@as(u32, @intCast(app_len)), app.packet_len);
-    try testing.expect((try datagram.next(&server, &plaintext)) == null);
+    try testing.expect((try datagram.next(&server, &plaintext, &events)) == null);
     try testing.expectEqual(@as(u16, 0), datagram.dropped);
 }
 
@@ -1178,7 +1420,7 @@ test "RFC 9000 §12.2, bytes with no readable end stop the walk without an error
     });
 
     var flight: [512]u8 = undefined;
-    const initial_len = try client.writeFrames(.initial, "initial payload bytes", &flight);
+    const initial_len = try client.writeFrames(.initial, &pings(3), &flight);
     // A long header cut off inside its connection ID: no Length field, so
     // nothing says where the packet would have ended.
     const junk = [_]u8{ 0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x01, 0x02 };
@@ -1186,9 +1428,10 @@ test "RFC 9000 §12.2, bytes with no readable end stop the walk without an error
     var datagram: Datagram = .init(flight[0 .. initial_len + junk.len]);
 
     var plaintext: [512]u8 = undefined;
-    const opened = (try datagram.next(&server, &plaintext)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings("initial payload bytes", opened.frames);
-    try testing.expect((try datagram.next(&server, &plaintext)) == null);
+    var events: [8]frame.Frame = undefined;
+    const opened = (try datagram.next(&server, &plaintext, &events)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 3), opened.frames.len);
+    try testing.expect((try datagram.next(&server, &plaintext, &events)) == null);
     try testing.expectEqual(@as(u16, 1), datagram.dropped);
 }
 
@@ -1208,16 +1451,21 @@ test "RFC 9000 §12.2, coalesced packets: only the first is taken, the length sa
     });
 
     var plaintext: [512]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
     var combined: [1024]u8 = undefined;
-    const first = try client.writeFrames(.initial, "first packet bytes to sample", &combined);
-    const second = try client.writeFrames(.initial, "second packet bytes to sample", combined[first..]);
+    const first = try client.writeFrames(.initial, &pings(2), &combined);
+    const second = try client.writeFrames(.initial, &pings(2), combined[first..]);
 
-    const opened = try server.feed(&combined, &plaintext);
+    const opened = try server.feed(&combined, &plaintext, &events);
     try testing.expectEqual(@as(u32, @intCast(first)), opened.packet_len);
     try testing.expectEqual(@as(u64, 0), opened.packet_number);
 
     // The caller continues where the machine said the packet ended.
-    const next = try server.feed(combined[opened.packet_len..][0 .. first + second - opened.packet_len], &plaintext);
+    const next = try server.feed(
+        combined[opened.packet_len..][0 .. first + second - opened.packet_len],
+        &plaintext,
+        &events,
+    );
     try testing.expectEqual(@as(u64, 1), next.packet_number);
 }
 
@@ -1238,11 +1486,12 @@ test "RFC 9001 §5.5, a packet that will not unprotect changes nothing" {
 
     var datagram: [256]u8 = undefined;
     var plaintext: [256]u8 = undefined;
-    const sent = try client.writeFrames(.initial, "payload long enough to sample", &datagram);
+    var events: [8]frame.Frame = undefined;
+    const sent = try client.writeFrames(.initial, &pings(4), &datagram);
 
     // One bit in the ciphertext, far from the header sample.
     datagram[sent - 20] ^= 0x01;
-    try testing.expectError(error.AuthenticationFailed, server.feed(datagram[0..sent], &plaintext));
+    try testing.expectError(error.AuthenticationFailed, server.feed(datagram[0..sent], &plaintext, &events));
     try testing.expect(!server.ackOwed(.initial));
     try testing.expectEqual(@as(?u64, null), server.initial.?.largest_received);
 }

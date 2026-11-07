@@ -20,6 +20,7 @@
 //! the caller.
 
 pub const Cursor = @import("Cursor.zig");
+pub const CryptoStream = @import("CryptoStream.zig");
 pub const Writer = @import("Writer.zig");
 pub const Congestion = @import("Congestion.zig");
 pub const Conn = @import("Conn.zig");
@@ -44,6 +45,7 @@ pub const StreamTable = @import("StreamTable.zig");
 
 test {
     _ = @import("Cursor.zig");
+    _ = CryptoStream;
     _ = @import("Writer.zig");
     _ = Congestion;
     _ = Conn;
