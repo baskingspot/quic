@@ -142,6 +142,10 @@ refactors do not need one unless they change how someone uses the package.
 
 Write from the user's side: what changed, and what they must do about it. Name
 the symbol, flag, or error. One line, under Added, Changed, Fixed, or Removed.
+The structure is checked, not trusted: `tools/changelog.zig` runs in `just lint`
+and fails a heading that does not own its line, a heading without a blank line
+above it, a section that is not one of Keep a Changelog's six, or the same section
+twice in one release. Write the heading first, then the bullets under it.
 
 To release, dispatch the repo's `release.yml` with the version. The workflow
 moves the Unreleased section into a dated heading, sets `.version` in

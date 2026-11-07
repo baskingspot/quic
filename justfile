@@ -54,6 +54,7 @@ interop:
 lint:
     ziglint
     zig fmt --check src tools build.zig
+    zig run tools/changelog.zig
     nix fmt -- --ci
     oxfmt --check README.md AGENTS.md .github
     actionlint
