@@ -972,7 +972,26 @@ fn lossTablesValid(loss: Loss) bool {
     if (loss.sent_initial.len == 0) return false;
     if (loss.sent_handshake.len == 0) return false;
     if (loss.sent_app.len == 0) return false;
+
+    // Two spaces over one table would overwrite each other's records, and a
+    // record holds the packet number its own space uses: a caller that handed
+    // the same buffer to, say, Initial and Handshake would see the two space's
+    // losses reported as each other's. A buffer per space is the configuration
+    // this type asks for, so overlapping ones are refused here.
+    if (tablesOverlap(loss.sent_initial, loss.sent_handshake)) return false;
+    if (tablesOverlap(loss.sent_initial, loss.sent_app)) return false;
+    if (tablesOverlap(loss.sent_handshake, loss.sent_app)) return false;
     return true;
+}
+
+/// Whether two caller tables share any storage.
+fn tablesOverlap(a: []const Recovery.SentPacket, b: []const Recovery.SentPacket) bool {
+    const size = @sizeOf(Recovery.SentPacket);
+    const a_start = @intFromPtr(a.ptr);
+    const b_start = @intFromPtr(b.ptr);
+    const a_end = a_start + a.len * size;
+    const b_end = b_start + b.len * size;
+    return a_start < b_end and b_start < a_end;
 }
 
 /// The stream with `id`, or null when it is not open.
@@ -2987,8 +3006,10 @@ test "RFC 9002 §6.2.1, a probe timeout is armed over the machine's own space" {
 
 test "a loss configuration with an empty table is refused" {
     var shared: Recovery = .{};
-    var sent: [4]Recovery.SentPacket = undefined;
-    const none: []Recovery.SentPacket = sent[0..0];
+    var first: [4]Recovery.SentPacket = undefined;
+    var second: [4]Recovery.SentPacket = undefined;
+    var third: [4]Recovery.SentPacket = undefined;
+    const none: []Recovery.SentPacket = first[0..0];
 
     const Case = struct {
         sent_initial: []Recovery.SentPacket,
@@ -2997,12 +3018,18 @@ test "a loss configuration with an empty table is refused" {
         valid: bool,
     };
     const cases = [_]Case{
-        .{ .sent_initial = &sent, .sent_handshake = &sent, .sent_app = &sent, .valid = true },
+        .{ .sent_initial = &first, .sent_handshake = &second, .sent_app = &third, .valid = true },
         // A space with no table is a space whose lost packets nobody reports, so
         // each of the three has to be there.
-        .{ .sent_initial = none, .sent_handshake = &sent, .sent_app = &sent, .valid = false },
-        .{ .sent_initial = &sent, .sent_handshake = none, .sent_app = &sent, .valid = false },
-        .{ .sent_initial = &sent, .sent_handshake = &sent, .sent_app = none, .valid = false },
+        .{ .sent_initial = none, .sent_handshake = &second, .sent_app = &third, .valid = false },
+        .{ .sent_initial = &first, .sent_handshake = none, .sent_app = &third, .valid = false },
+        .{ .sent_initial = &first, .sent_handshake = &second, .sent_app = none, .valid = false },
+        // Two spaces over one table: the records would overwrite each other and
+        // the packet numbers would stop meaning anything.
+        .{ .sent_initial = &first, .sent_handshake = &first, .sent_app = &third, .valid = false },
+        // Half of one table and the other half, which is what a caller splitting
+        // a buffer by hand looks like.
+        .{ .sent_initial = first[0..2], .sent_handshake = first[2..4], .sent_app = &third, .valid = true },
     };
 
     for (cases) |case| {
