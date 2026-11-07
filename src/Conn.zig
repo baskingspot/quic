@@ -134,8 +134,10 @@ pub const Stream = struct {
     /// advertises is a caller misconfiguration, and catching it there beats a
     /// peer's frame turning into `error.NoSpace` two layers away (§2.2, §4.1).
     recv_buffer: []u8 = "",
-    /// §4.1: the per-stream limit this endpoint advertises.
-    limit: u64 = 0,
+    /// §4.1: the per-stream limit this endpoint advertises. A count of bytes,
+    /// not the name it shares with `Config.receive_limit`, which is the
+    /// connection's.
+    recv_limit_bytes: u64 = 0,
     send: SendStream = undefined,
     recv: ReceiveStream = undefined,
     state: State = .unused,
@@ -196,7 +198,7 @@ pub const Space = struct {
     range_count: u4 = 0,
     /// How much CRYPTO data this endpoint has sent in this space: the offset
     /// the next CRYPTO frame starts at (§19.6).
-    crypto_sent: u64 = 0,
+    crypto_sent_bytes: u64 = 0,
 
     pub fn ackOwed(self: *const Space) bool {
         return self.range_count != 0 and self.acked_through != self.largest_received;
@@ -215,7 +217,7 @@ pub const Space = struct {
         self.largest_received = null;
         self.acked_through = null;
         self.range_count = 0;
-        self.crypto_sent = 0;
+        self.crypto_sent_bytes = 0;
     }
 
     /// Note a packet number that arrived, merging it into the ranges an ACK
@@ -567,7 +569,9 @@ pub const Datagram = struct {
     /// The read position, through the one read walker in this package.
     cursor: Cursor,
     /// Packets that the datagram delimited and that did not open: a bad tag, a
-    /// space with no keys yet, or bytes with no readable end.
+    /// space with no keys yet, or bytes with no readable end. Bounded by the
+    /// datagram: the smallest packet is over twenty bytes (§17.2), so a 65527
+    /// byte datagram cannot reach the `u16` limit, and `next` asserts it.
     dropped: u16 = 0,
 
     pub fn init(bytes: []u8) Datagram {
@@ -582,6 +586,8 @@ pub const Datagram = struct {
             const at = conn.locate(rest) catch {
                 // The packet has no readable end, so there is no boundary to
                 // find the next one at. The rest of the datagram goes with it.
+                std.debug.assert(self.dropped < std.math.maxInt(u16));
+                std.debug.assert(self.dropped < std.math.maxInt(u16));
                 self.dropped += 1;
                 self.cursor.pos = @intCast(self.bytes.len);
                 return null;
@@ -593,6 +599,7 @@ pub const Datagram = struct {
                 // of it is not the peer's doing: report it, do not drop it.
                 error.NoSpace => return err,
                 else => {
+                    std.debug.assert(self.dropped < std.math.maxInt(u16));
                     self.dropped += 1;
                     continue;
                 },
@@ -644,13 +651,13 @@ pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8) Error!?u32 {
     };
 
     const space = try self.spaceFor(id);
-    const offset = space.crypto_sent;
+    const offset = space.crypto_sent_bytes;
 
     var writer: Writer = .init(frames);
     try frame.write(&writer, .{ .crypto = .{ .offset = offset, .data = message.bytes } });
 
     const total = try self.writeFrames(id, writer.written(), out);
-    space.crypto_sent = offset + message.bytes.len;
+    space.crypto_sent_bytes = offset + message.bytes.len;
 
     // §17.2.2.1: the client's Initial keys go when its first Handshake packet
     // is sent. The packet is sealed; nothing needs them again.
@@ -715,9 +722,9 @@ fn streamsValid(slots: []const StreamTable.Slot, streams: []const Stream) bool {
     if (slots.len != streams.len) return false;
     for (streams) |entry| {
         if (entry.recv_buffer.len == 0) {
-            if (entry.limit != 0) return false;
+            if (entry.recv_limit_bytes != 0) return false;
         } else {
-            if (entry.recv_buffer.len < entry.limit) return false;
+            if (entry.recv_buffer.len < entry.recv_limit_bytes) return false;
         }
     }
     return true;
@@ -763,7 +770,7 @@ pub fn openStream(self: *Conn, id: u64, send_limit: u64) Error!*Stream {
     entry.state = .send_only;
 
     if (stream_id.direction(id) == .bidi) {
-        entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.limit);
+        entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.recv_limit_bytes);
         entry.state = .both;
         _ = try self.stream_table.open(id, &entry.send, &entry.recv);
     } else {
@@ -783,7 +790,7 @@ fn streamFor(self: *Conn, id: u64) Error!*Stream {
 
     const index = self.freeStream() orelse return error.StreamLimit;
     const entry = &self.streams[index];
-    entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.limit);
+    entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.recv_limit_bytes);
     entry.state = .recv_only;
     _ = try self.stream_table.open(id, null, &entry.recv);
     return entry;
@@ -1084,7 +1091,7 @@ test "RFC 9001 §4.9, a discarded space keeps no keys and no counters" {
     // acknowledgment already sent.
     var space = conn.initial.?;
     space.next_packet_number = 9;
-    space.crypto_sent = 1234;
+    space.crypto_sent_bytes = 1234;
     space.largest_received = 7;
     space.record(7);
     space.acked_through = 7;
@@ -1098,7 +1105,7 @@ test "RFC 9001 §4.9, a discarded space keeps no keys and no counters" {
     try testing.expectEqualSlices(u8, &zeros, &space.send_keys.hp);
     try testing.expectEqualSlices(u8, &zeros, &space.receive_keys.hp);
     try testing.expectEqual(@as(u64, 0), space.next_packet_number);
-    try testing.expectEqual(@as(u64, 0), space.crypto_sent);
+    try testing.expectEqual(@as(u64, 0), space.crypto_sent_bytes);
     try testing.expectEqual(@as(?u64, null), space.largest_received);
     try testing.expectEqual(@as(?u64, null), space.acked_through);
     try testing.expectEqual(@as(u4, 0), space.range_count);
@@ -1548,13 +1555,13 @@ test "a stream configuration that cannot hold its own limits is refused" {
         // Nothing configured, and slots that match.
         .{ .slots = &slots, .streams = &.{ .{}, .{} }, .valid = true },
         // A ring that holds exactly the window it advertises.
-        .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .limit = 64 }, .{} }, .valid = true },
+        .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .recv_limit_bytes = 64 }, .{} }, .valid = true },
         // A ring one byte short of it: §4.1 says it cannot hold what it says.
-        .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .limit = 65 }, .{} }, .valid = false },
+        .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .recv_limit_bytes = 65 }, .{} }, .valid = false },
         // A limit with no ring behind it.
-        .{ .slots = &slots, .streams = &.{ .{ .limit = 8 }, .{} }, .valid = false },
+        .{ .slots = &slots, .streams = &.{ .{ .recv_limit_bytes = 8 }, .{} }, .valid = false },
         // A ring with a zero limit is a stream that receives nothing.
-        .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .limit = 0 }, .{} }, .valid = true },
+        .{ .slots = &slots, .streams = &.{ .{ .recv_buffer = &ring, .recv_limit_bytes = 0 }, .{} }, .valid = true },
         // One slot short of the streams it would have to hold.
         .{ .slots = slots[0..1], .streams = &.{ .{}, .{} }, .valid = false },
     };
@@ -1568,7 +1575,7 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
     const dcid = [_]u8{ 0x21, 0x22 };
     var ring: [64]u8 = undefined;
     var slots: [2]StreamTable.Slot = undefined;
-    var streams: [2]Conn.Stream = .{ .{ .recv_buffer = &ring, .limit = 64 }, .{} };
+    var streams: [2]Conn.Stream = .{ .{ .recv_buffer = &ring, .recv_limit_bytes = 64 }, .{} };
 
     var client: Conn = .init(.{
         .role = .client,
@@ -1622,7 +1629,7 @@ test "RFC 9000 §4.6, a full stream table is peer-visible and not a dropped pack
     const dcid = [_]u8{0x23};
     var ring: [64]u8 = undefined;
     var slots: [1]StreamTable.Slot = undefined;
-    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .limit = 64 }};
+    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .recv_limit_bytes = 64 }};
 
     var client: Conn = .init(.{
         .role = .client,
@@ -1683,7 +1690,7 @@ test "RFC 9000 §4.1, a peer past the stream limit is a connection error" {
     });
     var ring: [64]u8 = undefined;
     var slots: [1]StreamTable.Slot = undefined;
-    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .limit = 4 }};
+    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .recv_limit_bytes = 4 }};
     var server: Conn = .init(.{
         .role = .server,
         .original_destination_connection_id = &dcid,
@@ -1730,8 +1737,8 @@ test "RFC 9000 §4.1, a peer past the connection limit is a connection error" {
     var ring_b: [64]u8 = undefined;
     var slots: [2]StreamTable.Slot = undefined;
     var streams: [2]Conn.Stream = .{
-        .{ .recv_buffer = &ring_a, .limit = 64 },
-        .{ .recv_buffer = &ring_b, .limit = 64 },
+        .{ .recv_buffer = &ring_a, .recv_limit_bytes = 64 },
+        .{ .recv_buffer = &ring_b, .recv_limit_bytes = 64 },
     };
     var server: Conn = .init(.{
         .role = .server,
@@ -1784,7 +1791,7 @@ test "RFC 9000 §12.4, a STREAM frame in an Initial packet is a connection error
     });
     var ring: [64]u8 = undefined;
     var slots: [1]StreamTable.Slot = undefined;
-    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .limit = 64 }};
+    var streams: [1]Conn.Stream = .{.{ .recv_buffer = &ring, .recv_limit_bytes = 64 }};
     var server: Conn = .init(.{
         .role = .server,
         .original_destination_connection_id = &dcid,
@@ -1819,13 +1826,13 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
     var client_ring: [64]u8 = undefined;
     var client_slots: [2]StreamTable.Slot = undefined;
     var client_streams: [2]Conn.Stream = .{
-        .{ .send_buffer = &send_buffer, .recv_buffer = &client_ring, .limit = 64 },
+        .{ .send_buffer = &send_buffer, .recv_buffer = &client_ring, .recv_limit_bytes = 64 },
         .{},
     };
 
     var receive_ring: [64]u8 = undefined;
     var server_slots: [2]StreamTable.Slot = undefined;
-    var server_streams: [2]Conn.Stream = .{ .{ .recv_buffer = &receive_ring, .limit = 64 }, .{} };
+    var server_streams: [2]Conn.Stream = .{ .{ .recv_buffer = &receive_ring, .recv_limit_bytes = 64 }, .{} };
 
     var client: Conn = .init(.{
         .role = .client,
