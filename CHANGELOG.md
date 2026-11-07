@@ -7,6 +7,10 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `examples/echo.zig` is a client and a server over `Conn` with a faked
+  handshake, echoing one stream. `just example` builds and runs it. It is the
+  first code in the tree that calls the machine the way an application does, and
+  the gaps it found are recorded in `docs/slop/connection-machine.md`.
 - `Conn.writeStreams` packs several streams into one packet from the caller's
   ordered offer list, up to the caller's payload budget, the peer's
   connection-wide allowance, and the output buffer, and describes what it wrote so
@@ -283,6 +287,9 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- `just interop` never built anything runnable: `interop-bin` compiled the tool
+  and installed nothing, so the recipe's `./zig-out/bin/interop` was always
+  missing. Both developer binaries are installed by their steps now.
 - A single ACK frame that covered more than 64 packets wrote past the fixed
   64-record `Recovery.Events` array, against a caller-owned sent table of any
   length. That was an assertion failure in a safe build and an out-of-bounds

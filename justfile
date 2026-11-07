@@ -10,6 +10,12 @@ default:
 test:
     zig build test --summary all
 
+[doc("Build and run the echo example: the machine called as an application would")]
+[group("test")]
+example:
+    zig build example-bin
+    ./zig-out/bin/echo
+
 [doc("Fuzz the codecs with an iteration budget, for example `just fuzz 50M`. A budget is required: without one the build runner opens a web UI and waits")]
 [group("test")]
 fuzz LIMIT="10M":
@@ -53,7 +59,7 @@ interop:
 [group("lint")]
 lint:
     ziglint
-    zig fmt --check src tools build.zig
+    zig fmt --check src tools examples build.zig
     # The validator validates itself first: the fixtures are what tell the next
     # person who edits it that a rule they changed stopped working.
     zig run tools/changelog.zig -- --self-test
@@ -67,7 +73,7 @@ lint:
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
-    zig fmt src tools build.zig
+    zig fmt src tools examples build.zig
     nix fmt
     oxfmt README.md AGENTS.md .github
     just --fmt

@@ -32,6 +32,20 @@ pub fn build(b: *std.Build) void {
     const run_vector_tests = b.addRunArtifact(vector_tests);
     test_step.dependOn(&run_vector_tests.step);
 
+    // The echo example: the machine called the way an application would. It is
+    // an executable rather than a test because its value is in being read.
+    const echo_mod = b.createModule(.{
+        .root_source_file = b.path("examples/echo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "quic", .module = mod }},
+    });
+    const echo = b.addExecutable(.{ .name = "echo", .root_module = echo_mod });
+    // Installed rather than merely built: `just example` runs it from
+    // zig-out/bin, and a step that only compiles leaves nothing to run.
+    const install_echo = b.addInstallArtifact(echo, .{});
+    b.step("example-bin", "Build the echo example").dependOn(&install_echo.step);
+
     // The external interop tool: a real UDP socket against a foreign client.
     // Developer-only, like the fuzz step; `just interop` runs it.
     const interop_mod = b.createModule(.{
@@ -41,7 +55,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "quic", .module = mod }},
     });
     const interop = b.addExecutable(.{ .name = "interop", .root_module = interop_mod });
-    b.step("interop-bin", "Build the external interop tool").dependOn(&interop.step);
+    const install_interop = b.addInstallArtifact(interop, .{});
+    b.step("interop-bin", "Build the external interop tool").dependOn(&install_interop.step);
 
     // Fuzzing is driven by the build runner: `zig build test --fuzz=10M`. The
     // `fuzz` module option segfaults in the test runner on Zig 0.17.0, so the
