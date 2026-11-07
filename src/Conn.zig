@@ -38,6 +38,11 @@ const Conn = @This();
 
 const Range = struct { smallest: u64, largest: u64 };
 
+/// Whether the handshake driver has this endpoint's transport parameters.
+/// Two states, and the transition happens once, before the driver may produce a
+/// first message (§8.2).
+pub const Parameters = enum { pending, handed };
+
 /// How many separate received ranges a space tracks. Eight covers the
 /// reordering a handshake sees in practice; beyond it, the oldest range is
 /// forgotten, which §13.2.4 allows.
@@ -272,6 +277,9 @@ app: ?Space = null,
 tls: ?seam.Driver,
 /// Encoded transport parameters for the driver, set before its first message.
 transport_parameters: []const u8,
+/// Whether the driver has them. Two states, and the transition happens once:
+/// they are handed over before the driver may produce a message (§8.2).
+parameters: Parameters = .pending,
 /// CRYPTO reassembly per level, over the caller's storage, indexed by
 /// `SpaceId`.
 crypto: [3]CryptoStream,
@@ -615,11 +623,14 @@ pub const Datagram = struct {
 pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8) Error!?u32 {
     const tls = self.tls orelse return null;
 
-    if (!self.transport_parameters_set) {
+    switch (self.parameters) {
         // §8.2: ours go out in the first message, so the driver takes them
-        // before it produces one.
-        try tls.setTransportParameters(self.transport_parameters);
-        self.transport_parameters_set = true;
+        // before it is asked for one.
+        .pending => {
+            try tls.setTransportParameters(self.transport_parameters);
+            self.parameters = .handed;
+        },
+        .handed => {},
     }
     try self.installSecrets(tls);
 

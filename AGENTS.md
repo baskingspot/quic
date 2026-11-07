@@ -89,6 +89,33 @@ Two traps on Zig 0.17.0, both hit while wiring this up:
   recipe reads the "exited with code" line out of the output and fails on it,
   because otherwise a crash reads as a pass in CI.
 
+## Style: TigerStyle, as far as it applies
+
+Matt wants the lowest-level primitive to have a strict contract, not merely a
+correct one. The rules that have actually caught bugs here:
+
+- Assert the invariant where it is _established_, not at every use. A range
+  table keeps `smallest <= largest` in `record`; `writeAck` then subtracts
+  without a guard, because the guard is upstream.
+- State construction invariants as a pure predicate and assert it in `init`
+  (`Conn.streamsValid`). `init` stays infallible: a configuration that cannot
+  hold its own windows is a programmer error, not a runtime condition. The
+  predicate is what makes it testable, since there is no `expectPanic` here.
+- An error return must leave the structure as it was found. Book the range
+  before copying the bytes (`CryptoStream.onData`): order the steps so the only
+  failing one comes first.
+- Never acknowledge what you have not processed: account for a packet after its
+  frames parse, not when it opens.
+- Assert across module boundaries. `Conn` and `ReceiveStream` each keep a
+  counter; the subtraction that joins them gets an assertion, because neither
+  module can see the other's invariant.
+- Wire lengths and offsets are `u32` in this package. `usize` is for indexing
+  buffers, never for a quantity that came off the wire.
+- A `bool` that gates which fields are valid is a state enum (`Conn.Stream`).
+  Two booleans that can disagree are the bug.
+- Split compound conditions, and write the why when a check is deliberately
+  permissive (§4.5's MAY, §4.5's tolerances in `ReceiveStream`).
+
 ## Rules
 
 - Commit messages are one line, `area: summary`, and every commit is signed. Do not rewrite pushed history.
