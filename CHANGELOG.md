@@ -168,6 +168,13 @@ All notable changes to quic are recorded here. The format follows
   sent table, which is what an acknowledgment and the loss timer act on. An
   ACK-only packet (`Conn.Write.acknowledgment`) is neither, so it takes no room
   in the table.
+- `Conn.close` seals a CONNECTION_CLOSE (§19.19) in the highest-numbered space
+  that has keys, a transport code (§20.1) or the application's own, with the
+  optional diagnostic reason, and puts the connection in the closing state.
+  `Conn.State` is `open`, `closing`, or `draining` (§10.2.1 and §10.2.2): a
+  closed connection answers `error.Closed` to `feed` and to every writer except
+  `close` itself, `ackOwed` is false, and a peer's CONNECTION_CLOSE comes back in
+  `Opened.frames` with the code it was given.
 
 ### Changed
 

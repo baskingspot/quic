@@ -46,6 +46,8 @@ const RecoveryDriver = @import("RecoveryDriver.zig");
 const Writer = @import("Writer.zig");
 const varint = @import("varint.zig");
 
+const error_code = @import("error_code.zig");
+
 const Conn = @This();
 
 /// Nanoseconds, from the module that measures them.
@@ -76,6 +78,21 @@ const ack_payload_len = ack_range_scratch_len + 32;
 
 pub const Role = enum { client, server };
 
+/// What a connection may still do, once it is over (§10.2 of RFC 9000).
+///
+/// Three states, not two booleans: "sent a close" and "received one" answer
+/// different questions. A closing endpoint may still put a close on the wire in
+/// answer to a packet it arrives too late for; a draining endpoint sends nothing
+/// at all.
+pub const State = enum {
+    /// Packets are processed and answered.
+    open,
+    /// §10.2.1: this endpoint sent a CONNECTION_CLOSE.
+    closing,
+    /// §10.2.2: the peer's CONNECTION_CLOSE arrived.
+    draining,
+};
+
 /// The packet number spaces of §12.3. There are three, not four: 0-RTT and
 /// 1-RTT packets share the application data space.
 pub const SpaceId = enum { initial, handshake, app };
@@ -103,6 +120,10 @@ pub const Error = protection.Error ||
         StreamLimit,
         /// §12.4: STREAM frames belong to the application space only.
         WrongFrameSpace,
+        /// §10.2.1 and §10.2.2: this connection has sent or received a
+        /// CONNECTION_CLOSE, so it processes no more packets. Only the close
+        /// itself may still be written.
+        Closed,
     };
 
 /// Where loss recovery's state lives: the caller's, outside the connection.
@@ -210,19 +231,19 @@ pub const Stream = struct {
     recv_limit_bytes: u64 = 0,
     send: SendStream = undefined,
     recv: ReceiveStream = undefined,
-    state: State = .unused,
+    halves: Halves = .unused,
 
     /// Which halves a slot holds. Exhaustive on purpose: `send` is only valid
-    /// when `state` says so, and a boolean pair could disagree with the slot the
+    /// when this says so, and a boolean pair could disagree with the slot the
     /// table points at.
-    pub const State = enum { unused, recv_only, send_only, both };
+    pub const Halves = enum { unused, recv_only, send_only, both };
 
     pub fn isOpen(self: *const Stream) bool {
-        return self.state != .unused;
+        return self.halves != .unused;
     }
 
     pub fn canSend(self: *const Stream) bool {
-        return switch (self.state) {
+        return switch (self.halves) {
             .send_only, .both => true,
             .unused, .recv_only => false,
         };
@@ -341,6 +362,9 @@ pub const Space = struct {
 };
 
 role: Role,
+/// §10.2: where this connection is in its life. A packet that arrives after the
+/// close is `error.Closed`, processed no further.
+state: State = .open,
 packet_number_len: u3,
 /// What this endpoint writes into the packets it sends. The connection IDs
 /// outlive every space: discarding a space's keys does not change what the peer
@@ -502,6 +526,10 @@ pub fn feed(
     events: *Recovery.Events,
     now: Duration,
 ) Error!Opened {
+    // §10.2.1 and §10.2.2: a connection that has closed, either way, processes
+    // no more frames. The caller decides whether to answer with its close again.
+    if (self.state != .open) return error.Closed;
+
     const raw = try self.open(try self.locate(datagram), plaintext);
     const opened = try self.finish(raw, frames, events, now);
     self.commit(raw.id, raw.packet_number);
@@ -624,6 +652,16 @@ fn finish(
             .stream => |frame_stream| try self.onStreamFrame(raw.id, frame_stream),
             .ack => |ack| try self.onAck(raw.id, ack, events, now),
             .padding => {},
+            .connection_close => |value| {
+                // §10.2.2: the peer closed, so this endpoint enters the
+                // draining state and sends nothing else. The frame still comes
+                // back to the caller, which is the only place the code it was
+                // given can be reported.
+                self.state = .draining;
+                if (count == frames.len) return error.NoSpace;
+                frames[count] = .{ .connection_close = value };
+                count += 1;
+            },
             else => |parsed| {
                 if (count == frames.len) return error.NoSpace;
                 frames[count] = parsed;
@@ -770,6 +808,9 @@ pub const Datagram = struct {
         events: *Recovery.Events,
         now: Duration,
     ) Error!?Opened {
+        // The same rule as `feed`: a closed connection walks nothing.
+        if (conn.state != .open) return error.Closed;
+
         while (self.cursor.remaining() > 0) {
             const rest = self.bytes[self.cursor.pos..];
             const at = conn.locate(rest) catch {
@@ -964,9 +1005,9 @@ pub fn openStream(self: *Conn, id: u64, send_limit: u64) Error!*Stream {
         // A bidirectional stream the peer opened is ours to send on as well.
         if (slot.send != null) return error.AlreadyOpen;
         const existing = streamOf(slot);
-        std.debug.assert(existing.state == .recv_only);
+        std.debug.assert(existing.halves == .recv_only);
         existing.send = SendStream.init(id, existing.send_buffer, send_limit);
-        existing.state = .both;
+        existing.halves = .both;
         slot.send = &existing.send;
         return existing;
     }
@@ -974,11 +1015,11 @@ pub fn openStream(self: *Conn, id: u64, send_limit: u64) Error!*Stream {
     const index = self.freeStream() orelse return error.StreamLimit;
     const entry = &self.streams[index];
     entry.send = SendStream.init(id, entry.send_buffer, send_limit);
-    entry.state = .send_only;
+    entry.halves = .send_only;
 
     if (stream_id.direction(id) == .bidi) {
         entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.recv_limit_bytes);
-        entry.state = .both;
+        entry.halves = .both;
         _ = try self.stream_table.open(id, &entry.send, &entry.recv);
     } else {
         _ = try self.stream_table.open(id, &entry.send, null);
@@ -998,7 +1039,7 @@ fn streamFor(self: *Conn, id: u64) Error!*Stream {
     const index = self.freeStream() orelse return error.StreamLimit;
     const entry = &self.streams[index];
     entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.recv_limit_bytes);
-    entry.state = .recv_only;
+    entry.halves = .recv_only;
     _ = try self.stream_table.open(id, null, &entry.recv);
     return entry;
 }
@@ -1159,13 +1200,6 @@ pub const Write = struct {
     pub fn data(now: Duration) Write {
         return .{ .now = now, .ack_eliciting = true, .in_flight = true };
     }
-
-    /// §13.2.1: acknowledgments and PADDING alone. The peer does not answer it
-    /// and no congestion controller counts it, so the loss detector never sees
-    /// it and it takes no room in the caller's table.
-    pub fn acknowledgment(now: Duration) Write {
-        return .{ .now = now, .ack_eliciting = false, .in_flight = false };
-    }
 };
 
 /// Seal a packet in `id`'s space carrying `frames`, which the caller already
@@ -1180,6 +1214,16 @@ pub const Write = struct {
 /// before anything is sealed, so the machine is left as it was found and the
 /// caller's buffer holds no half packet.
 pub fn writeFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8, write: Write) Error!u32 {
+    // §10.2.1: a closing endpoint sends nothing but CONNECTION_CLOSE, and this
+    // is where every other frame this machine writes goes out.
+    if (self.state != .open) return error.Closed;
+    return self.sealFrames(id, frames, out, write);
+}
+
+/// The body of `writeFrames`, without the closing check: the close itself has to
+/// go out while the connection is already closing (§10.2.1 lets a closing
+/// endpoint answer a late packet, and the answer is another CONNECTION_CLOSE).
+fn sealFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8, write: Write) Error!u32 {
     const space = try self.spaceFor(id);
     const pn = space.next_packet_number;
     const pn_len = self.packet_number_len;
@@ -1231,6 +1275,8 @@ pub fn writeFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8, writ
 /// received there since the last one was sent. A space with no keys owes
 /// nothing, because nothing in it can have arrived.
 pub fn ackOwed(self: *Conn, id: SpaceId) bool {
+    // §10.2.2: a draining endpoint sends nothing, so nothing is owed.
+    if (self.state != .open) return false;
     const space = self.spaceMaybe(id) orelse return false;
     return space.ackOwed();
 }
@@ -1246,7 +1292,9 @@ pub fn writeAck(self: *Conn, id: SpaceId, out: []u8, now: Duration) Error!u32 {
     var payload: [ack_payload_len]u8 = undefined;
     const bytes = try ackPayload(space, &payload);
 
-    const total = try self.writeFrames(id, bytes, out, .acknowledgment(now));
+    // §13.2.1 and §7.1 of RFC 9002: an acknowledgment on its own is neither
+    // ack-eliciting nor in flight, so nothing will ever report it lost.
+    const total = try self.writeFrames(id, bytes, out, .{ .now = now, .ack_eliciting = false, .in_flight = false });
     space.acked_through = space.largest_received;
     return total;
 }
@@ -1286,6 +1334,62 @@ fn ackPayload(space: *const Space, payload: []u8) Error![]const u8 {
     var writer: Writer = .init(payload);
     try frame.write(&writer, .{ .ack = ack });
     return writer.written();
+}
+
+/// What to tell the peer when the connection stops (§19.19 of RFC 9000).
+pub const Close = struct {
+    /// The transport error code of §20.1, or the application's own code when
+    /// `application` is set.
+    error_code: u64,
+    /// §19.19's two frame types: 0x1d is the application's, and it has no frame
+    /// type field because an application error cannot name a transport frame.
+    application: bool = false,
+    /// §19.19: the frame type that triggered a transport close, or 0 when the
+    /// caller cannot say which one it was.
+    frame_type: u64 = 0,
+    /// Diagnostic text for the peer's log. This machine never reads it back.
+    reason: []const u8 = "",
+};
+
+/// Seal a packet carrying one CONNECTION_CLOSE frame, and put the connection in
+/// the closing state (§10.2.1).
+///
+/// The space is the highest-numbered one that has keys, because the peer may
+/// already have discarded the lower ones (§4.9.2 of RFC 9001). `frames` is the
+/// caller's scratch for the encoded frame, as in `writeStream`.
+///
+/// A call while already closing is not an error: §10.2.1 lets a closing endpoint
+/// answer a packet that arrives too late, and this is the answer. It is not
+/// required; a caller that would rather resend the packet it already has is
+/// allowed to as well (§12.3 carves that out explicitly).
+pub fn close(self: *Conn, args: Close, frames: []u8, out: []u8, now: Duration) Error!u32 {
+    const id: SpaceId = if (self.app != null)
+        .app
+    else if (self.handshake != null)
+        .handshake
+    else
+        .initial;
+    // Refused by name before anything is sealed when no space has keys yet.
+    _ = try self.spaceFor(id);
+
+    var writer: Writer = .init(frames);
+    try frame.write(&writer, .{ .connection_close = .{
+        .application = args.application,
+        .error_code = args.error_code,
+        .frame_type = if (args.application) null else args.frame_type,
+        .reason = args.reason,
+    } });
+
+    // §13.2.1 and §7.1 of RFC 9002: acknowledgments, PADDING, and
+    // CONNECTION_CLOSE alone are neither ack-eliciting nor in flight, so the
+    // packet is not recorded and nothing will ever call it lost.
+    const total = try self.sealFrames(id, writer.written(), out, .{
+        .now = now,
+        .ack_eliciting = false,
+        .in_flight = false,
+    });
+    self.state = .closing;
+    return total;
 }
 
 /// A payload of `n` PING frames (§19.2): one byte, no fields, and nothing for
@@ -3027,7 +3131,8 @@ test "RFC 9000 §18.2, a received ACK delay is scaled by this endpoint's exponen
         .bytes = &.{},
         .ecn = null,
     } });
-    const first = try server.writeFrames(.initial, writer.written(), &datagram, .acknowledgment(0));
+    const quiet: Write = .{ .now = 0, .ack_eliciting = false, .in_flight = false };
+    const first = try server.writeFrames(.initial, writer.written(), &datagram, quiet);
     _ = try client.feed(datagram[0..first], &plaintext, &frames, &report, ms(100));
     try testing.expectEqual(ms(100), client_loss.shared.rtt.smoothed);
 
@@ -3044,12 +3149,139 @@ test "RFC 9000 §18.2, a received ACK delay is scaled by this endpoint's exponen
         .bytes = &.{},
         .ecn = null,
     } });
-    const second = try server.writeFrames(.initial, writer.written(), &datagram, .acknowledgment(0));
+    const second = try server.writeFrames(.initial, writer.written(), &datagram, quiet);
     _ = try client.feed(datagram[0..second], &plaintext, &frames, &report, ms(300));
     // `latest` is the raw sample; the delay is subtracted from the value the
     // average takes (§5.3), not from the round trip itself.
     try testing.expectEqual(ms(200), client_loss.shared.rtt.latest);
     try testing.expectEqual(ms(111) + 500_000, client_loss.shared.rtt.smoothed);
+}
+
+test "RFC 9000 §10.2.1, a close is written once and nothing is processed after it" {
+    const dcid = [_]u8{ 0x8b, 0x8c };
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x8d},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x8d},
+        .source_connection_id = &dcid,
+    });
+
+    var acked: [8]Recovery.SentPacket = undefined;
+    var lost: [8]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var scratch: [64]u8 = undefined;
+
+    // A packet built before the close, for the "nothing is processed" check
+    // below: unprotecting mutates a datagram in place, so each feed needs its own
+    // bytes and this one is made while the machine still writes.
+    var late: [256]u8 = undefined;
+    const late_length = try client.writeFrames(.initial, &pings(1), &late, .data(0));
+
+    // Only the Initial space has keys, so that is where the close goes: §10.2.1
+    // asks for the highest-numbered space this endpoint can protect a packet in.
+    const length = try client.close(.{
+        .error_code = error_code.Transport.protocol_violation.toInt(),
+        .frame_type = 0x08,
+        .reason = "bad frames",
+    }, &scratch, &datagram, 0);
+    try testing.expectEqual(State.closing, client.state);
+    // §13.2.1 and §7.1 of RFC 9002: a CONNECTION_CLOSE alone is neither
+    // ack-eliciting nor in flight, so nothing in the sent table will ever be
+    // reported lost for it.
+    try testing.expectEqual(@as(usize, 1), client.initial.?.recovery.inFlight().len);
+
+    // The peer reads it, learns the code, and enters the draining state.
+    const opened = try server.feed(datagram[0..length], &plaintext, &frames, &report, 0);
+    try testing.expectEqual(.initial, opened.space);
+    try testing.expectEqual(State.draining, server.state);
+    try testing.expectEqual(@as(usize, 1), opened.frames.len);
+    const received = opened.frames[0].connection_close;
+    try testing.expectEqual(error_code.Transport.protocol_violation.toInt(), received.error_code);
+    try testing.expectEqual(@as(?u64, 0x08), received.frame_type);
+    try testing.expectEqualStrings("bad frames", received.reason);
+    try testing.expect(!received.application);
+
+    // §10.2.1: a closing endpoint processes nothing more. §10.2.2: neither does
+    // a draining one, and it sends nothing at all.
+    try testing.expectError(
+        error.Closed,
+        client.feed(late[0..late_length], &plaintext, &frames, &report, 0),
+    );
+    try testing.expectError(
+        error.Closed,
+        server.feed(late[0..late_length], &plaintext, &frames, &report, 0),
+    );
+    try testing.expectError(
+        error.Closed,
+        client.writeFrames(.initial, &pings(1), &datagram, .data(0)),
+    );
+    try testing.expectError(
+        error.Closed,
+        server.writeFrames(.initial, &pings(1), &datagram, .data(0)),
+    );
+    try testing.expectError(error.Closed, server.writeAck(.initial, &datagram, 0));
+    try testing.expect(!server.ackOwed(.initial));
+
+    // §10.2.1: a closing endpoint answers a packet that arrives too late. The
+    // answer is another CONNECTION_CLOSE, and it is the one write a closed
+    // connection still makes.
+    try testing.expect(try client.close(.{ .error_code = 0 }, &scratch, &datagram, 0) > 0);
+}
+
+test "RFC 9000 §19.19, an application close carries the application's code" {
+    const dcid = [_]u8{0x8e};
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x8f},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x8f},
+        .source_connection_id = &dcid,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x41);
+    const server_secret: [protection.secret_length]u8 = @splat(0x42);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var acked: [8]Recovery.SentPacket = undefined;
+    var lost: [8]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var scratch: [64]u8 = undefined;
+
+    // 1-RTT keys exist, so the close goes there and the peer reads it in the
+    // application space (§10.2.1).
+    const length = try client.close(.{ .application = true, .error_code = 0x42 }, &scratch, &datagram, 0);
+    const opened = try server.feed(datagram[0..length], &plaintext, &frames, &report, 0);
+    try testing.expectEqual(.app, opened.space);
+    const received = opened.frames[0].connection_close;
+    try testing.expect(received.application);
+    try testing.expectEqual(@as(u64, 0x42), received.error_code);
+    // §19.19: an application close has no frame type field at all.
+    try testing.expectEqual(@as(?u64, null), received.frame_type);
+    try testing.expectEqual(State.draining, server.state);
 }
 
 /// Stand in for the TLS driver: hand an endpoint a space directly, with the
