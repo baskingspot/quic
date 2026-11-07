@@ -243,34 +243,44 @@ and `Stub` for a caller that has no TLS.
 
 What is still unwired, in the order I would take it:
 
-1. `Recovery` has no caller in `Conn`, so nothing is acknowledged in the loss
-   sense, nothing is ever declared lost, no PTO is armed, and ACK frames still
-   come back in `Opened.frames` as caller events. The shape to build, because it
-   is the one that does not create a self-reference:
+1. **Wire `Recovery` into `Conn`.** Nothing is acknowledged in the loss sense,
+   nothing is ever declared lost, no PTO is armed, and ACK frames still come back
+   in `Opened.frames` as caller events. Do this before `connection_setup` and the
+   close path: acknowledgments and loss detection are what make the machine a
+   transport at all, and the rest is protocol surface that can land after.
+
+   **The trap, first.** `Recovery.Space` holds `*Recovery`, and `Conn.init`
+   returns `Conn` by value, so the caller's assignment copies it. A `Recovery`
+   field inside `Conn` therefore leaves every space pointing at the pre-move
+   address. That is a dangling pointer, and it surfaces much later as recovery
+   state that changes on its own, with no path back to the cause. The `Recovery`
+   and its sent tables live outside `Conn`; `Conn` holds a pointer to them.
+
+   The four API changes:
 
    - `Conn.Config` gains `recovery: *Recovery` and three caller-owned sent
-     tables (`sent_initial`, `sent_handshake`, `sent_app`). The `Recovery` must
-     live outside `Conn`: `Recovery.Space` holds `*Recovery`, and `Conn` is
-     returned by value from `init`, so a `Recovery` field inside `Conn` would
-     leave every space pointing at the old address the moment `init`'s result is
-     copied.
-   - `Conn.Space` holds `?Recovery.Space`, created from `Config` on first use and
-     taken away by `Conn.discard`, which also calls `Space.discard()` (§6.4:
-     loss state goes with the keys).
-   - `Conn` has no clock today, so every write and every feed grows a `now:
-     Duration`. `writeFrames` also has to record the packet: whether it is
-     ack-eliciting and in flight is a property of the frames the caller put
-     inside, which the machine never parses, so the caller says it. An options
-     struct keeps the two bools from being swapped.
-   - `feed` gains enough information to route an ACK: `.ack` frames go to
-     `space.recovery.onAckReceived(ack, now, options, events)` and stop coming
-     back in `Opened.frames`. `events` is caller storage, passed in the same way
-     `frames` is. `Options` (`max_ack_delay`, `peer_address_validated`,
-     `handshake_confirmed`) comes from `Config` plus the handshake seam's
-     `confirmed`.
-   - The caller reads `nextTimer`/`onTimeout` through `RecoveryDriver`, which
-     already exists and is tested; `Conn` should not grow a timer loop of its
-     own.
+     tables, `sent_initial`, `sent_handshake`, `sent_app`: `[]Recovery.SentPacket`,
+     each non-empty and at least as long as the `Recovery.Events` report the
+     caller passes to `feed`.
+   - `Conn.Space` gains `?Recovery.Space`, built from the config table on first
+     use and taken away by `Conn.discard`, which calls `Space.discard()` before
+     it zeroes the keys, because §6.4 puts the loss state in the same grave.
+   - `Conn` has no clock, so `feed` and the writers grow `now: Duration`.
+     Whether a packet is ack-eliciting and in flight is a property of the frames
+     the caller put inside, and the machine never parses what it just sealed, so
+     `writeFrames` takes both as an options struct: two bools in positional
+     arguments is a swap waiting to happen.
+   - `feed` takes `events: *Recovery.Events` beside `frames`. `.ack` frames go
+     to `space.recovery.onAckReceived(ack, now, options, events)` and stop
+     coming back in `Opened.frames`; the `Options` fields come from `Config`
+     plus the handshake seam's `confirmed()`. The caller drives
+     `RecoveryDriver` for timers; `Conn` grows no timer loop of its own.
+
+   Tests that pin it: an ACK covering a sent packet empties `inFlight` and
+   reports the record in `events`; a packet never acknowledged becomes lost
+   after the loss delay, named by packet number so the caller's resend queue can
+   find its own description of it; and `.ack` no longer appears in
+   `Opened.frames`.
 
 2. `connection_setup` on the server side, Retry and version negotiation state on
    the client side, and the connection close path every error above is waiting
