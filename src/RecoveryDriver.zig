@@ -257,6 +257,14 @@ test "RFC 9002 §6.4, discarding a space removes its timer and keeps the RTT" {
     try testing.expectEqual(Recovery.TimerKind.none, h.driver.deadline(.{}).kind);
     try testing.expectEqual(@as(usize, 0), h.space_a.sent_len);
 
+    // §6.2.2.1 arms an anti-deadlock probe with nothing in flight for a client
+    // that has not seen its address validated, and a discarded space must not
+    // answer that. Space B is untouched and still does, so the deadline names
+    // it rather than the space whose keys went.
+    const armed = h.driver.deadline(.{ .peer_address_validated = false });
+    try testing.expectEqual(Recovery.TimerKind.probe, armed.kind);
+    try testing.expectEqual(@as(usize, 1), armed.space);
+
     // §6.4 removes the packets and the timers, not the path's estimate (A.2).
     try testing.expectEqual(ms(80), h.shared.rtt.smoothed);
 

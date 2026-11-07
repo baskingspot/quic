@@ -150,7 +150,10 @@ pub const Events = struct {
         return self.lost[0..self.lost_len];
     }
 
-    fn clear(self: *Events) void {
+    /// Start a new report. The machine calls this once per packet it parses, so
+    /// a report describes the call the caller just made and never the one
+    /// before it.
+    pub fn clear(self: *Events) void {
         self.acked_len = 0;
         self.acked_bytes = 0;
         self.lost_len = 0;
@@ -313,6 +316,11 @@ pub const Space = struct {
     run_start: Duration = 0,
     run_last: u64 = 0,
     run_eliciting: u32 = 0,
+    /// §6.4: the keys this space was using are gone, and the loss state goes
+    /// with them. A discarded space cannot send, so it must contribute no
+    /// timer: the anti-deadlock probe of §6.2.2.1 is what would otherwise arm
+    /// itself forever for a client that still doubts the peer's address.
+    discarded: bool = false,
 
     pub fn rtt(self: *const Space) *const Rtt {
         return &self.shared.rtt;
@@ -345,7 +353,7 @@ pub const Space = struct {
         sent_bytes: u32,
     ) Error!void {
         assert(self.sentValid());
-        if (self.sent_len == self.sent.len) return error.NoSpace;
+        if (!self.hasRoom()) return error.NoSpace;
         self.sent[self.sent_len] = .{
             .packet_number = packet_number,
             .time_sent = now,
@@ -496,10 +504,15 @@ pub const Space = struct {
         self.run_start = 0;
         self.run_last = 0;
         self.run_eliciting = 0;
+        self.discarded = true;
     }
 
     /// The timer the caller should set after any event (§6.1.2 and §6.2.1, A.8).
     pub fn nextTimer(self: *Space, options: Options) Timer {
+        // §6.4: the timers of a discarded space are reset, and nothing below
+        // may re-arm one. Without this the anti-deadlock branch at the end
+        // returns a probe at every call, forever.
+        if (self.discarded) return .{ .kind = .none };
         if (self.loss_time != 0) return .{ .kind = .loss, .at = self.loss_time };
 
         // A.8: with nothing ack-eliciting in flight, and a peer whose address is
@@ -557,6 +570,14 @@ pub const Space = struct {
             if (packet.ack_eliciting and packet.in_flight) return true;
         }
         return false;
+    }
+
+    /// Whether one more packet fits. Asking first is what lets a writer refuse
+    /// a full table before it seals anything, so the caller's output buffer and
+    /// the packet number counter are untouched on the way out.
+    pub fn hasRoom(self: *const Space) bool {
+        assert(self.sentValid());
+        return self.sent_len < self.sent.len;
     }
 
     /// Drop the record at `index`, moving the tail down over it. The index and
@@ -944,6 +965,22 @@ test "RFC 9002 §6.2.1, a client keeps its backoff while it doubts the address" 
     };
     try sp.onAckReceived(&ack, ms(2000), .{ .peer_address_validated = false }, &events);
     try testing.expectEqual(@as(u5, 1), h.conn.pto_count);
+}
+
+test "RFC 9002 §6.4, a discarded space arms no timer even for a client that doubts the address" {
+    var h: Harness = .{};
+    var sp = h.space();
+
+    // §6.2.2.1: with nothing in flight and an address it has not seen
+    // validated, a client arms a probe it will never otherwise cancel.
+    const unvalidated: Options = .{ .peer_address_validated = false };
+    try testing.expectEqual(TimerKind.probe, sp.nextTimer(unvalidated).kind);
+
+    // §6.4: the keys went, and the probe with them.
+    sp.discard();
+    try testing.expectEqual(TimerKind.none, sp.nextTimer(unvalidated).kind);
+    // The path's estimate is not the space's to lose (A.2).
+    try testing.expectEqual(initial_rtt, h.conn.rtt.smoothed);
 }
 
 test "RFC 9002 §6.2.2.1, a client with nothing in flight still arms a probe" {
