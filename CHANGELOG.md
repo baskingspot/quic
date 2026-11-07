@@ -175,6 +175,13 @@ All notable changes to quic are recorded here. The format follows
   closed connection answers `error.Closed` to `feed` and to every writer except
   `close` itself, `ackOwed` is false, and a peer's CONNECTION_CLOSE comes back in
   `Opened.frames` with the code it was given.
+- `Conn` owns the client's handshake attempt (`connection_setup.Client`), so the
+  §6.2 rule "discard a Version Negotiation after anything else arrived" is the
+  machine's to enforce rather than the caller's to remember.
+  `Conn.onVersionNegotiation` answers with `connection_setup.VersionNegotiation.Action`,
+  which has no "change version" branch, and a server gets `error.WrongRole`
+  because it has no attempt. A 1-RTT packet sent records §17.2.5.2's deadline for
+  accepting a Retry.
 
 ### Changed
 

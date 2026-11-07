@@ -34,6 +34,7 @@ const SendStream = @import("SendStream.zig");
 const StreamTable = @import("StreamTable.zig");
 const stream_id = @import("stream_id.zig");
 const frame = @import("frame.zig");
+const setup = @import("connection_setup.zig");
 const seam = @import("handshake.zig");
 const packet = @import("packet.zig");
 const packet_number = @import("packet_number.zig");
@@ -119,6 +120,9 @@ pub const Error = protection.Error ||
         /// CONNECTION_CLOSE, so it processes no more packets. Only the close
         /// itself may still be written.
         Closed,
+        /// The call only means something to one end of the connection: a server
+        /// has no handshake attempt to remember (§6.2).
+        WrongRole,
     };
 
 /// Where loss recovery's state lives: the caller's, outside the connection.
@@ -366,6 +370,10 @@ packet_number_len: u3,
 /// calls this endpoint.
 destination_connection_id: []const u8,
 source_connection_id: []const u8,
+/// §6.2 and §17.2.5.2: the client's memory of what the server has said, which
+/// is what decides whether a Version Negotiation or a Retry still counts. Absent
+/// on a server, which never has to remember either.
+attempt: ?setup.Client,
 /// The caller's loss recovery storage, kept as the handles it is: everything
 /// here points outside this value, so a copy of a `Conn` does not copy any state
 /// that matters. See `Loss`.
@@ -423,6 +431,13 @@ pub fn init(config: Config) Conn {
 
     return .{
         .role = config.role,
+        // §6.2: the attempt is built around the Destination Connection ID the
+        // first Initial carried, because that is what a Retry's tag covers
+        // (§5.8 of RFC 9001). A server never needs it.
+        .attempt = if (config.role == .client)
+            setup.Client.init(config.original_destination_connection_id)
+        else
+            null,
         .packet_number_len = config.packet_number_len,
         .destination_connection_id = config.destination_connection_id,
         .source_connection_id = config.source_connection_id,
@@ -599,6 +614,11 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
         space.largest_received,
         plaintext,
     );
+
+    // §6.2 and §17.2.5.2: once anything from the server has been processed, a
+    // Version Negotiation is discarded and a Retry is too late. A packet that
+    // decrypted is the server having spoken, whatever it said inside.
+    if (self.attempt) |*attempt| attempt.onServerResponse();
 
     // §17.2.2.1: a server lets its Initial keys go when it first processes a
     // Handshake packet. A client's moment is the first Handshake packet it
@@ -1167,6 +1187,26 @@ pub fn onFlowControlSent(self: *Conn, frames: []const frame.Frame) void {
     }
 }
 
+/// §6.2: what a client does with a Version Negotiation packet.
+///
+/// The packet is not part of a connection — a server sends it before it has one,
+/// and this package speaks one version — so it never reaches `feed`. The caller
+/// parses it and asks; the machine remembers whether the server has said
+/// anything else first, which is the rule that makes the answer `.ignore`.
+///
+/// The return type of `setup.VersionNegotiation.Action` has no "different
+/// version" in it: a client that supports only the version it tried abandons the
+/// attempt (§6.2), so a caller cannot negotiate into a version this package
+/// cannot speak.
+pub fn onVersionNegotiation(
+    self: *Conn,
+    response: *const packet.VersionNegotiation,
+) Error!setup.VersionNegotiation.Action {
+    const attempt = if (self.attempt) |*attempt| attempt else return error.WrongRole;
+    // The version this machine speaks, which is the only one it is built for.
+    return attempt.onVersionNegotiation(response, .v1);
+}
+
 /// §6.2.1 of RFC 9002: the peer has validated this endpoint's address, so an
 /// acknowledgment may reset the PTO backoff again.
 ///
@@ -1287,6 +1327,13 @@ fn sealFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8, write: Wr
     );
 
     space.next_packet_number += 1;
+
+    // §17.2.5.2: a Retry that arrives after this endpoint has sent a 1-RTT
+    // packet is discarded, because the handshake has plainly moved on.
+    if (id == .app) {
+        if (self.attempt) |*attempt| attempt.onOneRttSent();
+    }
+
     return sealed;
 }
 
@@ -1420,6 +1467,112 @@ pub fn close(self: *Conn, args: Close, frames: []u8, out: []u8, now: Duration) E
 fn pings(comptime n: usize) [n]u8 {
     return @splat(0x01);
 }
+test "RFC 9000 §6.2, a version negotiation counts only before the server has spoken" {
+    const dcid = [_]u8{0x91};
+    var first_loss: LossTables = .{};
+    var fresh: Conn = .init(.{
+        .role = .client,
+        .loss = first_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x92},
+    });
+    var second_loss: LossTables = .{};
+    var answered: Conn = .init(.{
+        .role = .client,
+        .loss = second_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x92},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x92},
+        .source_connection_id = &dcid,
+    });
+
+    // The versions a server might offer: one this package cannot speak, and the
+    // one it does.
+    const other = [_]u8{ 0xfa, 0x0a, 0x0a, 0x0a };
+    const offers: packet.VersionNegotiation = .{
+        .destination_connection_id = &.{},
+        .source_connection_id = &.{},
+        .versions = &other,
+    };
+    const ours = [_]u8{ 0x00, 0x00, 0x00, 0x01 };
+    const lists_v1: packet.VersionNegotiation = .{
+        .destination_connection_id = &.{},
+        .source_connection_id = &.{},
+        .versions = &ours,
+    };
+
+    // §6.2: the packet never reaches `feed`, so the caller parses it and asks.
+    // A client that supports only the version it tried abandons the attempt;
+    // there is no other action in the type.
+    try testing.expectEqual(
+        setup.VersionNegotiation.Action.abandon,
+        try fresh.onVersionNegotiation(&offers),
+    );
+
+    // The version the client selected may not appear in the list at all, so a
+    // packet that lists it is invalid and discarded before anything else.
+    try testing.expectEqual(
+        setup.VersionNegotiation.Action.ignore,
+        try fresh.onVersionNegotiation(&lists_v1),
+    );
+
+    // Once anything at all has arrived from the server, the negotiation is too
+    // late, whichever version it names.
+    var acked: [8]Recovery.SentPacket = undefined;
+    var lost: [8]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var datagram: [256]u8 = undefined;
+    var plaintext: [256]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    const sent = try server.writeFrames(.initial, &pings(1), &datagram, .data(0));
+    _ = try answered.feed(datagram[0..sent], &plaintext, &frames, &report, 0);
+    try testing.expectEqual(
+        setup.VersionNegotiation.Action.ignore,
+        try answered.onVersionNegotiation(&offers),
+    );
+
+    // A server has no attempt to remember, and says so instead of pretending.
+    try testing.expectError(error.WrongRole, server.onVersionNegotiation(&offers));
+}
+
+test "RFC 9000 §17.2.5.2, a 1-RTT packet ends the window for a Retry" {
+    const dcid = [_]u8{0x93};
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x94},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x94},
+        .source_connection_id = &dcid,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x51);
+    const server_secret: [protection.secret_length]u8 = @splat(0x52);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [256]u8 = undefined;
+    try testing.expect(!client.attempt.?.one_rtt_sent);
+    // A packet in the application space is 1-RTT, and from then on a Retry is
+    // discarded however well it validates.
+    _ = try client.writeFrames(.app, &pings(1), &datagram, .data(0));
+    try testing.expect(client.attempt.?.one_rtt_sent);
+}
+
 /// The caller's side of the timer, which only the tests here exercise: a
 /// connection owns no timer, so "when do I wake up" is asked of `RecoveryDriver`
 /// over the spaces the machine owns.
