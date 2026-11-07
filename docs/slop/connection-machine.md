@@ -158,8 +158,8 @@ PMTUD, key update, and the 0-RTT path. Each is its own note.
 
 State as of the three spaces, the datagram walk, key discard, the TLS seam,
 frame parsing, streams, the receive-side flow control generator, loss recovery,
-the close path, the client's handshake attempt, and CRYPTO retention: 213
-tests.
+the close path, the client's handshake attempt, CRYPTO retention, and the client's
+Retry: 216 tests.
 
 ### The TigerStyle pass
 
@@ -317,43 +317,48 @@ zero.
   table this design refuses to keep. Re-sending a prefix is legal and cheap for a
   handshake (§19.6 makes the peer drop what it already has by offset).
 
-### The Retry path, which is now open
+### The client's Retry, landed
 
-`Conn.attempt` is already maintained (`retried`, `responded`, `one_rtt_sent`),
-and the bytes are now replayable. What is left is one operation, and it has a
-trap in it: **do not route the rekey through `Conn.discard` or
-`Conn.discardIfPresent`.** Both call `clear`, which forgets the level's CRYPTO
-bytes — and the ClientHello that must be re-sent lives in exactly that buffer.
-The rekey builds a new `Recovery.Space` and `Space` value over the same table,
-keeps `next_packet_number` (§17.2.5.3 forbids resetting it), adopts the Retry's
-Source Connection ID as the Destination, and leaves `crypto_sent[initial]`
-alone.
+`Conn.onRetry(retry, raw)` is the whole of it, and the order inside it is the
+design:
 
-Two smaller pieces it needs:
+1. A server has no attempt, so it is `error.WrongRole`.
+2. A Retry that does not name this endpoint's own Source Connection ID is
+   `.ignored` before the tag is even checked (§17.2.5.2), because it costs
+   nothing and settles the question.
+3. The caller's `retry_storage` has to hold the connection ID plus the token, or
+   the call is `error.NoSpace` — before any state moves, so a Retry cannot be
+   half-accepted.
+4. `connection_setup.Client.onRetry` decides `.ignored` against `.accepted` with
+   the tag, the one-Retry rule, and the "after the server spoke" rule.
+5. On acceptance the connection ID and token are copied out of the datagram and
+   adopted, and `rekeyInitial` builds a live Initial space over the new
+   Destination Connection ID (§5.2 of RFC 9001), keeping the packet number
+   (§17.2.5.3) and leaving `crypto_sent[initial]` alone.
 
-- a token: `Conn` has no field for the §17.2.2 token that goes in every Initial a
-  client sends, and `packet.writeLong` already takes one, so `writeFrames` needs
-  to pass it for `.initial`.
-- `Conn.onRetry(retry, raw)` wrapping `connection_setup.Retry.validate` and
-  `Client.onRetry`, so the one-Retry rule stays where the state is. The server
-  half needs nothing: a server seeing a retried Initial builds its connection from
-  its own Source Connection ID, which is what `Conn.init` already does when the
-  caller passes it.
+Things that were easy to get wrong and are now pinned by tests:
+
+- **The datagram does not outlive the call.** `retry.source_connection_id` and
+  `retry.token` point into the caller's receive buffer, which the caller reuses
+  for the next packet. Both are copied into `Config.retry_storage`, and a test
+  overwrites the Retry's bytes before the client sends again.
+- **The rekey must not go through `discard`.** That calls `clear`, which forgets
+  the level's CRYPTO bytes — and the ClientHello to re-send is exactly there.
+- **The packet number is carried across.** A test has the client send at 0, take
+  a Retry, re-send its flight, and the server reads packet number 1.
+- **The new keys are the ones the server can read.** The same test builds the
+  server from the Retry's Source Connection ID, which is where its Initial keys
+  come from, and the retried packet opens.
 
 ### What is still unwired, in the order I would take it
 
-1. The client's Retry: the rekey, the token, and `Conn.onRetry`, as the section
-   above lays out. `Conn.attempt` is already maintained, and version negotiation
-   is already wired — `Conn.onVersionNegotiation` and the attempt's own history
-   decide `.ignore` against `.abandon`, and the action type cannot name a version
-   this package cannot speak.
-2. MAX_STREAMS when a stream slot frees. The receive-side MAX_DATA and
+1. MAX_STREAMS when a stream slot frees. The receive-side MAX_DATA and
    MAX_STREAM_DATA generation landed; this is the one limit still never raised.
-3. The stream scheduler that decides which `SendStream` gets the next packet.
-4. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
+2. The stream scheduler that decides which `SendStream` gets the next packet.
+3. `varint.decode`'s error set includes `NonMinimal`, which it never returns, so
    both callers carry an `unreachable` arm for it. Narrowing the set to
    `error{Truncated}` deletes those arms.
-5. `InitialSpace` is still a file with its own tests and no user. The machine
+4. `InitialSpace` is still a file with its own tests and no user. The machine
    covers everything it did; deleting it takes the duplicated `largest_acked` out
    of the tree, which is what this note always said would happen.
 
