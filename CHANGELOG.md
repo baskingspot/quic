@@ -191,6 +191,17 @@ All notable changes to quic are recorded here. The format follows
   (CRYPTO_BUFFER_EXCEEDED, §20.1), the replay is idempotent, and a discarded
   space replays nothing. `Conn.Space.crypto_sent_bytes` is gone: the buffer's
   length is the offset.
+- `Conn.onRetry` completes the client's side of RFC 9000 §17.2.5: it discards a
+  Retry that does not name this endpoint's connection ID, validates the integrity
+  tag (§5.8 of RFC 9001), refuses a second one or one that arrives after the
+  server has spoken, and on acceptance adopts the Retry's connection ID and token
+  and rekeys the Initial space from the new Destination Connection ID (§5.2 of
+  RFC 9001). Packet numbers continue rather than restarting (§17.2.5.3), the
+  packets sent under the old keys are dropped rather than declared lost, and the
+  handshake bytes stay in `replayCrypto(.initial)` so the ClientHello can go out
+  again. `Conn.Config` gained `token`, which every Initial carries (§8.1.2), and
+  `retry_storage`, where the adopted connection ID and token are copied so the
+  machine never points into a datagram the caller will reuse.
 
 ### Changed
 

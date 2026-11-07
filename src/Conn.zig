@@ -95,6 +95,7 @@ pub const SpaceId = enum { initial, handshake, app };
 
 pub const Error = protection.Error ||
     packet.Error ||
+    setup.Retry.Error ||
     frame.Error ||
     seam.Error ||
     Recovery.Error ||
@@ -183,6 +184,16 @@ pub const Config = struct {
     /// observe validation, so the caller seeds this and flips the field of the
     /// same name on `Conn` when it happens.
     peer_address_validated: bool = true,
+    /// §17.2.2: the address validation token, empty unless a Retry or a
+    /// NEW_TOKEN frame gave one. It goes in every Initial packet this endpoint
+    /// sends (§8.1.2), and a Retry replaces it.
+    token: []const u8 = "",
+    /// Where a Retry's connection ID and token are copied to (§17.2.5.3). They
+    /// arrive inside the datagram, which the caller reuses for the next one, so
+    /// the machine cannot keep pointing at them. Size it for the largest
+    /// connection ID plus token this client expects to be handed; a Retry that
+    /// does not fit is `error.NoSpace` before any of it is adopted.
+    retry_storage: []u8 = "",
     /// The truncation width to use. §17.1 makes this a function of what the
     /// peer has acknowledged; until that lands, the caller picks, and four
     /// bytes is always legal.
@@ -390,6 +401,12 @@ packet_number_len: u3,
 /// calls this endpoint.
 destination_connection_id: []const u8,
 source_connection_id: []const u8,
+/// §17.2.2: the token this endpoint puts in its Initial packets. Empty until a
+/// Retry (or a caller handing over a NEW_TOKEN value) gives it one.
+token: []const u8,
+/// The caller's storage that `token` and a Retry's connection ID live in once
+/// they have been copied out of the datagram they arrived in.
+retry_storage: []u8,
 /// §6.2 and §17.2.5.2: the client's memory of what the server has said, which
 /// is what decides whether a Version Negotiation or a Retry still counts. Absent
 /// on a server, which never has to remember either.
@@ -470,6 +487,8 @@ pub fn init(config: Config) Conn {
         .destination_connection_id = config.destination_connection_id,
         .source_connection_id = config.source_connection_id,
         .loss = config.loss,
+        .token = config.token,
+        .retry_storage = config.retry_storage,
         .ack_delay_exponent = config.ack_delay_exponent,
         .max_ack_delay = config.max_ack_delay,
         .peer_address_validated = config.peer_address_validated,
@@ -1280,6 +1299,82 @@ pub fn onVersionNegotiation(
     return attempt.onVersionNegotiation(response, .v1);
 }
 
+/// §17.2.5.2: what a client does with a Retry packet.
+///
+/// `retry` is the parsed packet and `raw` the bytes it came from, because the
+/// integrity tag covers the bytes (§5.8 of RFC 9001). `.ignored` means the Retry
+/// arrived after the server had already spoken, or after a 1-RTT packet, or is a
+/// second one; `.accepted` means the connection has been rekeyed and its
+/// handshake bytes are waiting in `replayCrypto(.initial)`.
+///
+/// The rekey does not go through `Conn.discard`: that forgets the level's CRYPTO
+/// bytes, and the ClientHello this Retry exists to re-send lives in exactly that
+/// buffer.
+pub fn onRetry(self: *Conn, retry: *const packet.Retry, raw: []const u8) Error!setup.Client.Outcome {
+    const attempt = if (self.attempt) |*attempt| attempt else return error.WrongRole;
+
+    // §17.2.5.2: a Retry that does not name this endpoint's own connection ID is
+    // discarded. Checked before the integrity tag, like the state checks in
+    // `Client.onRetry`, because it costs nothing and settles the question.
+    if (!std.mem.eql(u8, retry.destination_connection_id, self.source_connection_id)) return .ignored;
+
+    // The connection ID and token point into the datagram, which the caller will
+    // reuse. Refused before anything is adopted, so a configuration too small for
+    // them cannot half-accept a Retry.
+    const adopted = retry.source_connection_id.len + retry.token.len;
+    if (adopted > self.retry_storage.len) return error.NoSpace;
+
+    const outcome = try attempt.onRetry(retry, raw);
+    if (outcome == .ignored) return outcome;
+
+    // §17.2.5.3: the client copies the Retry's Source Connection ID into the
+    // Destination it uses from then on, and the token into every Initial it
+    // sends. Both are copied out of the datagram first, because nothing here may
+    // keep a pointer into it.
+    const connection_id = retry.source_connection_id;
+    @memcpy(self.retry_storage[0..connection_id.len], connection_id);
+    @memcpy(self.retry_storage[connection_id.len..][0..retry.token.len], retry.token);
+    self.destination_connection_id = self.retry_storage[0..connection_id.len];
+    self.token = self.retry_storage[connection_id.len..][0..retry.token.len];
+
+    self.rekeyInitial(self.destination_connection_id);
+    return outcome;
+}
+
+/// RFC 9001 §5.2 with §17.2.5.3: the Initial keys come from the Destination
+/// Connection ID, so a Retry means new keys, and the packet number does not
+/// restart.
+fn rekeyInitial(self: *Conn, destination_connection_id: []const u8) void {
+    const secrets = protection.initialSecrets(destination_connection_id);
+    const suite = protection.Suite.aes_128_gcm;
+    const client = protection.deriveKeys(&secrets.client, suite) catch unreachable;
+    const server = protection.deriveKeys(&secrets.server, suite) catch unreachable;
+
+    // §17.2.5.2 lets a client accept a Retry only before anything arrived from
+    // the server, and its Initial keys only go once it has sent a Handshake
+    // packet, which needs that flight first. So the space is always here, and the
+    // assert says so rather than letting a rejected Retry resurrect dead keys.
+    std.debug.assert(self.initial != null);
+
+    // §17.2.5.3: "A client MUST NOT reset the packet number for any packet
+    // number space after processing a Retry packet." The counter is the one
+    // thing the old space keeps.
+    const next_packet_number = self.initial.?.next_packet_number;
+
+    // A live space over the caller's table again: the packets sent under the old
+    // keys were never seen by the server, so they are dropped rather than
+    // declared lost, and a fresh `Recovery.Space` says exactly that. The RTT
+    // estimate is the path's and is not touched (RFC 9002 A.2). The received
+    // ranges are empty because a Retry is only accepted before anything arrived
+    // (§17.2.5.2).
+    self.initial = .{
+        .send_keys = if (self.role == .client) client else server,
+        .receive_keys = if (self.role == .client) server else client,
+        .recovery = self.loss.shared.space(self.loss.table(.initial)),
+        .next_packet_number = next_packet_number,
+    };
+}
+
 /// §6.2.1 of RFC 9002: the peer has validated this endpoint's address, so an
 /// acknowledgment may reset the PTO backoff again.
 ///
@@ -1371,6 +1466,9 @@ fn sealFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8, write: Wr
             .source_connection_id = self.source_connection_id,
             .packet_number_len = pn_len,
             .body_len = @as(u32, pn_len) + @as(u32, @intCast(frames.len)) + protection.tag_length,
+            // §17.2.2: only an Initial carries one, which `writeLong` enforces
+            // too.
+            .token = if (id == .initial) self.token else "",
         })).packet_number,
         .app => (try packet.writeShort(&writer, .{
             .destination_connection_id = self.destination_connection_id,
@@ -1728,6 +1826,189 @@ test "RFC 9000 §20.1, a CRYPTO send buffer too small refuses the message" {
     // replay. A truncated frame here would look like a sent flight.
     try testing.expectEqual(before, client.initial.?.next_packet_number);
     try testing.expectEqual(@as(usize, 0), client.replayCrypto(.initial).len);
+}
+
+test "RFC 9000 §8.1.2, every Initial a client sends carries the token" {
+    const dcid = [_]u8{ 0xa1, 0xa2 };
+    var loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xa3},
+        .token = "address-validation",
+    });
+
+    var datagram: [256]u8 = undefined;
+    const sent = try client.writeFrames(.initial, &pings(1), &datagram, .data(0));
+    const long = try packet.parseLong(datagram[0..sent]);
+    // §8.1.2: "The client MUST include the token in all Initial packets it
+    // sends, unless a Retry replaces the token with a newer one."
+    try testing.expectEqualStrings("address-validation", long.token);
+    // §17.2.2: no other packet type has a token field, and `writeLong` refuses
+    // one, so a machine that ever set this for another space would fail loudly.
+    const secret: [protection.secret_length]u8 = @splat(0x55);
+    const keys = protection.deriveKeys(&secret, .aes_128_gcm) catch unreachable;
+    plantSpace(&client, .handshake, keys, keys);
+    var other: [256]u8 = undefined;
+    const handshake = try client.writeFrames(.handshake, &pings(1), &other, .data(0));
+    try testing.expectEqualStrings("", (try packet.parseLong(other[0..handshake])).token);
+}
+
+test "RFC 9000 §17.2.5.3, a Retry rekeys the Initial space and keeps its packet number" {
+    const dcid = [_]u8{ 0xb1, 0xb2 };
+    const client_scid = [_]u8{ 0xb3, 0xb4 };
+    const retry_scid = [_]u8{ 0xb5, 0xb6, 0xb7 };
+    const hello = "ClientHello bytes";
+    const client_secret: [protection.secret_length]u8 = @splat(0x71);
+    const server_secret: [protection.secret_length]u8 = @splat(0x72);
+    var stub: seam.Stub = .{
+        .outbox = &.{.{ .level = .initial, .bytes = hello }},
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+    };
+    var sent_initial: [64]u8 = undefined;
+    var retry_storage: [64]u8 = undefined;
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &client_scid,
+        .tls = stub.driver(),
+        .crypto_sent = .{ .initial = &sent_initial },
+        .retry_storage = &retry_storage,
+    });
+
+    var frames: [128]u8 = undefined;
+    var datagram: [512]u8 = undefined;
+    _ = (try client.writeHandshake(&frames, &datagram, 0)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 1), client.initial.?.next_packet_number);
+
+    // The server challenges (§17.2.5), naming its own connection ID and a token.
+    var retry_bytes: [256]u8 = undefined;
+    const retry_length = try setup.Retry.write(&retry_bytes, &dcid, .{
+        .destination_connection_id = &client_scid,
+        .source_connection_id = &retry_scid,
+        .token = "retry-token",
+    });
+    const retry = try packet.parseRetry(try packet.parseInvariant(retry_bytes[0..retry_length]));
+
+    // §17.2.5.2: the tag validates against the client's first Destination
+    // Connection ID, which is why the machine kept it as the "original" one.
+    try testing.expectEqual(
+        setup.Client.Outcome.accepted,
+        try client.onRetry(&retry, retry_bytes[0..retry_length]),
+    );
+    try testing.expectEqualSlices(u8, &retry_scid, client.destination_connection_id);
+    try testing.expectEqualStrings("retry-token", client.token);
+    // §17.2.5.3: the packet number is not reset, and it did not restart here.
+    try testing.expectEqual(@as(u64, 1), client.initial.?.next_packet_number);
+    // §13.3: the ClientHello survives the rekey, because it is the thing the
+    // Retry exists to make the client send again.
+    try testing.expectEqualStrings(hello, client.replayCrypto(.initial));
+
+    // The connection ID and token were borrowed from the datagram, and the caller
+    // reuses that buffer for the next packet. The machine copied them, so
+    // overwriting the bytes it read changes nothing about what it sends.
+    @memset(retry_bytes[0..retry_length], 0xee);
+
+    // The keys are the ones the server derives from its own Source Connection ID
+    // (§5.2 of RFC 9001), which is what makes the retried Initial readable at
+    // all. The client re-sends its flight at offset zero under the new keys, and
+    // the server opens it and sees packet number 1: continued, not restarted.
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &retry_scid,
+        .destination_connection_id = &client_scid,
+        .source_connection_id = &retry_scid,
+    });
+    var payload: [128]u8 = undefined;
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .crypto = .{
+        .offset = 0,
+        .data = client.replayCrypto(.initial),
+    } });
+    const resent = try client.writeFrames(.initial, writer.written(), &datagram, .data(0));
+
+    const long = try packet.parseLong(datagram[0..resent]);
+    try testing.expectEqualStrings("retry-token", long.token);
+    try testing.expectEqualSlices(u8, &retry_scid, long.destination_connection_id);
+
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var plaintext: [512]u8 = undefined;
+    var frames_in: [8]frame.Frame = undefined;
+    const opened = try server.feed(datagram[0..resent], &plaintext, &frames_in, &report, 0);
+    try testing.expectEqual(.initial, opened.space);
+    try testing.expectEqual(@as(u64, 1), opened.packet_number);
+}
+
+test "RFC 9000 §17.2.5.2, a Retry that is not ours, or is late, is ignored" {
+    const dcid = [_]u8{0xb8};
+    const client_scid = [_]u8{ 0xb9, 0xba };
+    const retry_scid = [_]u8{ 0xbb, 0xbc };
+    var retry_storage: [64]u8 = undefined;
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &client_scid,
+        .retry_storage = &retry_storage,
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &client_scid,
+        .source_connection_id = &retry_scid,
+    });
+
+    var retry_bytes: [256]u8 = undefined;
+    var datagram: [256]u8 = undefined;
+    var plaintext: [256]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+
+    // A Retry that names some other connection: discarded before its tag is even
+    // checked, and the connection is untouched.
+    const elsewhere = [_]u8{ 0xcc, 0xcd };
+    const wrong_length = try setup.Retry.write(&retry_bytes, &dcid, .{
+        .destination_connection_id = &elsewhere,
+        .source_connection_id = &retry_scid,
+        .token = "retry-token",
+    });
+    const wrong = try packet.parseRetry(try packet.parseInvariant(retry_bytes[0..wrong_length]));
+    try testing.expectEqual(setup.Client.Outcome.ignored, try client.onRetry(&wrong, retry_bytes[0..wrong_length]));
+    try testing.expectEqualSlices(u8, &dcid, client.destination_connection_id);
+    try testing.expectEqualStrings("", client.token);
+
+    // The same Retry, correctly addressed, after anything at all has arrived
+    // from the server: too late (§17.2.5.2).
+    const sent = try server.writeFrames(.initial, &pings(1), &datagram, .data(0));
+    var acked: [8]Recovery.SentPacket = undefined;
+    var lost: [8]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    _ = try client.feed(datagram[0..sent], &plaintext, &frames, &report, 0);
+
+    const length = try setup.Retry.write(&retry_bytes, &dcid, .{
+        .destination_connection_id = &client_scid,
+        .source_connection_id = &retry_scid,
+        .token = "retry-token",
+    });
+    const late = try packet.parseRetry(try packet.parseInvariant(retry_bytes[0..length]));
+    try testing.expectEqual(setup.Client.Outcome.ignored, try client.onRetry(&late, retry_bytes[0..length]));
+    try testing.expectEqualSlices(u8, &dcid, client.destination_connection_id);
+
+    // A server has no attempt, and says so rather than pretending it ignored a
+    // packet it was never meant to see.
+    try testing.expectError(error.WrongRole, server.onRetry(&late, retry_bytes[0..length]));
 }
 
 /// The caller's side of the timer, which only the tests here exercise: a
