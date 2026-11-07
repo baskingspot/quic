@@ -124,8 +124,10 @@ pub const Config = struct {
 pub const Stream = struct {
     /// Where the send half's bytes live.
     send_buffer: []u8 = "",
-    /// The ring the receive half reassembles into, which must be at least as
-    /// large as `limit` (§2.2, §4.1).
+    /// The ring the receive half reassembles into. It must be at least as large
+    /// as `limit`, which `Conn.init` asserts: a ring smaller than the window it
+    /// advertises is a caller misconfiguration, and catching it there beats a
+    /// peer's frame turning into `error.NoSpace` two layers away (§2.2, §4.1).
     recv_buffer: []u8 = "",
     /// §4.1: the per-stream limit this endpoint advertises.
     limit: u64 = 0,
@@ -270,6 +272,18 @@ transport_parameters_set: bool = false,
 pub fn init(config: Config) Conn {
     std.debug.assert(config.packet_number_len >= 1);
     std.debug.assert(config.packet_number_len <= 4);
+
+    // §4.1: a stream has to hold the window it advertises. A ring smaller than
+    // the limit, or a limit with no ring behind it, is the caller's numbers and
+    // not a peer's frame; it fails here, at setup, instead of surfacing as
+    // `error.NoSpace` from `ReceiveStream`'s backpressure later.
+    for (config.streams) |entry| {
+        if (entry.recv_buffer.len == 0) {
+            std.debug.assert(entry.limit == 0);
+        } else {
+            std.debug.assert(entry.recv_buffer.len >= entry.limit);
+        }
+    }
 
     const secrets = protection.initialSecrets(config.original_destination_connection_id);
     const suite = protection.Suite.aes_128_gcm;
