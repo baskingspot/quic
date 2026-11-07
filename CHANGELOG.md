@@ -154,6 +154,9 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `varint.size` takes a `u62` instead of a `u64`, so the value it measures must
+  have an encoding. A caller passing a `u64` adds `@intCast` after its own range
+  check, and `varint.write` stays the one place that refuses `error.Overflow`.
 - STREAM frames no longer appear in `Conn.Opened.frames`, because the machine
   has a home for them. A STREAM frame in an Initial or Handshake packet is
   `error.WrongFrameSpace` (§12.4).
@@ -176,6 +179,14 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- A single ACK frame that covered more than 64 packets wrote past
+  `Recovery.Events`: an assertion failure in a safe build, an out-of-bounds
+  write in a release build. `Recovery.space` now refuses a sent table larger
+  than `Recovery.sent_packets_max` (64), so the table and the report share one
+  bound.
+- `transport.encode` panicked on a parameter value above 2^62 - 1, which has no
+  varint encoding, and wrote a connection ID longer than 20 bytes that its own
+  decoder refuses. Both are `error.InvalidValue` now.
 - `Conn` records a packet's number and range only after its frames parse, so a
   packet with a frame that will not parse is never acknowledged. State that was
   half-updated on an error path was the audit's first finding: `CryptoStream`
