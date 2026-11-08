@@ -483,9 +483,10 @@ pub const Opened = struct {
     packet_len: u32,
     /// The frames the machine did not act on, in wire order, borrowed from
     /// `payload`. CRYPTO frames went to the driver, STREAM, RESET_STREAM, and
-    /// STOP_SENDING frames to their stream, and ACK frames to loss recovery, so
-    /// none of them appear here. This is what the caller has to handle itself,
-    /// and it is the whole of it.
+    /// STOP_SENDING frames to their stream, MAX_DATA and MAX_STREAM_DATA to the
+    /// allowances they raise, and ACK frames to loss recovery, so none of them
+    /// appear here. This is what the caller has to handle itself, and it is the
+    /// whole of it.
     frames: []frame.Frame,
     /// The streams this packet changed, one record per stream, in the order
     /// their first frame arrived. Borrowed from the caller's `stream_events`
@@ -973,7 +974,8 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
 ///
 /// A CRYPTO frame is reassembled per level and handed to the driver (§19.6), a
 /// STREAM, RESET_STREAM, or STOP_SENDING frame goes to its stream (§2.1, §3.2,
-/// §3.5), an ACK is the loss detector's (§6.1 of RFC 9002), and PADDING has no
+/// §3.5), MAX_DATA and MAX_STREAM_DATA raise the credit they name (§19.9,
+/// §19.10), an ACK is the loss detector's (§6.1 of RFC 9002), and PADDING has no
 /// meaning to hand anyone (§19.1). Everything else is written to the caller's
 /// array in wire order, because the machine has no home for it yet.
 ///
@@ -1017,6 +1019,12 @@ fn finish(
                 &stream_count,
             ),
             .ack => |ack| try self.onAck(raw.id, ack, events, now),
+            .max_data => |maximum| try self.onMaxDataFrame(raw.id, maximum),
+            .max_stream_data => |data| try self.onStreamCredit(
+                raw.id,
+                data.stream_id,
+                data.maximum,
+            ),
             .padding => {},
             .connection_close => |value| {
                 // §10.2.2: the peer closed, so this endpoint enters the
@@ -1755,6 +1763,59 @@ fn onResetStream(
     });
 }
 
+/// The stream a §3.2 flow-control frame names, opening or joining it if the
+/// frame is allowed to.
+///
+/// §3.2: MAX_STREAM_DATA and STOP_SENDING both open a bidirectional stream the
+/// peer initiated, and either can arrive before any STREAM frame does. A frame
+/// for a locally initiated stream that was never created is STREAM_STATE_ERROR;
+/// one for a stream this endpoint opened and has since closed is a delayed frame
+/// to ignore (§3.3), which `null` is.
+fn streamForCredit(self: *Conn, id: u64) Error!?*Stream {
+    if (self.stream(id)) |entry| {
+        if (entry.canSend()) return entry;
+        // §2.1: a bidirectional stream the peer opened is ours to send on too,
+        // and joining it is what creates that half.
+        const joined = try self.joinStream(id);
+        return joined;
+    }
+
+    if (locallyInitiated(self, id)) {
+        if (!everOpened(self, id)) return error.StreamState;
+        return null;
+    }
+
+    _ = try self.streamFor(id);
+    const joined = try self.joinStream(id);
+    return joined;
+}
+
+/// §19.9: the peer raised the connection-wide allowance.
+fn onMaxDataFrame(self: *Conn, space: SpaceId, maximum: u64) Error!void {
+    // §12.4: the flow-control frames belong to the application space.
+    if (space != .app) return error.WrongFrameSpace;
+    self.onMaxData(maximum);
+}
+
+/// §19.10: the peer raised a stream's allowance, which is credit to send.
+///
+/// Same rules as STOP_SENDING about which stream can exist: a receive-only
+/// stream is STREAM_STATE_ERROR, a locally initiated one that was never created
+/// is too, and a peer-initiated bidirectional stream is opened by the frame.
+fn onStreamCredit(
+    self: *Conn,
+    space: SpaceId,
+    id: u64,
+    maximum: u64,
+) Error!void {
+    // §12.4: the flow-control frames belong to the application space.
+    if (space != .app) return error.WrongFrameSpace;
+    if (receiveOnly(self, id)) return error.StreamState;
+
+    const entry = (try self.streamForCredit(id)) orelse return;
+    entry.send.onMaxStreamData(maximum);
+}
+
 /// §19.5: the peer will not read this stream any more.
 ///
 /// The sending half is reset in place (`SendStream.onStopSending`), and the
@@ -1774,25 +1835,8 @@ fn onStopSending(
     // a locally initiated stream that was never opened has no sending half to
     // stop. Both are STREAM_STATE_ERROR.
     if (receiveOnly(self, stop.stream_id)) return error.StreamState;
-    if (self.stream(stop.stream_id) == null) {
-        if (locallyInitiated(self, stop.stream_id)) {
-            // §19.5 makes a STOP_SENDING for a locally initiated stream that
-            // has not yet been created STREAM_STATE_ERROR. An id this endpoint
-            // opened and then closed is not that: the slot is gone, so it looks
-            // the same, and §3.3 lets the frame arrive late. Only an id beyond
-            // everything opened can never have existed.
-            if (!everOpened(self, stop.stream_id)) return error.StreamState;
-            return;
-        }
-        // §3.2: this frame opens a bidirectional stream the peer initiated, and
-        // it may arrive before any STREAM frame does. The sending half is the
-        // one it is about, so the stream is joined straight away.
-        const fresh = try self.streamFor(stop.stream_id);
-        std.debug.assert(fresh.halves == .recv_only);
-        _ = try self.joinStream(stop.stream_id);
-    }
 
-    const entry = self.stream(stop.stream_id) orelse unreachable;
+    const entry = (try self.streamForCredit(stop.stream_id)) orelse return;
     const owed = try entry.send.onStopSending(stop.error_code);
     // A stream already in Data Sent keeps the request for later (§3.5), and one
     // that is already reset or terminal owes nothing.
@@ -4895,6 +4939,177 @@ test "RFC 9000 §19.5, stop sending resets the sending half and owes a reset" {
     try testing.expectEqual(Conn.Stream.Halves.both, fresh.halves);
     try testing.expectEqual(@as(u64, 64), fresh.send.limit);
     try testing.expectEqual(SendStream.State.reset_sent, fresh.send.state);
+}
+
+test "RFC 9000 §19.9, a peer's MAX_DATA raises the connection allowance" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x81, 0x82 };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x83},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x83},
+        .source_connection_id = &dcid,
+        .send_limit = 64,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x84);
+    const server_secret: [protection.secret_length]u8 = @splat(0x85);
+    installApp(&client, &server, client_secret, server_secret);
+
+    // §4.1: the peer's connection-wide allowance starts at what it advertised,
+    // and the frame raises it where the machine keeps it.
+    try testing.expectEqual(@as(u64, 64), server.send_window.available());
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var payload: [64]u8 = undefined;
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .max_data = 4096 });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const opened = try server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(@as(usize, 0), opened.frames.len);
+    try testing.expectEqual(@as(u64, 4096), server.send_window.available());
+
+    // §12.4: MAX_DATA belongs to the application space, and one in an Initial is
+    // a connection error rather than a frame the caller has to police.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .max_data = 8192 });
+    const wrong_space = try client.writeFrames(.initial, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.WrongFrameSpace, server.feed(
+        datagram[0..wrong_space],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+}
+
+test "RFC 9000 §19.10, a peer's credit reaches the stream it names" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x86, 0x87 };
+    var rings: [2][64]u8 = .{ undefined, undefined };
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &rings[0], .recv_limit_bytes = 64 },
+        .{ .recv_buffer = &rings[1], .recv_limit_bytes = 64 },
+    };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x88},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x88},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 1024,
+        .send_streams = .{ .bidi_remote = 10, .bidi_local = 20 },
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x89);
+    const server_secret: [protection.secret_length]u8 = @splat(0x8a);
+    installApp(&client, &server, client_secret, server_secret);
+
+    const own = try server.openStream(1);
+    try testing.expectEqual(@as(u64, 10), own.send.limit);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var payload: [64]u8 = undefined;
+    var writer: Writer = .init(&payload);
+
+    // §19.10: the limit on a stream this endpoint opened moves where the stream
+    // keeps it, and the frame is no longer the caller's to dispatch.
+    try frame.write(&writer, .{ .max_stream_data = .{ .stream_id = 1, .maximum = 100 } });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const opened = try server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(@as(usize, 0), opened.frames.len);
+    try testing.expectEqual(@as(u64, 100), own.send.limit);
+
+    // §4.1: a limit that does not increase is ignored, not an error.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .max_stream_data = .{ .stream_id = 1, .maximum = 50 } });
+    const lower = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    _ = try server.feed(datagram[0..lower], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(@as(u64, 100), own.send.limit);
+
+    // §19.10: a receive-only stream, and a locally initiated stream that was
+    // never created, are both STREAM_STATE_ERROR.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .max_stream_data = .{ .stream_id = 2, .maximum = 100 } });
+    const one_way = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.StreamState, server.feed(
+        datagram[0..one_way],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .max_stream_data = .{ .stream_id = 5, .maximum = 100 } });
+    const unopened = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.StreamState, server.feed(
+        datagram[0..unopened],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+
+    // §3.2: a MAX_STREAM_DATA for a peer-initiated stream opens it, sending half
+    // included, and the limit it names is the credit the new half starts with.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .max_stream_data = .{ .stream_id = 8, .maximum = 100 } });
+    const early = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    _ = try server.feed(datagram[0..early], &plaintext, &frames, &stream_events, &report, 0);
+
+    const fresh = server.stream(8) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Conn.Stream.Halves.both, fresh.halves);
+    try testing.expectEqual(@as(u64, 100), fresh.send.limit);
 }
 
 test "RFC 9000 §3.3, a frame for a stream this endpoint closed is ignored" {

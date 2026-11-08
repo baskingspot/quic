@@ -273,6 +273,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- MAX_DATA and MAX_STREAM_DATA no longer appear in `Opened.frames`: the machine
+  raises the connection-wide allowance and the stream's send limit, and a
+  MAX_STREAM_DATA for a peer-initiated bidirectional stream opens it as §3.2
+  says. A receive-only stream, or a locally initiated one that was never
+  created, is STREAM_STATE_ERROR. A caller that dispatched these frames by hand
+  stops.
 - A STREAM frame for a locally initiated stream this endpoint never opened, or
   for a one-way stream it opened, is now STREAM_STATE_ERROR (§19.8). A frame for
   a stream it opened and later closed is ignored: `closeStream` frees the slot,

@@ -591,13 +591,26 @@ fresh loss state, same address. CI caught the first version of this, where
 stack was zero and the runner's was not, which is the whole argument for
 initializing rather than asserting.
 
+### The peer's credit, landed after that
+
+MAX_DATA and MAX_STREAM_DATA reached `onMaxData` and the stream's send limit in
+the same shape as the stop-sending work: one helper, `streamForCredit`, decides
+which stream a §3.2 flow-control frame may name, opening or joining a
+peer-initiated bidirectional stream and applying `everOpened` to the rest.
+MAX_STREAMS did not land with them, because the machine has no state for the
+credit the peer grants this endpoint; see the first item below.
+
 ### What is not wired, in the order the RFC makes it matter
 
-1. **Connection ID changes are not adopted.** The echo keeps the client's and the
+1. **The peer's MAX_STREAMS is not kept.** `openStream` never checks it, so a
+   caller can open past what the peer allowed and only the peer's
+   STREAM_LIMIT_ERROR will say so. Two counters, the peer's initial values from
+   its transport parameters, and a check in `openStream` are the whole fix.
+2. **Connection ID changes are not adopted.** The echo keeps the client's and the
    server's IDs the same length, because a short header's destination length comes
    from the connection and nothing copies a peer's Source Connection ID into the
    destination when the two differ. NEW_CONNECTION_ID is not wired either.
-2. **0-RTT**, which the constraints note already records as dropped, not buffered.
+3. **0-RTT**, which the constraints note already records as dropped, not buffered.
 
 The queue in this note is empty; the next session starts at item 1 above, or at
 whatever Matt puts ahead of it.
