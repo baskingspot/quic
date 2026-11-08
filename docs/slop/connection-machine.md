@@ -633,6 +633,16 @@ peer, because a single connection ID completes a handshake and exchanges streams
 and rotation is what you add once that path is known to work. A partial
 `retire_prior_to` is a connection error, so it stays absent until it is complete.
 
+### Confirmation, landed with them
+
+HANDSHAKE_DONE is the client's confirmation (§4.1.2 of RFC 9001), and
+§4.9.2 takes the Handshake keys with it. Before this, the machine believed the
+TLS driver's `confirmed` for both roles: correct for a server, whose confirmation
+is TLS completion, and wrong for a client, whose driver would report its own
+handshake finishing, well before the server has acked a 1-RTT packet. A server
+that receives the frame is PROTOCOL_VIOLATION (§19.20). `Conn.handshakeConfirmed`
+is the one answer either role's caller asks for.
+
 ### What is not wired, in the order the RFC makes it matter
 
 1. **NEW_CONNECTION_ID and its rotation.** Named for after interop, per the

@@ -141,6 +141,9 @@ pub const Error = protection.Error ||
         /// connection sends to. It is not this connection's packet, so the
         /// caller drops it rather than closing anything.
         WrongConnectionId,
+        /// §19.20: the peer sent a frame that only one role may send, which is
+        /// a connection error (PROTOCOL_VIOLATION) and not a caller mistake.
+        ProtocolViolation,
         /// §10.2.1 and §10.2.2: this connection has sent or received a
         /// CONNECTION_CLOSE, so it processes no more packets. Only the close
         /// itself may still be written.
@@ -508,8 +511,9 @@ pub const Opened = struct {
     packet_len: u32,
     /// The frames the machine did not act on, in wire order, borrowed from
     /// `payload`. CRYPTO frames went to the driver, STREAM, RESET_STREAM, and
-    /// STOP_SENDING frames to their stream, MAX_DATA and MAX_STREAM_DATA to the
-    /// allowances they raise, and ACK frames to loss recovery, so none of them
+    /// STOP_SENDING frames to their stream, MAX_DATA, MAX_STREAM_DATA, and
+    /// MAX_STREAMS to the allowances they raise, HANDSHAKE_DONE to the
+    /// confirmation it reports, and ACK frames to loss recovery, so none of them
     /// appear here. This is what the caller has to handle itself, and it is the
     /// whole of it.
     frames: []frame.Frame,
@@ -664,6 +668,10 @@ connection_id_storage: []u8,
 /// a Retry) changes the client's destination, and a later long header with a
 /// different Source Connection ID is discarded, not adopted.
 named: bool = false,
+/// §4.1.2 of RFC 9001: a client's handshake is confirmed when a HANDSHAKE_DONE
+/// frame arrives, which is the machine's fact alone. A server's is confirmed
+/// when its TLS handshake completes, which is the driver's.
+handshake_done: bool = false,
 /// §6.2 and §17.2.5.2: the client's memory of what the server has said, which
 /// is what decides whether a Version Negotiation or a Retry still counts. Absent
 /// on a server, which never has to remember either.
@@ -1054,10 +1062,11 @@ fn nameFrom(self: *Conn, at: Located) Error!void {
 ///
 /// A CRYPTO frame is reassembled per level and handed to the driver (§19.6), a
 /// STREAM, RESET_STREAM, or STOP_SENDING frame goes to its stream (§2.1, §3.2,
-/// §3.5), MAX_DATA and MAX_STREAM_DATA raise the credit they name (§19.9,
-/// §19.10), an ACK is the loss detector's (§6.1 of RFC 9002), and PADDING has no
-/// meaning to hand anyone (§19.1). Everything else is written to the caller's
-/// array in wire order, because the machine has no home for it yet.
+/// §3.5), MAX_DATA, MAX_STREAM_DATA, and MAX_STREAMS raise the credit they name
+/// (§19.9 to §19.11), HANDSHAKE_DONE confirms the handshake (§19.20), an ACK is
+/// the loss detector's (§6.1 of RFC 9002), and PADDING has no meaning to hand
+/// anyone (§19.1). Everything else is written to the caller's array in wire
+/// order, because the machine has no home for it yet.
 ///
 /// A frame that will not parse is a connection error (§12.4), not a dropped
 /// packet: the datagram walk drops undecryptable packets and nothing else.
@@ -1106,6 +1115,7 @@ fn finish(
                 data.maximum,
             ),
             .max_streams => |streams| try self.onMaxStreams(raw.id, streams),
+            .handshake_done => try self.onHandshakeDone(raw.id),
             .padding => {},
             .connection_close => |value| {
                 // §10.2.2: the peer closed, so this endpoint enters the
@@ -1180,13 +1190,26 @@ fn ackDelay(self: *const Conn, delay: u64) Duration {
 /// the machine's to keep: the peer's `max_ack_delay`, whether its address is
 /// validated, and whether the TLS driver has confirmed the handshake. A caller
 /// that owns the driver asks here instead of reconstructing them.
+/// Whether the handshake is confirmed (§4.1.2 of RFC 9001).
+///
+/// The two roles learn it differently. A server is confirmed when its TLS
+/// handshake completes, which is what the driver reports. A client is confirmed
+/// when HANDSHAKE_DONE arrives, which no TLS driver can see, so the driver's
+/// word does not make it so; a client MAY also count an acknowledged 1-RTT
+/// packet, and this does not.
+pub fn handshakeConfirmed(self: *const Conn) bool {
+    if (self.handshake_done) return true;
+    if (self.role == .client) return false;
+    if (self.tls) |tls| return tls.confirmed();
+    return false;
+}
+
 pub fn recoveryOptions(self: *const Conn) Recovery.Options {
     return .{
         .max_ack_delay = self.max_ack_delay,
-        // §5.3: `max_ack_delay` bounds a reported delay only once the handshake is
-        // confirmed, and confirmation is the driver's to report (§4.1.2 of RFC
-        // 9001).
-        .handshake_confirmed = if (self.tls) |tls| tls.confirmed() else false,
+        // §5.3: `max_ack_delay` bounds a reported delay only once the handshake
+        // is confirmed, and §4.1.2 of RFC 9001 is where both roles learn that.
+        .handshake_confirmed = self.handshakeConfirmed(),
         .peer_address_validated = self.peer_address_validated,
     };
 }
@@ -1319,9 +1342,11 @@ pub const Datagram = struct {
 ///
 /// It hands the driver this endpoint's transport parameters once (§8.2), builds
 /// whichever of Handshake and 1-RTT is missing and reported (§7.1 of RFC 9001),
-/// and discards the Handshake keys once `confirmed` says so (§4.9.2). A driver
-/// that has already reported everything makes it a no-op, so a caller may call
-/// it after every packet. Without a driver it does nothing.
+/// and discards the Handshake keys once the handshake is confirmed (§4.9.2): a
+/// server learns that here, from its TLS driver, and a client learns it where a
+/// HANDSHAKE_DONE frame lands. A driver that has already reported everything
+/// makes it a no-op, so a caller may call it after every packet. Without a
+/// driver it does nothing.
 pub fn installSpaces(self: *Conn) Error!void {
     self.pin();
     if (self.state != .open) return error.Closed;
@@ -1338,7 +1363,11 @@ pub fn installSpaces(self: *Conn) Error!void {
     }
     try self.installSecrets(tls);
 
-    if (tls.confirmed()) self.discardIfPresent(.handshake);
+    // §4.9.2: the Handshake keys go with confirmation, whichever way this
+    // endpoint learned it. `installSpaces` runs on the handshake's own call, so
+    // a server's completion is noticed here; a client's HANDSHAKE_DONE is
+    // noticed where the frame lands.
+    if (self.handshakeConfirmed()) self.discardIfPresent(.handshake);
 }
 
 /// Drain one handshake message into a packet.
@@ -1904,6 +1933,20 @@ fn onStreamCredit(
 
     const entry = (try self.streamForCredit(id)) orelse return;
     entry.send.onMaxStreamData(maximum);
+}
+
+/// §19.20: the server has confirmed the handshake, and §4.9.2 of RFC 9001 says
+/// the Handshake keys go with that.
+///
+/// Only a client receives this frame. A server that sees one has a peer
+/// pretending to be this endpoint, which is PROTOCOL_VIOLATION.
+fn onHandshakeDone(self: *Conn, space: SpaceId) Error!void {
+    // §12.4: HANDSHAKE_DONE is a 1-RTT frame.
+    if (space != .app) return error.WrongFrameSpace;
+    if (self.role == .server) return error.ProtocolViolation;
+
+    self.handshake_done = true;
+    self.discardIfPresent(.handshake);
 }
 
 /// §19.11: the peer raised how many streams this endpoint may open.
@@ -4349,13 +4392,84 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
     const opened_app = try server.feed(datagram[0..app_packet], &plaintext, &events, &stream_events, &report, 0);
     try testing.expectEqual(@as(usize, 2), opened_app.frames.len);
 
-    // §4.9.2: confirmation takes the Handshake keys, and 1-RTT carries on.
+    // §4.1.2 of RFC 9001: a client's handshake is confirmed by HANDSHAKE_DONE,
+    // and the TLS driver's completion is the server's confirmation, not the
+    // client's. A stub that claims confirmed moves nothing here.
     client_stub.confirmed = true;
     try client.installSpaces();
+    try testing.expect(client.handshake != null);
+    try testing.expect(!client.handshakeConfirmed());
+
+    // §4.9.2: the frame is what takes the Handshake keys, and 1-RTT carries on.
+    var done_payload: [16]u8 = undefined;
+    var done_writer: Writer = .init(&done_payload);
+    try frame.write(&done_writer, .{ .handshake_done = {} });
+    const done = try server.writeFrames(.app, done_writer.written(), &datagram, .data(0));
+    const at_done = try client.feed(datagram[0..done], &plaintext, &events, &stream_events, &report, 0);
+    try testing.expectEqual(@as(usize, 0), at_done.frames.len);
+    try testing.expect(client.handshakeConfirmed());
     try testing.expectEqual(@as(?Space, null), client.handshake);
     try testing.expect(client.app != null);
     try testing.expectError(error.NoKeys, client.writeFrames(.handshake, "\x01", &datagram, .data(0)));
     _ = try client.writeFrames(.app, &app_payload, &datagram, .data(0));
+}
+
+test "RFC 9000 §19.20, only a server sends HANDSHAKE_DONE" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x91, 0x92 };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x93},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x93},
+        .source_connection_id = &dcid,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x94);
+    const server_secret: [protection.secret_length]u8 = @splat(0x95);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var payload: [16]u8 = undefined;
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .handshake_done = {} });
+
+    // §19.20: a server that receives one has a peer answering as this endpoint,
+    // which is PROTOCOL_VIOLATION rather than a frame to hand upstairs.
+    const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.ProtocolViolation, server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+
+    // §12.4: and it belongs to the application space in either role.
+    const wrong_space = try server.writeFrames(.initial, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.WrongFrameSpace, client.feed(
+        datagram[0..wrong_space],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
 }
 
 test "RFC 9000 §20.1, a driver failure carries the CRYPTO_ERROR to close with" {

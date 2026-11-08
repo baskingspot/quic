@@ -273,6 +273,13 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- HANDSHAKE_DONE no longer appears in `Opened.frames`: a client confirms the
+  handshake on the frame and discards its Handshake keys (§4.1.2 and §4.9.2 of
+  RFC 9001), while a server that receives one gets `error.ProtocolViolation`
+  (§19.20). `Conn.handshakeConfirmed` is public and answers per role, and the
+  TLS driver's `confirmed` now counts only for a server: a client's confirmation
+  is the frame, which no driver can see. `Conn.recoveryOptions` follows it, so a
+  client's `max_ack_delay` starts applying when the frame arrives.
 - A client adopts the name the server's first Initial gives it (§7.2): the
   Source Connection ID of that packet becomes the Destination Connection ID of
   everything it sends afterwards, copied into `Conn.Config.connection_id_storage`

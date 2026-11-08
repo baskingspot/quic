@@ -128,9 +128,10 @@ pub const VTable = struct {
     setTransportParameters: *const fn (ctx: *anyopaque, bytes: []const u8) Error!void,
     /// The peer's transport parameters, or null until they arrive.
     peerTransportParameters: *const fn (ctx: *anyopaque) Error!?[]const u8,
-    /// Whether the handshake is confirmed (§4.1.2 of RFC 9001): the moment the
-    /// machine discards the Handshake keys (§4.9.2) and may arm the 1-RTT
-    /// probe (§6.2.1 of RFC 9002).
+    /// Whether this endpoint's TLS handshake has completed. §4.1.2 of RFC 9001
+    /// makes that the server's confirmation, not the client's: a client is
+    /// confirmed by a HANDSHAKE_DONE frame, which no TLS driver can see. The
+    /// machine asks this of a server and nowhere else.
     confirmed: *const fn (ctx: *anyopaque) bool,
     /// The ALPN protocol the handshake settled on, or null.
     alpn: *const fn (ctx: *anyopaque) ?[]const u8,
