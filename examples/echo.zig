@@ -156,6 +156,8 @@ pub fn main(init: std.process.Init) !void {
     client_config.receive_limit = 4096;
     client_config.send_limit = 4096;
     client_config.send_streams = .{ .bidi_remote = 4096 };
+    // The client opens one stream, so it needs the server's credit for one.
+    client_config.peer_max_streams = .{ .bidi = 1 };
     client_config.max_streams_bidi = 1;
     client.start(client_config);
     var wire: [1500]u8 = undefined;

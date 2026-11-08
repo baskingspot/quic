@@ -600,17 +600,22 @@ peer-initiated bidirectional stream and applying `everOpened` to the rest.
 MAX_STREAMS did not land with them, because the machine has no state for the
 credit the peer grants this endpoint; see the first item below.
 
+### The peer's MAX_STREAMS, landed with them
+
+`Config.peer_max_streams` carries the peer's initial counts, `Conn` keeps them as
+a high-water mark, a MAX_STREAMS frame raises it, and `openStream` refuses an
+ordinal past it with `error.NoStreamCredit` — a new error, because the caller's
+own open being refused is not the peer-visible STREAM_LIMIT_ERROR that `feed`
+raises when the peer overruns the table. A count above 2^60 is
+`error.StreamCountTooLarge`, which is FRAME_ENCODING_ERROR (§19.11).
+
 ### What is not wired, in the order the RFC makes it matter
 
-1. **The peer's MAX_STREAMS is not kept.** `openStream` never checks it, so a
-   caller can open past what the peer allowed and only the peer's
-   STREAM_LIMIT_ERROR will say so. Two counters, the peer's initial values from
-   its transport parameters, and a check in `openStream` are the whole fix.
-2. **Connection ID changes are not adopted.** The echo keeps the client's and the
+1. **Connection ID changes are not adopted.** The echo keeps the client's and the
    server's IDs the same length, because a short header's destination length comes
    from the connection and nothing copies a peer's Source Connection ID into the
    destination when the two differ. NEW_CONNECTION_ID is not wired either.
-3. **0-RTT**, which the constraints note already records as dropped, not buffered.
+2. **0-RTT**, which the constraints note already records as dropped, not buffered.
 
 The queue in this note is empty; the next session starts at item 1 above, or at
 whatever Matt puts ahead of it.

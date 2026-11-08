@@ -273,6 +273,14 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- MAX_STREAMS no longer appears in `Opened.frames`: the machine raises the
+  credit the peer grants this endpoint, ignores a count that does not increase,
+  and refuses a count that permits a stream id §17.1 cannot encode with
+  `error.StreamCountTooLarge` (FRAME_ENCODING_ERROR). `Conn.Config.peer_max_streams`
+  carries the peer's initial counts from its transport parameters, and
+  `Conn.openStream` refuses to exceed them with `error.NoStreamCredit` instead of
+  letting the peer close the connection later. A caller that opened streams
+  without setting the credit now has to set it.
 - MAX_DATA and MAX_STREAM_DATA no longer appear in `Opened.frames`: the machine
   raises the connection-wide allowance and the stream's send limit, and a
   MAX_STREAM_DATA for a peer-initiated bidirectional stream opens it as §3.2

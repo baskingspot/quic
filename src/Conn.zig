@@ -129,6 +129,14 @@ pub const Error = protection.Error ||
         /// §2.1: the stream cannot carry data in this direction, or it is the
         /// other endpoint's to open.
         WrongDirection,
+        /// §4.6: the peer has not granted credit for another stream of this
+        /// kind. This is the caller's own open being refused, never a peer
+        /// violation, so it is not a connection error.
+        NoStreamCredit,
+        /// §19.11: a MAX_STREAMS frame that permits a stream id this protocol
+        /// cannot encode, which is FRAME_ENCODING_ERROR for the caller to close
+        /// with.
+        StreamCountTooLarge,
         /// §10.2.1 and §10.2.2: this connection has sent or received a
         /// CONNECTION_CLOSE, so it processes no more packets. Only the close
         /// itself may still be written.
@@ -301,6 +309,11 @@ pub const Config = struct {
     /// it was allowed must never find `error.StreamLimit`.
     max_streams_bidi: u64 = 0,
     max_streams_uni: u64 = 0,
+    /// §4.6: the credit the peer advertised for this endpoint to open streams,
+    /// from its own `initial_max_streams_bidi` and `initial_max_streams_uni`.
+    /// The machine refuses to open past it, because the peer will close the
+    /// connection if it does.
+    peer_max_streams: StreamLimits = .{},
 };
 
 /// What a server learns from a client's first Initial, before it has a `Conn`.
@@ -688,6 +701,9 @@ streams_advertised: StreamLimits,
 /// was. `closeStream` frees a slot and the machine keeps no record of the id, so
 /// this is the only memory of a stream that is gone.
 opened_local: StreamLimits = .{},
+/// §4.6: how many streams the peer has permitted this endpoint to open, per
+/// direction, counting closed ones. MAX_STREAMS raises it and nothing lowers it.
+peer_max_streams: StreamLimits,
 /// Whether the driver has them yet. One call, before the first flight.
 transport_parameters_set: bool = false,
 
@@ -764,6 +780,7 @@ pub fn init(config: Config) Conn {
         .receive_window = .init(config.receive_limit),
         .send_window = .init(config.send_limit),
         .send_streams = config.send_streams,
+        .peer_max_streams = config.peer_max_streams,
         .streams_allowed = .{
             .bidi = config.max_streams_bidi,
             .uni = config.max_streams_uni,
@@ -1025,6 +1042,7 @@ fn finish(
                 data.stream_id,
                 data.maximum,
             ),
+            .max_streams => |streams| try self.onMaxStreams(raw.id, streams),
             .padding => {},
             .connection_close => |value| {
                 // §10.2.2: the peer closed, so this endpoint enters the
@@ -1535,6 +1553,15 @@ pub fn openStream(self: *Conn, id: u64) Error!*Stream {
     // open its own.
     if (stream_id.initiator(id) != initiator) return error.WrongDirection;
 
+    // §4.6: "An endpoint MUST NOT open more streams than permitted by the
+    // current stream limit set by its peer." The count includes closed streams,
+    // so it is the ordinal of the id that has to fit, not how many are open.
+    const credit = switch (stream_id.direction(id)) {
+        .bidi => self.peer_max_streams.bidi,
+        .uni => self.peer_max_streams.uni,
+    };
+    if (stream_id.index(id) >= credit) return error.NoStreamCredit;
+
     const index = self.freeStream() orelse return error.StreamLimit;
     const entry = &self.streams[index];
     entry.send = SendStream.init(id, entry.send_buffer, self.send_streams.forOpening(id));
@@ -1815,6 +1842,28 @@ fn onStreamCredit(
     const entry = (try self.streamForCredit(id)) orelse return;
     entry.send.onMaxStreamData(maximum);
 }
+
+/// §19.11: the peer raised how many streams this endpoint may open.
+///
+/// The count is cumulative over the connection's life and includes the streams
+/// already closed, so it is a high-water mark and never a concurrent count. A
+/// frame that does not raise it is ignored (§4.6); one that permits a stream id
+/// §17.1 cannot encode is FRAME_ENCODING_ERROR.
+fn onMaxStreams(self: *Conn, space: SpaceId, value: frame.MaxStreams) Error!void {
+    // §12.4: MAX_STREAMS belongs to the application space.
+    if (space != .app) return error.WrongFrameSpace;
+    // §19.11: "This value cannot exceed 2^60", because a stream id is four
+    // times the ordinal and has to fit in 62 bits.
+    if (value.maximum > max_streams) return error.StreamCountTooLarge;
+
+    switch (value.direction) {
+        .bidi => self.peer_max_streams.bidi = @max(self.peer_max_streams.bidi, value.maximum),
+        .uni => self.peer_max_streams.uni = @max(self.peer_max_streams.uni, value.maximum),
+    }
+}
+
+/// §19.11: the largest MAX_STREAMS count that can describe a stream id.
+const max_streams: u64 = 1 << 60;
 
 /// §19.5: the peer will not read this stream any more.
 ///
@@ -3040,6 +3089,7 @@ test "RFC 9000 §4.6, closing a stream this endpoint opened grants no credit" {
         .streams = &streams,
         .send_limit = 64,
         .send_streams = .{ .uni = 64 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
         .max_streams_bidi = 1,
     });
 
@@ -3246,6 +3296,7 @@ test "RFC 9000 §19.8, a packed packet reports its number and the frames it carr
         .streams = &client_streams,
         .send_limit = 64,
         .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -3337,6 +3388,7 @@ test "RFC 9000 §4.1, a packet that fits part of an offer says where to resume" 
         .streams = &streams,
         .send_limit = 64,
         .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x43);
     installApp(&client, &client, client_secret, client_secret);
@@ -3410,6 +3462,7 @@ test "RFC 9000 §4.1, a window with no room is a different answer from a used on
         .streams = &streams,
         .send_limit = 64,
         .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x44);
     installApp(&client, &client, client_secret, client_secret);
@@ -4416,6 +4469,7 @@ test "RFC 9000 §2.1, opening a stream takes the peer's limit for it" {
         .stream_slots = &client_slots,
         .streams = &client_streams,
         .send_streams = .{ .bidi_remote = 10, .uni = 30 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
 
     var server_rings: [2][8]u8 = .{ undefined, undefined };
@@ -4434,6 +4488,7 @@ test "RFC 9000 §2.1, opening a stream takes the peer's limit for it" {
         .stream_slots = &server_slots,
         .streams = &server_streams,
         .send_streams = .{ .bidi_remote = 11, .bidi_local = 20 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
 
     // §4.1: a bidirectional stream this endpoint opens carries the limit the
@@ -4486,6 +4541,7 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
         .streams = &streams,
         .receive_limit = 1024,
         .send_streams = .{ .bidi_local = 64 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x25);
     const server_secret: [protection.secret_length]u8 = @splat(0x26);
@@ -4714,6 +4770,7 @@ test "RFC 9000 §19.4, a reset ends the receive half and the application reads t
         .streams = &streams,
         .receive_limit = 1024,
         .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x54);
     const server_secret: [protection.secret_length]u8 = @splat(0x55);
@@ -4859,6 +4916,7 @@ test "RFC 9000 §19.5, stop sending resets the sending half and owes a reset" {
         .streams = &streams,
         .receive_limit = 1024,
         .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x64);
     const server_secret: [protection.secret_length]u8 = @splat(0x65);
@@ -4939,6 +4997,108 @@ test "RFC 9000 §19.5, stop sending resets the sending half and owes a reset" {
     try testing.expectEqual(Conn.Stream.Halves.both, fresh.halves);
     try testing.expectEqual(@as(u64, 64), fresh.send.limit);
     try testing.expectEqual(SendStream.State.reset_sent, fresh.send.state);
+}
+
+test "RFC 9000 §19.11, the peer's MAX_STREAMS is the credit to open" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x8b, 0x8c };
+    var rings: [2][64]u8 = .{ undefined, undefined };
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &rings[0], .recv_limit_bytes = 64 },
+        .{ .recv_buffer = &rings[1], .recv_limit_bytes = 64 },
+    };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x8d},
+        .stream_slots = &slots,
+        .streams = &streams,
+        .send_streams = .{ .bidi_remote = 64, .uni = 64 },
+        .peer_max_streams = .{ .bidi = 1 },
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x8d},
+        .source_connection_id = &dcid,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x8e);
+    const server_secret: [protection.secret_length]u8 = @splat(0x8f);
+    installApp(&client, &server, client_secret, server_secret);
+
+    // §4.6: the credit is a count of streams, so ordinal 0 fits one and ordinal
+    // 1 does not; a one-way stream has its own, which is zero here.
+    _ = try client.openStream(0);
+    try testing.expectError(error.NoStreamCredit, client.openStream(4));
+    try testing.expectError(error.NoStreamCredit, client.openStream(2));
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var payload: [64]u8 = undefined;
+    var writer: Writer = .init(&payload);
+
+    // §19.11: the frame raises the count, and the machine is where it lands.
+    try frame.write(&writer, .{ .max_streams = .{ .direction = .bidi, .maximum = 2 } });
+    const raised = try server.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const opened = try client.feed(
+        datagram[0..raised],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(@as(usize, 0), opened.frames.len);
+    _ = try client.openStream(4);
+
+    // §4.6: a smaller count is loss or reordering, and it is ignored.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .max_streams = .{ .direction = .bidi, .maximum = 1 } });
+    const lowered = try server.writeFrames(.app, writer.written(), &datagram, .data(0));
+    _ = try client.feed(datagram[0..lowered], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(@as(u64, 2), client.peer_max_streams.bidi);
+    try testing.expectError(error.NoStreamCredit, client.openStream(8));
+
+    // §19.11: a count that permits a stream id this protocol cannot name is
+    // FRAME_ENCODING_ERROR for the caller to close with.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .max_streams = .{
+        .direction = .bidi,
+        .maximum = (1 << 60) + 1,
+    } });
+    const too_many = try server.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.StreamCountTooLarge, client.feed(
+        datagram[0..too_many],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+
+    // §12.4: MAX_STREAMS belongs to the application space.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .max_streams = .{ .direction = .bidi, .maximum = 4 } });
+    const wrong_space = try server.writeFrames(.initial, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.WrongFrameSpace, client.feed(
+        datagram[0..wrong_space],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
 }
 
 test "RFC 9000 §19.9, a peer's MAX_DATA raises the connection allowance" {
@@ -5038,6 +5198,7 @@ test "RFC 9000 §19.10, a peer's credit reaches the stream it names" {
         .streams = &streams,
         .receive_limit = 1024,
         .send_streams = .{ .bidi_remote = 10, .bidi_local = 20 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x89);
     const server_secret: [protection.secret_length]u8 = @splat(0x8a);
@@ -5144,6 +5305,7 @@ test "RFC 9000 §3.3, a frame for a stream this endpoint closed is ignored" {
         .streams = &streams,
         .receive_limit = 1024,
         .send_streams = .{ .bidi_remote = 64, .uni = 64, .bidi_local = 64 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x74);
     const server_secret: [protection.secret_length]u8 = @splat(0x75);
@@ -5628,6 +5790,7 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
         .streams = &client_streams,
         .send_limit = 64,
         .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
+        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
