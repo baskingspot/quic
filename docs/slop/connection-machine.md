@@ -581,11 +581,15 @@ moves, because nothing it holds lives inside the `Conn`; the move assertion stay
 for everything else. `Conn.recoveryOptions` is public, so the caller no longer
 reconstructs the options the driver takes on every call.
 
-Two creation sites had to change with it, and both are the same call:
-`init` places the Initial space, `installSpace` places Handshake and 1-RTT, and
-`rekeyInitial` replaces the Initial one in the same slot, which is what a Retry
-wanted anyway — fresh loss state, same address. `placeRecovery` is the only place
-that knows where the state lives.
+`placeRecovery` is the only place that knows where the state lives, and three
+calls reach it: `init` places all three spaces, because a driver over the array
+must never read a slot that was never written; `installSpace` replaces the
+Handshake or 1-RTT state in place when its keys arrive; and `rekeyInitial`
+replaces the Initial one for a Retry, which is what a Retry wanted anyway —
+fresh loss state, same address. CI caught the first version of this, where
+`init` placed only Initial and the driver read two undefined spaces: the local
+stack was zero and the runner's was not, which is the whole argument for
+initializing rather than asserting.
 
 ### What is not wired, in the order the RFC makes it matter
 

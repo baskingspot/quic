@@ -173,7 +173,9 @@ pub const Loss = struct {
     /// The per-space half, one slot per `SpaceId`, in the caller's storage. The
     /// machine keeps a pointer into these rather than a copy, so a
     /// `RecoveryDriver` built over them survives a `Conn` that moves: the
-    /// connection holds no address the driver needs.
+    /// connection holds no address the driver needs. `Conn.init` places all
+    /// three, so a slot is readable before its keys exist and after they are
+    /// discarded.
     spaces: *[3]Recovery.Space,
     sent_initial: []Recovery.SentPacket,
     sent_handshake: []Recovery.SentPacket,
