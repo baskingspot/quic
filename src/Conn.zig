@@ -775,7 +775,7 @@ pub fn init(config: Config) Conn {
             // The handle points at the caller's `Recovery`, never at `Conn`, so
             // returning this value is safe. That is the whole reason `Loss`
             // exists.
-            .recovery = initialRecovery(config.loss),
+            .recovery = placeAllRecovery(config.loss),
         },
     };
 }
@@ -1460,8 +1460,20 @@ fn placeRecovery(loss: Loss, id: SpaceId) *Recovery.Space {
     return place;
 }
 
-fn initialRecovery(loss: Loss) *Recovery.Space {
-    return placeRecovery(loss, .initial);
+/// Place all three spaces and return the Initial one.
+///
+/// `init` is the first caller, and it places Handshake and 1-RTT too even
+/// though their keys do not exist yet: a `RecoveryDriver` is built over the
+/// whole array, and a slot that was never written is an uninitialized read
+/// waiting for the first timer query. Keys arriving later replace the loss
+/// state where it stands.
+fn placeAllRecovery(loss: Loss) *Recovery.Space {
+    var initial: *Recovery.Space = undefined;
+    for (std.enums.values(SpaceId)) |id| {
+        const placed = placeRecovery(loss, id);
+        if (id == .initial) initial = placed;
+    }
+    return initial;
 }
 
 /// Whether two caller tables share any storage.
@@ -5828,7 +5840,8 @@ test "RFC 9002 §6.2.1, a driver over the caller's spaces outlives the connectio
     _ = try client.writeFrames(.initial, &pings(2), &datagram, .data(0));
 
     // The driver is built over the caller's three spaces, which is where the
-    // loss state lives now: no address inside the connection is needed.
+    // loss state lives now: no address inside the connection is needed, and
+    // `init` placed all three so the two without keys are still readable.
     var handles: [3]*Recovery.Space = .{
         &loss.spaces[0],
         &loss.spaces[1],
