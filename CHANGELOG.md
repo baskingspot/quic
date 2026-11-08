@@ -273,6 +273,14 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- RESET_STREAM and STOP_SENDING no longer appear in `Opened.frames`. The machine
+  ends the receive half on a reset and resets the sending half on a stop, and
+  reports both in `Opened.streams`: `Conn.StreamEvent` gained `reset`, and
+  `reset_owed` carries the code to put in the RESET_STREAM the caller sends. The
+  application reads the peer's reset code with `ReceiveStream.readReset`. A
+  receive-only stream in a STOP_SENDING, a send-only stream in a RESET_STREAM,
+  and a STOP_SENDING for a locally initiated stream that was never opened are
+  STREAM_STATE_ERROR.
 - `SendStream.write` returns `Error!void`: it appends every byte it is given or
   refuses the whole write with `error.NoSpace`, so a short write cannot exist and
   a caller has no count to check. `SendStream.end` is `SendStream.finish`, and it

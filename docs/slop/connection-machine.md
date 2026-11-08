@@ -551,25 +551,40 @@ The example exercises the new surface: server built from the client's datagram,
 streams found from `Opened.streams`, the answer on a joined stream, the server's
 keys from `installSpaces`, and both configs from a constructor.
 
+### RESET_STREAM and STOP_SENDING, landed after the queue
+
+One commit, `Conn`'s frame dispatch: a reset ends the receive half
+(`ReceiveStream.onReset`, §19.4 and §4.5) and a stop resets the sending half
+(`SendStream.onStopSending`, §3.5), with `StreamEvent` gaining `reset` and
+`reset_owed`. Three shapes the RFC named and the tests pin: a RESET_STREAM for a
+send-only stream, a STOP_SENDING for a receive-only stream, and a STOP_SENDING
+for a locally initiated stream that was never opened are all STREAM_STATE_ERROR.
+A STOP_SENDING for a peer bidi stream that no frame has reached yet opens it,
+sending half included, because §3.2 says the frame does that and it may arrive
+before the STREAM frame does.
+
+Left alone on purpose: §19.8's "a STREAM frame for a locally initiated stream
+that has not yet been created". The machine cannot tell never-created from
+created-and-forgotten, because `closeStream` frees the slot, and §3.3 says a
+receiver can see a STREAM frame late in any state. Raising STREAM_STATE_ERROR on
+an id the table no longer holds would close connections over harmless
+retransmissions. Either `closeStream` keeps a caller-owned record of the ids it
+has forgotten, or the check stays partial.
+
 ### What is not wired, in the order the RFC makes it matter
 
-1. **RESET_STREAM and STOP_SENDING are still the caller's.** `ReceiveStream.onReset`
-   and `SendStream.onStopSending` exist and are tested; neither frame reaches them.
-   Both are returned in `Opened.frames`, so a caller can do it, but the machine
-   already has the state and the answer the peer must see. RESET_STREAM also
-   changes what `Opened.streams` should say, which is why it comes first.
-2. **The congestion and timer handles pin the connection's address.**
+1. **The congestion and timer handles pin the connection's address.**
    `RecoveryDriver` wants `[]const *Recovery.Space`, which means
    `&conn.app.?.recovery`; the move assertion now makes a later move loud instead of
    silent, but the API still forces the caller to hand out an interior address.
    `Conn.recoveryOptions` is private, so the caller reconstructs `Recovery.Options`
    from the RFC's defaults. Either a driver built from the connection, borrowing the
    addresses once inside a type the caller owns, or an options accessor — not both.
-3. **Connection ID changes are not adopted.** The echo keeps the client's and the
+2. **Connection ID changes are not adopted.** The echo keeps the client's and the
    server's IDs the same length, because a short header's destination length comes
    from the connection and nothing copies a peer's Source Connection ID into the
    destination when the two differ. NEW_CONNECTION_ID is not wired either.
-4. **0-RTT**, which the constraints note already records as dropped, not buffered.
+3. **0-RTT**, which the constraints note already records as dropped, not buffered.
 
 The queue in this note is empty; the next session starts at item 1 above, or at
 whatever Matt puts ahead of it.

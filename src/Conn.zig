@@ -464,10 +464,10 @@ pub const Opened = struct {
     header_len: u32,
     packet_len: u32,
     /// The frames the machine did not act on, in wire order, borrowed from
-    /// `payload`. CRYPTO frames went to the driver, STREAM frames to their
-    /// stream, and ACK frames to loss recovery, so none of the three appear
-    /// here. This is what the caller has to handle itself, and it is the whole
-    /// of it.
+    /// `payload`. CRYPTO frames went to the driver, STREAM, RESET_STREAM, and
+    /// STOP_SENDING frames to their stream, and ACK frames to loss recovery, so
+    /// none of them appear here. This is what the caller has to handle itself,
+    /// and it is the whole of it.
     frames: []frame.Frame,
     /// The streams this packet changed, one record per stream, in the order
     /// their first frame arrived. Borrowed from the caller's `stream_events`
@@ -489,10 +489,16 @@ pub const StreamEvent = struct {
     stream_id: u64,
     /// The contiguous run from the read point grew, so a read now returns bytes
     /// it would not have returned before.
-    readable: bool,
+    readable: bool = false,
     /// The peer's FIN is known and this packet supplied the last byte of it, so
     /// the stream is Data Recvd and a read runs to the final size.
-    finished: bool,
+    finished: bool = false,
+    /// §3.2: the peer reset the stream, so the receive half is Reset Recvd and
+    /// the application reads the code with `ReceiveStream.readReset`.
+    reset: bool = false,
+    /// §3.5: the peer asked this endpoint to stop sending, and the sending half
+    /// is now Reset Sent. The caller owes a RESET_STREAM with this code.
+    reset_owed: ?u64 = null,
 };
 
 /// One packet number space: its keys, its counters, and the ranges it has
@@ -943,10 +949,10 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
 /// Parse the payload's frames and act on the ones the machine owns.
 ///
 /// A CRYPTO frame is reassembled per level and handed to the driver (§19.6), a
-/// STREAM frame goes to its stream (§2.1), an ACK is the loss detector's (§6.1 of
-/// RFC 9002), and PADDING has no meaning to hand anyone (§19.1). Everything else
-/// is written to the caller's array in wire order, because the machine has no home
-/// for it yet.
+/// STREAM, RESET_STREAM, or STOP_SENDING frame goes to its stream (§2.1, §3.2,
+/// §3.5), an ACK is the loss detector's (§6.1 of RFC 9002), and PADDING has no
+/// meaning to hand anyone (§19.1). Everything else is written to the caller's
+/// array in wire order, because the machine has no home for it yet.
 ///
 /// A frame that will not parse is a connection error (§12.4), not a dropped
 /// packet: the datagram walk drops undecryptable packets and nothing else.
@@ -972,6 +978,18 @@ fn finish(
             .stream => |frame_stream| try self.onStreamFrame(
                 raw.id,
                 frame_stream,
+                stream_events,
+                &stream_count,
+            ),
+            .reset_stream => |reset| try self.onResetStream(
+                raw.id,
+                reset,
+                stream_events,
+                &stream_count,
+            ),
+            .stop_sending => |stop| try self.onStopSending(
+                raw.id,
+                stop,
                 stream_events,
                 &stream_count,
             ),
@@ -1611,6 +1629,103 @@ fn onStreamFrame(
     try noteStreamEvent(stream_events, stream_count, news);
 }
 
+/// §19.4: the peer gave up on the sending half of a stream it opened.
+///
+/// The receive half ends in Reset Recvd and the application reads the code with
+/// `ReceiveStream.readReset`. §4.5 applies to the final size the frame names, so
+/// a size that disagrees with one already known is FINAL_SIZE_ERROR and one past
+/// the advertised limit is FLOW_CONTROL_ERROR, both from `onReset`.
+fn onResetStream(
+    self: *Conn,
+    space: SpaceId,
+    reset: frame.ResetStream,
+    stream_events: []StreamEvent,
+    stream_count: *usize,
+) Error!void {
+    // §12.4: RESET_STREAM belongs to the application space.
+    if (space != .app) return error.WrongFrameSpace;
+
+    // §19.4: a RESET_STREAM for a send-only stream is STREAM_STATE_ERROR. A
+    // unidirectional stream this endpoint opened has no receive half to reset,
+    // and the peer cannot have sent data on it.
+    if (sendOnly(self, reset.stream_id)) return error.StreamState;
+
+    const entry = try self.streamFor(reset.stream_id);
+    const already_reset = entry.recv.state == .reset_recvd;
+    try entry.recv.onReset(reset.error_code, reset.final_size);
+    // §3.2: a duplicate that arrives after the application consumed the reset
+    // changes nothing, so it is reported to nobody.
+    if (already_reset) return;
+    if (entry.recv.state != .reset_recvd) return;
+
+    try noteStreamEvent(stream_events, stream_count, .{
+        .stream_id = reset.stream_id,
+        .reset = true,
+    });
+}
+
+/// §19.5: the peer will not read this stream any more.
+///
+/// The sending half is reset in place (`SendStream.onStopSending`), and the
+/// caller owes the RESET_STREAM that says so; the machine composes no frame the
+/// caller did not ask for. The report carries the code for that frame.
+fn onStopSending(
+    self: *Conn,
+    space: SpaceId,
+    stop: frame.StopSending,
+    stream_events: []StreamEvent,
+    stream_count: *usize,
+) Error!void {
+    // §12.4: STOP_SENDING belongs to the application space.
+    if (space != .app) return error.WrongFrameSpace;
+
+    // §19.5: a receive-only stream is one this endpoint can never send on, and
+    // a locally initiated stream that was never opened has no sending half to
+    // stop. Both are STREAM_STATE_ERROR.
+    if (receiveOnly(self, stop.stream_id)) return error.StreamState;
+    if (self.stream(stop.stream_id) == null) {
+        if (locallyInitiated(self, stop.stream_id)) return error.StreamState;
+        // §3.2: this frame opens a bidirectional stream the peer initiated, and
+        // it may arrive before any STREAM frame does. The sending half is the
+        // one it is about, so the stream is joined straight away.
+        const fresh = try self.streamFor(stop.stream_id);
+        std.debug.assert(fresh.halves == .recv_only);
+        _ = try self.joinStream(stop.stream_id);
+    }
+
+    const entry = self.stream(stop.stream_id) orelse unreachable;
+    const owed = try entry.send.onStopSending(stop.error_code);
+    // A stream already in Data Sent keeps the request for later (§3.5), and one
+    // that is already reset or terminal owes nothing.
+    if (!owed) return;
+    try noteStreamEvent(stream_events, stream_count, .{
+        .stream_id = stop.stream_id,
+        .reset_owed = stop.error_code,
+    });
+}
+
+/// Whether this endpoint may never receive on `id`: a unidirectional stream it
+/// opened itself.
+fn sendOnly(self: *const Conn, id: u64) bool {
+    if (stream_id.direction(id) != .uni) return false;
+    return locallyInitiated(self, id);
+}
+
+/// Whether this endpoint may never send on `id`: a unidirectional stream the
+/// peer opened.
+fn receiveOnly(self: *const Conn, id: u64) bool {
+    if (stream_id.direction(id) != .uni) return false;
+    return !locallyInitiated(self, id);
+}
+
+fn locallyInitiated(self: *const Conn, id: u64) bool {
+    const local: stream_id.Initiator = switch (self.role) {
+        .client => .client,
+        .server => .server,
+    };
+    return stream_id.initiator(id) == local;
+}
+
 /// Record one stream's change in the caller's list.
 ///
 /// One record per stream: a packet may carry several frames for one stream, and
@@ -1622,6 +1737,8 @@ fn noteStreamEvent(events: []StreamEvent, count: *usize, event: StreamEvent) Err
         if (existing.stream_id != event.stream_id) continue;
         existing.readable = existing.readable or event.readable;
         existing.finished = existing.finished or event.finished;
+        existing.reset = existing.reset or event.reset;
+        if (event.reset_owed) |code| existing.reset_owed = code;
         return;
     }
 
@@ -4418,6 +4535,265 @@ test "RFC 9000 §3.2, a packet reports the streams it made readable" {
         .finished = false,
     }));
     try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "RFC 9000 §19.4, a reset ends the receive half and the application reads the code" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x51, 0x52 };
+    var rings: [2][64]u8 = .{ undefined, undefined };
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &rings[0], .recv_limit_bytes = 64 },
+        .{ .recv_buffer = &rings[1], .recv_limit_bytes = 64 },
+    };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x53},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x53},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 1024,
+        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x54);
+    const server_secret: [protection.secret_length]u8 = @splat(0x55);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var payload: [64]u8 = undefined;
+    var writer: Writer = .init(&payload);
+
+    // §19.4: the client gives up on stream 4 and names the bytes it will never
+    // send. The machine ends the receive half and says so; nothing is left for
+    // the caller's frame list.
+    try frame.write(&writer, .{ .reset_stream = .{
+        .stream_id = 4,
+        .error_code = 0x1234,
+        .final_size = 10,
+    } });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const opened = try server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(@as(usize, 0), opened.frames.len);
+    try testing.expectEqual(@as(usize, 1), opened.streams.len);
+    try testing.expectEqual(@as(u64, 4), opened.streams[0].stream_id);
+    try testing.expect(opened.streams[0].reset);
+    try testing.expect(!opened.streams[0].readable);
+
+    const entry = server.stream(4) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(ReceiveStream.State.reset_recvd, entry.recv.state);
+    try testing.expectEqual(@as(?u64, 10), entry.recv.final_size);
+
+    // §4.5: the final size a reset names cannot change, and a second reset with
+    // a different one is FINAL_SIZE_ERROR.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .reset_stream = .{
+        .stream_id = 4,
+        .error_code = 0x1235,
+        .final_size = 12,
+    } });
+    const changed = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.FinalSize, server.feed(
+        datagram[0..changed],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+
+    // The same reset again changes nothing, so it is reported to nobody.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .reset_stream = .{
+        .stream_id = 4,
+        .error_code = 0x1234,
+        .final_size = 10,
+    } });
+    const again = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const repeated = try server.feed(
+        datagram[0..again],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(@as(usize, 0), repeated.streams.len);
+
+    // The application takes the code, which is the only place it is kept.
+    try testing.expectEqual(@as(u64, 0x1234), try entry.recv.readReset());
+
+    // §19.4: a send-only stream has no receive half to reset: stream 3 is the
+    // server's own one-way stream.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .reset_stream = .{
+        .stream_id = 3,
+        .error_code = 1,
+        .final_size = 0,
+    } });
+    const wrong_way = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.StreamState, server.feed(
+        datagram[0..wrong_way],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+
+    // §4.1: a final size past the advertised window is FLOW_CONTROL_ERROR.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .reset_stream = .{
+        .stream_id = 8,
+        .error_code = 2,
+        .final_size = 65,
+    } });
+    const too_big = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.FlowControl, server.feed(
+        datagram[0..too_big],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+}
+
+test "RFC 9000 §19.5, stop sending resets the sending half and owes a reset" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x61, 0x62 };
+    var rings: [2][64]u8 = .{ undefined, undefined };
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &rings[0], .recv_limit_bytes = 64 },
+        .{ .recv_buffer = &rings[1], .recv_limit_bytes = 64 },
+    };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x63},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x63},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 1024,
+        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x64);
+    const server_secret: [protection.secret_length]u8 = @splat(0x65);
+    installApp(&client, &server, client_secret, server_secret);
+
+    // The server's own bidirectional stream, which it has sent nothing on yet.
+    const own = try server.openStream(1);
+    try testing.expectEqual(SendStream.State.ready, own.send.state);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var payload: [64]u8 = undefined;
+    var writer: Writer = .init(&payload);
+
+    // §3.5: the peer stops reading, and the machine resets the sending half in
+    // place. The RESET_STREAM is the caller's to send, with the code it asked
+    // for.
+    try frame.write(&writer, .{ .stop_sending = .{ .stream_id = 1, .error_code = 0x99 } });
+    const sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const opened = try server.feed(
+        datagram[0..sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(@as(usize, 0), opened.frames.len);
+    try testing.expectEqual(@as(usize, 1), opened.streams.len);
+    try testing.expectEqual(@as(?u64, 0x99), opened.streams[0].reset_owed);
+    try testing.expectEqual(SendStream.State.reset_sent, own.send.state);
+    try testing.expectEqual(@as(?u64, 0x99), own.send.reset_code);
+
+    // §19.5: a receive-only stream is one this endpoint can never send on, and a
+    // locally initiated stream that was never opened has no sending half to
+    // stop. Both are STREAM_STATE_ERROR.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stop_sending = .{ .stream_id = 2, .error_code = 1 } });
+    const one_way = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.StreamState, server.feed(
+        datagram[0..one_way],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stop_sending = .{ .stream_id = 5, .error_code = 1 } });
+    const unopened = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.StreamState, server.feed(
+        datagram[0..unopened],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+
+    // §3.2: a STOP_SENDING for a peer-initiated stream that no frame has
+    // reached yet opens it, sending half included, so the request has a home.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stop_sending = .{ .stream_id = 8, .error_code = 7 } });
+    const early = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const fresh_opened = try server.feed(
+        datagram[0..early],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(@as(?u64, 7), fresh_opened.streams[0].reset_owed);
+
+    const fresh = server.stream(8) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Conn.Stream.Halves.both, fresh.halves);
+    try testing.expectEqual(@as(u64, 64), fresh.send.limit);
+    try testing.expectEqual(SendStream.State.reset_sent, fresh.send.state);
 }
 
 test "RFC 9000 §4.2, reading a ring is what makes a window raise due" {
