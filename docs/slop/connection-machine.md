@@ -513,6 +513,13 @@ Also worth recording: `zig build interop-bin` never installed its artifact, so
 `just interop` could never have run. A test that cannot start is worse than no
 test, and it survived because quiche is not installed anywhere this repo has run.
 
+That half is fixed and checked: the build uses `addInstallArtifact`, the binary
+lands in `zig-out/bin/interop`, and the recipe reaches its skip path with the
+command to build quiche. What is still unrun is the foreign peer itself. No
+machine here has `quiche-client`, it is not in nixpkgs, and adding it means a
+Cargo checkout that the flake in `baskingspot/nix` would have to own — another
+repo's decision. Until then, interop is a test that starts and skips.
+
 ## The queue, landed
 
 All nine, one commit each, `just ci` green between them. The order was the point:
