@@ -57,6 +57,8 @@ const Endpoint = struct {
     plaintext: [1500]u8 = undefined,
     parsed: [16]frame.Frame = undefined,
     stream_events: [16]Conn.StreamEvent = undefined,
+    /// Where the client copies the server's name out of its first packet.
+    adopted_cid: [20]u8 = undefined,
 
     fn loss(self: *Endpoint) Conn.Loss {
         return .{
@@ -113,9 +115,10 @@ pub fn main(init: std.process.Init) !void {
     const named_server = [_]u8{ 0x5e, 0x5e, 0x5e, 0x5e, 0x5e, 0x5e, 0x5e, 0x5e };
     // What the server calls itself. A real server generates this from its own
     // entropy; the example fixes it so the transcript reads the same every run.
-    // Same length as `named_server` because this example has no connection ID
-    // migration, which is what would let the two lengths differ.
-    const server_local_id = [_]u8{ 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78 };
+    // Four bytes, while the name the client invented is eight: §7.2 makes the
+    // client adopt this one, and a short header has to know the length without
+    // a field for it (§17.3.1).
+    const server_local_id = [_]u8{ 0x71, 0x72, 0x73, 0x74 };
     const client_id = [_]u8{ 0xc1, 0xc2 };
 
     // Two stub drivers that agree on secrets and on nothing else. The machine
@@ -130,6 +133,7 @@ pub fn main(init: std.process.Init) !void {
         .app_secrets = secrets,
     };
     var server_stub: handshake.Stub = .{
+        .outbox = &.{.{ .level = .initial, .bytes = "ServerHello, faked" }},
         .handshake_secrets = secrets,
         .app_secrets = secrets,
     };
@@ -156,6 +160,7 @@ pub fn main(init: std.process.Init) !void {
     client_config.receive_limit = 4096;
     client_config.send_limit = 4096;
     client_config.send_streams = .{ .bidi_remote = 4096 };
+    client_config.connection_id_storage = &client.adopted_cid;
     // The client opens one stream, so it needs the server's credit for one.
     client_config.peer_max_streams = .{ .bidi = 1 };
     client_config.max_streams_bidi = 1;
@@ -195,14 +200,22 @@ pub fn main(init: std.process.Init) !void {
     server_config.send_streams = .{ .bidi_local = 4096 };
     server.start(server_config);
 
-    // The server reads the flight, and its call writes nothing but installs
-    // the spaces its driver reported secrets for.
+    // The server reads the flight and installs the spaces its driver reported
+    // secrets for; that is what makes its 1-RTT keys exist.
     const first_server_packet = try server.feed(wire[0..flight], now(io));
     std.debug.assert(first_server_packet.space == .initial);
-    // Nothing to say back yet; installing the spaces the driver reported is
-    // what makes the server's 1-RTT keys exist.
     try server.conn.installSpaces();
     std.debug.print("server: 1-RTT keys from the faked handshake: {}\n", .{server.conn.app != null});
+
+    // Its answer is also what names it: §7.2 makes the client adopt the Source
+    // Connection ID of the server's first Initial, and a short header has no
+    // length field to disagree about.
+    const hello = (try server.conn.writeHandshake(&frames, &wire, now(io))) orelse
+        return error.NoHandshakeWritten;
+    _ = try client.feed(wire[0..hello], now(io));
+    std.debug.print("client: sends to {d} bytes named by the server\n", .{
+        client.conn.destination_connection_id.len,
+    });
 
     // The client asks for a stream, writes, and offers it to the packetizer. The
     // offer is how much this packet may carry, not how much was written.

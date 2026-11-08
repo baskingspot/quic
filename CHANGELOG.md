@@ -273,6 +273,15 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- A client adopts the name the server's first Initial gives it (§7.2): the
+  Source Connection ID of that packet becomes the Destination Connection ID of
+  everything it sends afterwards, copied into `Conn.Config.connection_id_storage`
+  because the receive buffer is reused. A later long header with a different
+  Source Connection ID is dropped with `error.WrongConnectionId` instead of being
+  adopted. This is what lets the two endpoints use connection IDs of different
+  lengths, which a short header has to know without a length field (§17.3.1); a
+  client without the storage still refuses with `error.NoSpace`. Rekeying
+  through NEW_CONNECTION_ID is not part of this.
 - MAX_STREAMS no longer appears in `Opened.frames`: the machine raises the
   credit the peer grants this endpoint, ignores a count that does not increase,
   and refuses a count that permits a stream id §17.1 cannot encode with

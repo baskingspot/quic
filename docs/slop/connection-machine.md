@@ -609,12 +609,28 @@ own open being refused is not the peer-visible STREAM_LIMIT_ERROR that `feed`
 raises when the peer overruns the table. A count above 2^60 is
 `error.StreamCountTooLarge`, which is FRAME_ENCODING_ERROR (§19.11).
 
+### The short-header length bug, landed
+
+§7.2 in two rules. A client adopts the Source Connection ID of the server's first
+Initial as its destination, copying it into `Config.connection_id_storage`
+because the receive buffer is reused; after that, a long header with a different
+Source Connection ID is dropped (`error.WrongConnectionId`), never adopted. A
+server only checks: its destination came from the client's first packet, which
+`Opening` copied. The echo now runs the client's invented eight-byte name
+against a four-byte server name, which is the case that was silently broken: a
+short header has no length field, so the two ends have to agree (§17.3.1).
+
+Not in this: NEW_CONNECTION_ID, `retire_prior_to`, and stateless reset tokens.
+Matt's call is that this is a feature built after interop runs against a real
+peer, because a single connection ID completes a handshake and exchanges streams
+and rotation is what you add once that path is known to work. A partial
+`retire_prior_to` is a connection error, so it stays absent until it is complete.
+
 ### What is not wired, in the order the RFC makes it matter
 
-1. **Connection ID changes are not adopted.** The echo keeps the client's and the
-   server's IDs the same length, because a short header's destination length comes
-   from the connection and nothing copies a peer's Source Connection ID into the
-   destination when the two differ. NEW_CONNECTION_ID is not wired either.
+1. **NEW_CONNECTION_ID and its rotation.** Named for after interop, per the
+   paragraph above. `retire_prior_to`, the connection ID limit, and stateless
+   reset tokens go together.
 2. **0-RTT**, which the constraints note already records as dropped, not buffered.
 
 The queue in this note is empty; the next session starts at item 1 above, or at

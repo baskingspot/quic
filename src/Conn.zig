@@ -137,6 +137,10 @@ pub const Error = protection.Error ||
         /// cannot encode, which is FRAME_ENCODING_ERROR for the caller to close
         /// with.
         StreamCountTooLarge,
+        /// §7.2: a long header names a different endpoint than the one this
+        /// connection sends to. It is not this connection's packet, so the
+        /// caller drops it rather than closing anything.
+        WrongConnectionId,
         /// §10.2.1 and §10.2.2: this connection has sent or received a
         /// CONNECTION_CLOSE, so it processes no more packets. Only the close
         /// itself may still be written.
@@ -262,6 +266,14 @@ pub const Config = struct {
     /// connection ID plus token this client expects to be handed; a Retry that
     /// does not fit is `error.NoSpace` before any of it is adopted.
     retry_storage: []u8 = "",
+    /// Where a client copies the name the server first gives it (§7.2): the
+    /// Source Connection ID of the server's first Initial becomes the
+    /// Destination Connection ID of everything this endpoint sends after it,
+    /// and the datagram it arrived in is reused. Twenty bytes is the most a
+    /// version 1 connection ID can be; a name that does not fit is
+    /// `error.NoSpace`. A server never needs this: its destination came from
+    /// the client's first packet, which `Opening` already copied.
+    connection_id_storage: []u8 = "",
     /// The truncation width to use. §17.1 makes this a function of what the
     /// peer has acknowledged; until that lands, the caller picks, and four
     /// bytes is always legal.
@@ -645,6 +657,13 @@ token: []const u8,
 /// The caller's storage that `token` and a Retry's connection ID live in once
 /// they have been copied out of the datagram they arrived in.
 retry_storage: []u8,
+/// The caller's storage for the name the server first gives this endpoint
+/// (§7.2), once it has been copied out of the datagram it arrived in.
+connection_id_storage: []u8,
+/// Whether a server has named this endpoint. §7.2: only the first Initial (or
+/// a Retry) changes the client's destination, and a later long header with a
+/// different Source Connection ID is discarded, not adopted.
+named: bool = false,
 /// §6.2 and §17.2.5.2: the client's memory of what the server has said, which
 /// is what decides whether a Version Negotiation or a Retry still counts. Absent
 /// on a server, which never has to remember either.
@@ -760,6 +779,7 @@ pub fn init(config: Config) Conn {
         .loss = config.loss,
         .token = config.token,
         .retry_storage = config.retry_storage,
+        .connection_id_storage = config.connection_id_storage,
         .ack_delay_exponent = config.ack_delay_exponent,
         .max_ack_delay = config.max_ack_delay,
         .peer_address_validated = config.peer_address_validated,
@@ -906,6 +926,10 @@ const Located = struct {
     bytes: []u8,
     /// Where the packet number starts, counted from `bytes[0]`.
     pn_offset: u32,
+    /// §7.2: the Source Connection ID a long header names, which is what the
+    /// recipient puts in its own Destination Connection ID. Null for a short
+    /// header, because it carries only the destination.
+    source_connection_id: ?[]const u8,
 };
 
 fn locate(self: *const Conn, bytes: []u8) Error!Located {
@@ -919,6 +943,7 @@ fn locate(self: *const Conn, bytes: []u8) Error!Located {
             .id = .app,
             .bytes = bytes,
             .pn_offset = @intCast(1 + short.destination_connection_id.len),
+            .source_connection_id = null,
         };
     }
 
@@ -939,6 +964,7 @@ fn locate(self: *const Conn, bytes: []u8) Error!Located {
         .id = id,
         .bytes = bytes[0 .. @as(usize, long.body_offset) + long.length],
         .pn_offset = long.body_offset,
+        .source_connection_id = long.source_connection_id,
     };
 }
 
@@ -965,6 +991,10 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
         plaintext,
     );
 
+    // §7.2: the long header's Source Connection ID is the name the peer uses,
+    // and it is only trusted once the packet it arrived in decrypts.
+    try self.nameFrom(at);
+
     // §6.2 and §17.2.5.2: once anything from the server has been processed, a
     // Version Negotiation is discarded and a Retry is too late. A packet that
     // decrypted is the server having spoken, whatever it said inside.
@@ -985,6 +1015,39 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
         .packet_len = @intCast(at.bytes.len),
         .payload = opened.payload,
     };
+}
+
+/// §7.2: learn the name this endpoint sends to, and discard a long header that
+/// names somebody else.
+///
+/// The first Initial (or a Retry before it) sets a client's Destination
+/// Connection ID; after that a long header with a different Source Connection ID
+/// is not this connection's and is dropped. A server's destination came from the
+/// client's first packet, so for it the check is only ever a check. The name is
+/// copied out of the receive buffer, which the caller reuses.
+fn nameFrom(self: *Conn, at: Located) Error!void {
+    const supplied = at.source_connection_id orelse return;
+    const same = std.mem.eql(u8, supplied, self.destination_connection_id);
+
+    // A packet that already names this destination confirms the name and needs
+    // nothing copied, whatever form it has.
+    if (same) {
+        self.named = true;
+        return;
+    }
+
+    if (self.role == .server or self.named) return error.WrongConnectionId;
+
+    // §7.2 names only the first Initial or Retry. A Handshake packet cannot
+    // name an endpoint, and its keys cannot exist before the Initial that
+    // carried them, so anything else arriving first is not this connection's.
+    if (at.id != .initial) return error.WrongConnectionId;
+
+    if (self.connection_id_storage.len < supplied.len) return error.NoSpace;
+    const copy = self.connection_id_storage[0..supplied.len];
+    @memcpy(copy, supplied);
+    self.destination_connection_id = copy;
+    self.named = true;
 }
 
 /// Parse the payload's frames and act on the ones the machine owns.
@@ -2926,12 +2989,14 @@ test "RFC 9000 §17.2.5.2, a Retry that is not ours, or is late, is ignored" {
     const retry_scid = [_]u8{ 0xbb, 0xbc };
     var retry_storage: [64]u8 = undefined;
     var client_loss: LossTables = .{};
+    var adopted_cid: [20]u8 = undefined;
     var client: Conn = .init(.{
         .role = .client,
         .loss = client_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &client_scid,
+        .connection_id_storage = &adopted_cid,
         .retry_storage = &retry_storage,
     });
     var server_loss: LossTables = .{};
@@ -2969,6 +3034,9 @@ test "RFC 9000 §17.2.5.2, a Retry that is not ours, or is late, is ignored" {
     var report: Recovery.Events = .init(&acked, &lost);
     var stream_events: [16]StreamEvent = undefined;
     _ = try client.feed(datagram[0..sent], &plaintext, &frames, &stream_events, &report, 0);
+    // §7.2: that Initial named the server, so the destination is its Source
+    // Connection ID now.
+    try testing.expectEqualSlices(u8, &retry_scid, client.destination_connection_id);
 
     const length = try setup.Retry.write(&retry_bytes, &dcid, .{
         .destination_connection_id = &client_scid,
@@ -2977,7 +3045,8 @@ test "RFC 9000 §17.2.5.2, a Retry that is not ours, or is late, is ignored" {
     });
     const late = try packet.parseRetry(try packet.parseInvariant(retry_bytes[0..length]));
     try testing.expectEqual(setup.Client.Outcome.ignored, try client.onRetry(&late, retry_bytes[0..length]));
-    try testing.expectEqualSlices(u8, &dcid, client.destination_connection_id);
+    // The late Retry changed nothing: the name the server gave still stands.
+    try testing.expectEqualSlices(u8, &retry_scid, client.destination_connection_id);
 
     // A server has no attempt, and says so rather than pretending it ignored a
     // packet it was never meant to see.
@@ -3532,12 +3601,14 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
     var client_loss: LossTables = .{};
+    var adopted_cid: [20]u8 = undefined;
     var client: Conn = .init(.{
         .role = .client,
         .loss = client_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &.{ 0xc1, 0xc2 },
+        .connection_id_storage = &adopted_cid,
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -3731,6 +3802,98 @@ test "RFC 9000 §13.2.1, the acknowledgment summary lists the spaces in order" {
     try testing.expect(!server.ackOwed(.app));
 }
 
+test "RFC 9000 §7.2, a client adopts the name the server's first Initial gives" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+
+    // The client invents an eight-byte name for the server, as §7.2 asks. The
+    // server calls itself four bytes, which is the length a short header has to
+    // know without a Length field (§17.3.1).
+    const invented = [_]u8{ 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1 };
+    const server_name = [_]u8{ 0x11, 0x12, 0x13, 0x14 };
+    const client_name = [_]u8{ 0xc1, 0xc2 };
+
+    var adopted: [20]u8 = undefined;
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &invented,
+        .destination_connection_id = &invented,
+        .source_connection_id = &client_name,
+        .connection_id_storage = &adopted,
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &invented,
+        .destination_connection_id = &client_name,
+        .source_connection_id = &server_name,
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x21);
+    const server_secret: [protection.secret_length]u8 = @splat(0x22);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    const payload = pings(1);
+
+    // The server's first Initial names it, and the client sends to that name
+    // from then on.
+    const flight = try server.writeFrames(.initial, &payload, &datagram, .data(0));
+    _ = try client.feed(datagram[0..flight], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqualSlices(u8, &server_name, client.destination_connection_id);
+
+    // The buffer the name arrived in is about to be reused. The adoption copied
+    // it, so a short header now carries the server's four bytes and the server,
+    // which reads the length from its own name, parses it.
+    const app_len = try client.writeFrames(.app, &payload, &datagram, .data(0));
+    const at_server = try server.feed(datagram[0..app_len], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(.app, at_server.space);
+
+    // §7.2: a later long header with a different Source Connection ID is
+    // discarded, not adopted, and the datagram walk counts it as a drop.
+    var imposter_loss: LossTables = .{};
+    var imposter: Conn = .init(.{
+        .role = .server,
+        .loss = imposter_loss.value(),
+        .original_destination_connection_id = &invented,
+        .destination_connection_id = &client_name,
+        .source_connection_id = &.{ 0x31, 0x32, 0x33, 0x34 },
+    });
+    const imposter_flight = try imposter.writeFrames(.initial, &payload, &datagram, .data(0));
+    var walk: Datagram = .init(datagram[0..imposter_flight]);
+    try testing.expect((try walk.next(&client, &plaintext, &frames, &stream_events, &report, 0)) == null);
+    try testing.expectEqual(@as(u16, 1), walk.dropped);
+    try testing.expectEqualSlices(u8, &server_name, client.destination_connection_id);
+
+    // A caller that did not size the copy cannot adopt, and the failure is its
+    // own sizing rather than a packet to drop.
+    var tight: [3]u8 = undefined;
+    var fresh_loss: LossTables = .{};
+    var fresh: Conn = .init(.{
+        .role = .client,
+        .loss = fresh_loss.value(),
+        .original_destination_connection_id = &invented,
+        .destination_connection_id = &invented,
+        .source_connection_id = &client_name,
+        .connection_id_storage = &tight,
+    });
+    const again = try server.writeFrames(.initial, &payload, &datagram, .data(0));
+    try testing.expectError(error.NoSpace, fresh.feed(
+        datagram[0..again],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+}
+
 test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     var acked: [16]Recovery.SentPacket = undefined;
     var lost: [16]Recovery.SentPacket = undefined;
@@ -3738,12 +3901,14 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 3, 1, 4, 1, 5 };
     var client_loss: LossTables = .{};
+    var adopted_cid: [20]u8 = undefined;
     var client: Conn = .init(.{
         .role = .client,
         .loss = client_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &.{ 0xa1, 0xa2 },
+        .connection_id_storage = &adopted_cid,
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -3751,7 +3916,7 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
         .loss = server_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &.{ 0xa1, 0xa2 },
-        .source_connection_id = &.{ 0xb1, 0xb2 },
+        .source_connection_id = &dcid,
     });
 
     // What the TLS driver will do: both sides get the Handshake keys from the
@@ -3881,12 +4046,14 @@ test "RFC 9000 §17.2.2.1, a packet for a discarded space is dropped and the con
     var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0xe1, 0xe2 };
     var client_loss: LossTables = .{};
+    var adopted_cid: [20]u8 = undefined;
     var client: Conn = .init(.{
         .role = .client,
         .loss = client_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0xea},
+        .connection_id_storage = &adopted_cid,
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -3894,7 +4061,7 @@ test "RFC 9000 §17.2.2.1, a packet for a discarded space is dropped and the con
         .loss = server_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &.{0xea},
-        .source_connection_id = &.{0xeb},
+        .source_connection_id = &dcid,
     });
     const client_secret: [protection.secret_length]u8 = @splat(0xdd);
     const server_secret: [protection.secret_length]u8 = @splat(0xee);
@@ -5857,12 +6024,14 @@ test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram"
     var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x0d, 0x0e };
     var client_loss: LossTables = .{};
+    var adopted_cid: [20]u8 = undefined;
     var client: Conn = .init(.{
         .role = .client,
         .loss = client_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x0a},
+        .connection_id_storage = &adopted_cid,
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -5916,12 +6085,14 @@ test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next i
     var stream_events: [16]StreamEvent = undefined;
     const dcid = [_]u8{ 0x1d, 0x1e };
     var client_loss: LossTables = .{};
+    var adopted_cid: [20]u8 = undefined;
     var client: Conn = .init(.{
         .role = .client,
         .loss = client_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x1a},
+        .connection_id_storage = &adopted_cid,
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -5929,7 +6100,7 @@ test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next i
         .loss = server_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &.{0x1a},
-        .source_connection_id = &.{0x1b},
+        .source_connection_id = &dcid,
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x99);
     const server_secret: [protection.secret_length]u8 = @splat(0xaa);
@@ -6257,12 +6428,14 @@ test "RFC 9002 §6.1.1, an acknowledgment is what declares the gap lost" {
     var stream_events: [16]StreamEvent = undefined;
 
     var client_loss: LossTables = .{};
+    var adopted_cid: [20]u8 = undefined;
     var client: Conn = .init(.{
         .role = .client,
         .loss = client_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x7c},
+        .connection_id_storage = &adopted_cid,
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -6394,12 +6567,14 @@ test "a loss configuration with an empty table is refused" {
 test "RFC 9000 §19.3.1, an acknowledgment of a packet never sent is a connection error" {
     const dcid = [_]u8{ 0x81, 0x82 };
     var client_loss: LossTables = .{};
+    var adopted_cid: [20]u8 = undefined;
     var client: Conn = .init(.{
         .role = .client,
         .loss = client_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x83},
+        .connection_id_storage = &adopted_cid,
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -6472,12 +6647,14 @@ test "a full sent table refuses the packet instead of forgetting it" {
 test "RFC 9000 §18.2, a received ACK delay is scaled by this endpoint's exponent" {
     const dcid = [_]u8{ 0x87, 0x88 };
     var client_loss: LossTables = .{};
+    var adopted_cid: [20]u8 = undefined;
     var client: Conn = .init(.{
         .role = .client,
         .loss = client_loss.value(),
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x89},
+        .connection_id_storage = &adopted_cid,
         .ack_delay_exponent = 3,
     });
     var server_loss: LossTables = .{};
