@@ -18,11 +18,13 @@
 //! `Opened.frames`, because a packet that does not say what it carries cannot be
 //! retransmitted by a caller that later learns it was lost.
 //!
-//! Loss recovery is the caller's too, and lives outside this type. `Recovery.Space`
-//! holds a `*Recovery`, and `Conn.init` returns by value, so a `Recovery` field
-//! here would be left behind by the caller's first assignment and every space in
-//! the copy would point at the pre-move address. `Config.loss` is the caller's
-//! storage instead, and `Conn` keeps only the handles built from it.
+//! Loss recovery is the caller's too, and lives outside this type: the
+//! `Recovery`, its three sent tables, and the three `Recovery.Space` values are
+//! all in caller storage, and `Conn` keeps only pointers into them. `Conn.init`
+//! returns by value, so a `Recovery` field here would be left behind by the
+//! caller's first assignment and every space in the copy would point at the
+//! pre-move address. `Config.loss` is the caller's storage instead, which is also
+//! what lets a `RecoveryDriver` outlive a moved connection.
 
 const std = @import("std");
 const testing = std.testing;
@@ -155,7 +157,9 @@ pub const StreamLimits = struct {
 /// `Recovery` field inside `Conn` would leave every space pointed at the
 /// pre-move address: a dangling pointer that surfaces much later as recovery
 /// state changing on its own, with no path back to the cause. The sent tables
-/// move for the same reason, because a space keeps a slice of one.
+/// move for the same reason, because a space keeps a slice of one, and
+/// `spaces` holds the values themselves so a `RecoveryDriver` built over them
+/// needs no address inside the connection.
 ///
 /// All three tables must be non-empty. The machine records every packet it sends
 /// that is ack-eliciting or in flight (RFC 9002 §6.1), and a table that cannot
@@ -166,6 +170,11 @@ pub const Loss = struct {
     /// backoff (§6.2.1). Both belong to the path, so an Initial key discard
     /// leaves them alone (A.2).
     shared: *Recovery,
+    /// The per-space half, one slot per `SpaceId`, in the caller's storage. The
+    /// machine keeps a pointer into these rather than a copy, so a
+    /// `RecoveryDriver` built over them survives a `Conn` that moves: the
+    /// connection holds no address the driver needs.
+    spaces: *[3]Recovery.Space,
     sent_initial: []Recovery.SentPacket,
     sent_handshake: []Recovery.SentPacket,
     sent_app: []Recovery.SentPacket,
@@ -512,11 +521,11 @@ pub const Space = struct {
     send_keys: protection.Keys,
     receive_keys: protection.Keys,
     /// RFC 9002 §6.4: the loss state shares the keys' lifetime, so a packet sent
-    /// under them is accounted for here and nowhere else. The handle is always
-    /// present because the caller always supplies a table; a discard empties it
-    /// where it stands, which keeps the address a caller's `RecoveryDriver`
-    /// holds valid.
-    recovery: Recovery.Space,
+    /// under them is accounted for here and nowhere else. It lives in the
+    /// caller's `Loss.spaces`, not in this value: a discard empties it where it
+    /// stands, so the address a caller's `RecoveryDriver` holds stays valid even
+    /// when the space itself is gone.
+    recovery: *Recovery.Space,
     next_packet_number: u64 = 0,
     largest_received: ?u64 = null,
     /// The largest packet number an ACK has been sent for, so a machine does
@@ -754,7 +763,7 @@ pub fn init(config: Config) Conn {
             // The handle points at the caller's `Recovery`, never at `Conn`, so
             // returning this value is safe. That is the whole reason `Loss`
             // exists.
-            .recovery = config.loss.shared.space(config.loss.sent_initial),
+            .recovery = initialRecovery(config.loss),
         },
     };
 }
@@ -1062,7 +1071,13 @@ fn ackDelay(self: *const Conn, delay: u64) Duration {
 
 /// The options the loss detector is called with, from the caller's configuration
 /// and the one thing only the handshake driver knows.
-fn recoveryOptions(self: *const Conn) Recovery.Options {
+/// The recovery options this connection's spaces are driven with.
+///
+/// `RecoveryDriver` takes them on every call, and three of the four facts are
+/// the machine's to keep: the peer's `max_ack_delay`, whether its address is
+/// validated, and whether the TLS driver has confirmed the handshake. A caller
+/// that owns the driver asks here instead of reconstructing them.
+pub fn recoveryOptions(self: *const Conn) Recovery.Options {
     return .{
         .max_ack_delay = self.max_ack_delay,
         // §5.3: `max_ack_delay` bounds a reported delay only once the handshake is
@@ -1328,7 +1343,7 @@ fn installSpace(
     const space: Space = .{
         .send_keys = if (self.role == .client) client else server,
         .receive_keys = if (self.role == .client) server else client,
-        .recovery = self.loss.shared.space(self.loss.table(id)),
+        .recovery = placeRecovery(self.loss, id),
     };
     switch (id) {
         // Initial keys are derived from the connection ID in `init`, and a
@@ -1421,6 +1436,20 @@ fn lossTablesValid(loss: Loss) bool {
     if (tablesOverlap(loss.sent_initial, loss.sent_app)) return false;
     if (tablesOverlap(loss.sent_handshake, loss.sent_app)) return false;
     return true;
+}
+
+/// Build one space's loss state into the caller's storage and point at it.
+///
+/// Every creation of a `Conn.Space` goes through here, so there is exactly one
+/// place that knows where the state lives and no space can hold a copy.
+fn placeRecovery(loss: Loss, id: SpaceId) *Recovery.Space {
+    const place = &loss.spaces[@backingInt(id)];
+    place.* = loss.shared.space(loss.table(id));
+    return place;
+}
+
+fn initialRecovery(loss: Loss) *Recovery.Space {
+    return placeRecovery(loss, .initial);
 }
 
 /// Whether two caller tables share any storage.
@@ -2125,7 +2154,7 @@ fn rekeyInitial(self: *Conn, destination_connection_id: []const u8) void {
     self.initial = .{
         .send_keys = if (self.role == .client) client else server,
         .receive_keys = if (self.role == .client) server else client,
-        .recovery = self.loss.shared.space(self.loss.table(.initial)),
+        .recovery = placeRecovery(self.loss, .initial),
         .next_packet_number = next_packet_number,
     };
 }
@@ -3312,6 +3341,7 @@ const RecoveryDriver = @import("RecoveryDriver.zig");
 /// the three tables `Recovery.Space` records into.
 const LossTables = struct {
     shared: Recovery = .{},
+    spaces: [3]Recovery.Space = undefined,
     sent_initial: [16]Recovery.SentPacket = undefined,
     sent_handshake: [16]Recovery.SentPacket = undefined,
     sent_app: [16]Recovery.SentPacket = undefined,
@@ -3320,6 +3350,7 @@ const LossTables = struct {
     fn value(self: *LossTables) Conn.Loss {
         return .{
             .shared = &self.shared,
+            .spaces = &self.spaces,
             .sent_initial = &self.sent_initial,
             .sent_handshake = &self.sent_handshake,
             .sent_app = &self.sent_app,
@@ -5570,6 +5601,54 @@ test "the loss state stays outside the machine, so a copy of it still works" {
     try testing.expectEqual(Recovery.ms(50), client.initial.?.recovery.shared.rtt.latest);
 }
 
+test "RFC 9002 §6.2.1, a driver over the caller's spaces outlives the connection" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+
+    const dcid = [_]u8{ 0x91, 0x92 };
+    var loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x93},
+    });
+
+    // One ack-eliciting packet in flight arms the Initial space's probe timeout.
+    var datagram: [512]u8 = undefined;
+    _ = try client.writeFrames(.initial, &pings(2), &datagram, .data(0));
+
+    // The driver is built over the caller's three spaces, which is where the
+    // loss state lives now: no address inside the connection is needed.
+    var handles: [3]*Recovery.Space = .{
+        &loss.spaces[0],
+        &loss.spaces[1],
+        &loss.spaces[2],
+    };
+    var driver: RecoveryDriver = .init(&loss.shared, &handles);
+    const options = client.recoveryOptions();
+    const before = driver.deadline(options);
+    try testing.expectEqual(Recovery.TimerKind.probe, before.kind);
+    try testing.expectEqual(@as(usize, 0), before.space);
+
+    // A copy of the connection at another address still points at the same loss
+    // state, and the driver, which never knew the connection, is unaffected.
+    const moved = client;
+    try testing.expect(moved.initial.?.recovery == &loss.spaces[0]);
+    const after = driver.deadline(options);
+    try testing.expectEqual(before.at, after.at);
+    try testing.expectEqual(before.space, after.space);
+
+    // And it can fire: the probe is the Initial space's, from the caller's
+    // storage.
+    const fired = (try driver.poll(before.at, options, .client, &report)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(Recovery.TimeoutKind.probe, fired.kind);
+    try testing.expectEqual(@as(usize, 0), fired.space);
+}
+
 test "RFC 9002 §6.1.1, an acknowledgment is what declares the gap lost" {
     const dcid = [_]u8{ 0x7a, 0x7b };
     var acked: [16]Recovery.SentPacket = undefined;
@@ -5651,7 +5730,7 @@ test "RFC 9002 §6.2.1, a probe timeout is armed over the machine's own space" {
 
     // The caller's side of the timer: a driver over the spaces the machine owns.
     // The machine holds no clock, so this is where "when do I wake up" lives.
-    var spaces = [_]*Recovery.Space{&client.initial.?.recovery};
+    var spaces = [_]*Recovery.Space{client.initial.?.recovery};
     var driver: RecoveryDriver = .init(&loss.shared, &spaces);
 
     // §6.2.1 with no sample yet: smoothed 333ms and variance 166.5ms, so the
@@ -5698,9 +5777,11 @@ test "a loss configuration with an empty table is refused" {
         .{ .sent_initial = first[0..2], .sent_handshake = first[2..4], .sent_app = &third, .valid = true },
     };
 
+    var spaces: [3]Recovery.Space = undefined;
     for (cases) |case| {
         const loss: Loss = .{
             .shared = &shared,
+            .spaces = &spaces,
             .sent_initial = case.sent_initial,
             .sent_handshake = case.sent_handshake,
             .sent_app = case.sent_app,
@@ -6018,7 +6099,7 @@ fn plantSpace(conn: *Conn, id: SpaceId, send: protection.Keys, receive: protecti
     const installed: Space = .{
         .send_keys = send,
         .receive_keys = receive,
-        .recovery = conn.loss.shared.space(conn.loss.table(id)),
+        .recovery = placeRecovery(conn.loss, id),
     };
     switch (id) {
         .initial => unreachable,

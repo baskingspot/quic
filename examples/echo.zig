@@ -28,6 +28,9 @@ const tables_max = 16;
 /// moved, because `Conn` holds pointers into it.
 const Endpoint = struct {
     recovery: Recovery = .{},
+    /// The per-space loss state, outside the connection so a `RecoveryDriver`
+    /// can hold it without holding a pointer into the connection.
+    spaces: [3]Recovery.Space = undefined,
     sent_initial: [tables_max]Recovery.SentPacket = undefined,
     sent_handshake: [tables_max]Recovery.SentPacket = undefined,
     sent_app: [tables_max]Recovery.SentPacket = undefined,
@@ -58,6 +61,7 @@ const Endpoint = struct {
     fn loss(self: *Endpoint) Conn.Loss {
         return .{
             .shared = &self.recovery,
+            .spaces = &self.spaces,
             .sent_initial = &self.sent_initial,
             .sent_handshake = &self.sent_handshake,
             .sent_app = &self.sent_app,

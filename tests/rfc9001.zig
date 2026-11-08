@@ -212,12 +212,14 @@ test "RFC 9001 A.2, the machine reproduces the client Initial byte for byte" {
     // The golden gate for the connection machine: given the RFC's own payload
     // and packet number, its `writeFrames` must produce the printed packet.
     var loss: quic.Recovery = .{};
+    var spaces: [3]quic.Recovery.Space = undefined;
     var sent_initial: [4]quic.Recovery.SentPacket = undefined;
     var sent_handshake: [4]quic.Recovery.SentPacket = undefined;
     var sent_app: [4]quic.Recovery.SentPacket = undefined;
     var conn: quic.Conn = .init(.{
         .loss = .{
             .shared = &loss,
+            .spaces = &spaces,
             .sent_initial = &sent_initial,
             .sent_handshake = &sent_handshake,
             .sent_app = &sent_app,

@@ -571,20 +571,28 @@ an id the table no longer holds would close connections over harmless
 retransmissions. Either `closeStream` keeps a caller-owned record of the ids it
 has forgotten, or the check stays partial.
 
+### The recovery handles, landed after that
+
+`Conn.Loss` gained `spaces: *[3]Recovery.Space`, the caller's storage for the
+three spaces, and `Conn.Space.recovery` became a pointer into it. A
+`RecoveryDriver` is now built over `&loss.spaces` and outlives a connection that
+moves, because nothing it holds lives inside the `Conn`; the move assertion stays
+for everything else. `Conn.recoveryOptions` is public, so the caller no longer
+reconstructs the options the driver takes on every call.
+
+Two creation sites had to change with it, and both are the same call:
+`init` places the Initial space, `installSpace` places Handshake and 1-RTT, and
+`rekeyInitial` replaces the Initial one in the same slot, which is what a Retry
+wanted anyway — fresh loss state, same address. `placeRecovery` is the only place
+that knows where the state lives.
+
 ### What is not wired, in the order the RFC makes it matter
 
-1. **The congestion and timer handles pin the connection's address.**
-   `RecoveryDriver` wants `[]const *Recovery.Space`, which means
-   `&conn.app.?.recovery`; the move assertion now makes a later move loud instead of
-   silent, but the API still forces the caller to hand out an interior address.
-   `Conn.recoveryOptions` is private, so the caller reconstructs `Recovery.Options`
-   from the RFC's defaults. Either a driver built from the connection, borrowing the
-   addresses once inside a type the caller owns, or an options accessor — not both.
-2. **Connection ID changes are not adopted.** The echo keeps the client's and the
+1. **Connection ID changes are not adopted.** The echo keeps the client's and the
    server's IDs the same length, because a short header's destination length comes
    from the connection and nothing copies a peer's Source Connection ID into the
    destination when the two differ. NEW_CONNECTION_ID is not wired either.
-3. **0-RTT**, which the constraints note already records as dropped, not buffered.
+2. **0-RTT**, which the constraints note already records as dropped, not buffered.
 
 The queue in this note is empty; the next session starts at item 1 above, or at
 whatever Matt puts ahead of it.

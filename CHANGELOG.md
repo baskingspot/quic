@@ -273,6 +273,16 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `Conn.Loss` gained `spaces`, the caller's storage for the three
+  `Recovery.Space` values, and `Conn.Space.recovery` is now a pointer into it.
+  Loss state no longer lives inside the connection, so a `RecoveryDriver` built
+  over the caller's storage keeps working when a `Conn` moves. Every `Loss`
+  literal needs the new field; `Conn.Loss` is unchanged otherwise. A caller that
+  read `conn.app.?.recovery` directly now reads through the pointer, which is the
+  same syntax.
+- `Conn.recoveryOptions` is public: the driver takes the options on every call,
+  and the connection is where the peer's `max_ack_delay`, the validated flag, and
+  the driver's confirmation are.
 - RESET_STREAM and STOP_SENDING no longer appear in `Opened.frames`. The machine
   ends the receive half on a reset and resets the sending half on a stop, and
   reports both in `Opened.streams`: `Conn.StreamEvent` gained `reset`, and
