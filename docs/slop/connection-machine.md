@@ -563,13 +563,14 @@ A STOP_SENDING for a peer bidi stream that no frame has reached yet opens it,
 sending half included, because §3.2 says the frame does that and it may arrive
 before the STREAM frame does.
 
-Left alone on purpose: §19.8's "a STREAM frame for a locally initiated stream
-that has not yet been created". The machine cannot tell never-created from
-created-and-forgotten, because `closeStream` frees the slot, and §3.3 says a
-receiver can see a STREAM frame late in any state. Raising STREAM_STATE_ERROR on
-an id the table no longer holds would close connections over harmless
-retransmissions. Either `closeStream` keeps a caller-owned record of the ids it
-has forgotten, or the check stays partial.
+The §19.8 checks came one commit later, with the memory they needed. A slot can
+be freed by `closeStream`, so "not in the table" is ambiguous between
+never-created and created-and-forgotten, and §3.3 says a delayed frame is legal.
+`Conn` records the highest ordinal it has opened per direction
+(`opened_local`): an id below it was created and a frame for it is ignored, an
+id at or above it was never created and the frame is STREAM_STATE_ERROR. That is
+the only state `closeStream` leaves behind, and it answers the same question for
+a delayed STOP_SENDING.
 
 ### The recovery handles, landed after that
 

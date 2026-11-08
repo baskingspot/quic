@@ -273,6 +273,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- A STREAM frame for a locally initiated stream this endpoint never opened, or
+  for a one-way stream it opened, is now STREAM_STATE_ERROR (§19.8). A frame for
+  a stream it opened and later closed is ignored: `closeStream` frees the slot,
+  so the machine records the highest stream ordinal it has opened and tolerates
+  a delayed frame below it (§3.3). The same record keeps a delayed STOP_SENDING
+  for a closed stream from closing the connection.
 - `Conn.Loss` gained `spaces`, the caller's storage for the three
   `Recovery.Space` values, and `Conn.Space.recovery` is now a pointer into it.
   Loss state no longer lives inside the connection, so a `RecoveryDriver` built

@@ -444,6 +444,13 @@ pub const Stream = struct {
             .unused, .recv_only => false,
         };
     }
+
+    pub fn canRecv(self: *const Stream) bool {
+        return switch (self.halves) {
+            .recv_only, .both => true,
+            .unused, .send_only => false,
+        };
+    }
 };
 
 /// Three per-level byte buffers, the caller's. `Config.crypto` is where a
@@ -673,6 +680,11 @@ send_window: FlowControl.Sender,
 /// about.
 streams_allowed: StreamLimits,
 streams_advertised: StreamLimits,
+/// §2.1: how many streams this endpoint has opened, per direction, counting
+/// ordinals. An id below it was created at some point; one at or above it never
+/// was. `closeStream` frees a slot and the machine keeps no record of the id, so
+/// this is the only memory of a stream that is gone.
+opened_local: StreamLimits = .{},
 /// Whether the driver has them yet. One call, before the first flight.
 transport_parameters_set: bool = false,
 
@@ -1513,7 +1525,32 @@ pub fn openStream(self: *Conn, id: u64) Error!*Stream {
     } else {
         _ = try self.stream_table.open(id, &entry.send, null);
     }
+    self.noteOpened(id);
     return entry;
+}
+
+/// Record that a locally initiated stream existed, so a frame for it can be told
+/// from a frame for a stream that never did.
+fn noteOpened(self: *Conn, id: u64) void {
+    const ordinal = stream_id.index(id);
+    switch (stream_id.direction(id)) {
+        .bidi => self.opened_local.bidi = @max(self.opened_local.bidi, ordinal + 1),
+        .uni => self.opened_local.uni = @max(self.opened_local.uni, ordinal + 1),
+    }
+}
+
+/// Whether this endpoint ever opened the locally initiated stream `id`.
+///
+/// A slot can be freed by `closeStream`, and §3.3 lets a delayed frame for the
+/// old stream arrive after that. The high-water mark is what separates "never
+/// created", which §19.5 and §19.8 make a connection error, from "created,
+/// closed, and forgotten", which is a frame to ignore.
+fn everOpened(self: *const Conn, id: u64) bool {
+    const ordinal = stream_id.index(id);
+    return switch (stream_id.direction(id)) {
+        .bidi => ordinal < self.opened_local.bidi,
+        .uni => ordinal < self.opened_local.uni,
+    };
 }
 
 /// Take up the sending half of a stream the peer opened, so this endpoint can
@@ -1622,6 +1659,17 @@ fn onStreamFrame(
     // §12.4: Initial and Handshake packets carry no STREAM frames.
     if (space != .app) return error.WrongFrameSpace;
 
+    // §19.8: a STREAM frame for a send-only stream, or for a locally initiated
+    // stream this endpoint never created, is STREAM_STATE_ERROR. A stream it
+    // created and has since closed is a delayed frame to ignore (§3.3), which
+    // `everOpened` is what tells apart.
+    if (self.stream(frame_stream.id)) |known| {
+        if (!known.canRecv()) return error.StreamState;
+    } else if (locallyInitiated(self, frame_stream.id)) {
+        if (!everOpened(self, frame_stream.id)) return error.StreamState;
+        return;
+    }
+
     const entry = try self.streamFor(frame_stream.id);
     const before = entry.recv.highest;
     // §3.2: what the application can see is the contiguous run from its read
@@ -1713,7 +1761,15 @@ fn onStopSending(
     // stop. Both are STREAM_STATE_ERROR.
     if (receiveOnly(self, stop.stream_id)) return error.StreamState;
     if (self.stream(stop.stream_id) == null) {
-        if (locallyInitiated(self, stop.stream_id)) return error.StreamState;
+        if (locallyInitiated(self, stop.stream_id)) {
+            // §19.5 makes a STOP_SENDING for a locally initiated stream that
+            // has not yet been created STREAM_STATE_ERROR. An id this endpoint
+            // opened and then closed is not that: the slot is gone, so it looks
+            // the same, and §3.3 lets the frame arrive late. Only an id beyond
+            // everything opened can never have existed.
+            if (!everOpened(self, stop.stream_id)) return error.StreamState;
+            return;
+        }
         // §3.2: this frame opens a bidirectional stream the peer initiated, and
         // it may arrive before any STREAM frame does. The sending half is the
         // one it is about, so the stream is joined straight away.
@@ -4825,6 +4881,157 @@ test "RFC 9000 §19.5, stop sending resets the sending half and owes a reset" {
     try testing.expectEqual(Conn.Stream.Halves.both, fresh.halves);
     try testing.expectEqual(@as(u64, 64), fresh.send.limit);
     try testing.expectEqual(SendStream.State.reset_sent, fresh.send.state);
+}
+
+test "RFC 9000 §3.3, a frame for a stream this endpoint closed is ignored" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x71, 0x72 };
+    var rings: [2][64]u8 = .{ undefined, undefined };
+    var slots: [2]StreamTable.Slot = undefined;
+    var streams: [2]Conn.Stream = .{
+        .{ .recv_buffer = &rings[0], .recv_limit_bytes = 64 },
+        .{ .recv_buffer = &rings[1], .recv_limit_bytes = 64 },
+    };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x73},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0x73},
+        .source_connection_id = &dcid,
+        .stream_slots = &slots,
+        .streams = &streams,
+        .receive_limit = 1024,
+        .send_streams = .{ .bidi_remote = 64, .uni = 64, .bidi_local = 64 },
+    });
+    const client_secret: [protection.secret_length]u8 = @splat(0x74);
+    const server_secret: [protection.secret_length]u8 = @splat(0x75);
+    installApp(&client, &server, client_secret, server_secret);
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var payload: [64]u8 = undefined;
+
+    // The server opens stream 1 and its one-way stream 3, and finishes 1: the
+    // sending half is reset and acknowledged, the receiving half ends with the
+    // peer's FIN and is read out.
+    const own = try server.openStream(1);
+    try own.send.reset(0);
+    try own.send.onResetAcked();
+    _ = try server.openStream(3);
+
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 1,
+        .offset = 0,
+        .data = "",
+        .fin = true,
+        .length_present = true,
+    } });
+    const fin_sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    _ = try server.feed(
+        datagram[0..fin_sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    var read_buffer: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try own.recv.readInto(&read_buffer));
+    try server.closeStream(1);
+    try testing.expect(server.stream(1) == null);
+
+    // §3.3: a STREAM frame delayed past the close arrives for an id the table no
+    // longer holds. It was created, so it is not a violation, and there is
+    // nothing left to deliver it to.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 1,
+        .offset = 0,
+        .data = "late",
+        .fin = false,
+        .length_present = true,
+    } });
+    const late_sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const late = try server.feed(
+        datagram[0..late_sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(@as(usize, 0), late.frames.len);
+    try testing.expectEqual(@as(usize, 0), late.streams.len);
+    try testing.expect(server.stream(1) == null);
+
+    // The same delayed frame as a STOP_SENDING is ignored for the same reason.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stop_sending = .{ .stream_id = 1, .error_code = 3 } });
+    const stop_sent = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    const stopped = try server.feed(
+        datagram[0..stop_sent],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    );
+    try testing.expectEqual(@as(usize, 0), stopped.streams.len);
+
+    // §19.8: a STREAM frame for a send-only stream this endpoint still holds is
+    // STREAM_STATE_ERROR, and so is one for a locally initiated id it never
+    // opened. Stream 3 is the server's own one-way stream; stream 5 it has never
+    // created.
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 3,
+        .offset = 0,
+        .data = "x",
+        .fin = false,
+        .length_present = true,
+    } });
+    const send_only = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.StreamState, server.feed(
+        datagram[0..send_only],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
+
+    writer = .init(&payload);
+    try frame.write(&writer, .{ .stream = .{
+        .id = 5,
+        .offset = 0,
+        .data = "x",
+        .fin = false,
+        .length_present = true,
+    } });
+    const never = try client.writeFrames(.app, writer.written(), &datagram, .data(0));
+    try testing.expectError(error.StreamState, server.feed(
+        datagram[0..never],
+        &plaintext,
+        &frames,
+        &stream_events,
+        &report,
+        0,
+    ));
 }
 
 test "RFC 9000 §4.2, reading a ring is what makes a window raise due" {
