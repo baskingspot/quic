@@ -761,8 +761,8 @@ would prove the seam's plumbing while proving a handshake no QUIC peer accepts.
 `Conn.feedCrypto` hands the driver its bytes and never installs the spaces the
 driver just reported: `installSpaces` is called from `writeHandshake` only. A
 datagram that coalesces a Handshake Finished with the first 1-RTT packet — which
-§12.2 allows and a server does, because HANDSHAKE_DONE rides immediately after
-the handshake — has that 1-RTT packet dropped for lack of keys (RFC 9001 §4.1.1).
+§12.2 allows, and §4.1.1 of RFC 9001 lets a server send as soon as its Finished
+goes out — has that 1-RTT packet dropped for lack of keys.
 The fix is to call `installSpaces` after the driver has been fed, or at each
 packet boundary in the walk. It cannot be tested before the driver exists,
 because no stub reports a secret at the moment it is fed; it is first on the
