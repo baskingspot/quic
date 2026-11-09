@@ -68,23 +68,20 @@ pub const chacha_packet = hex("4cfe4189655e5cd55c41f69080575d7999c25a5bfb");
 
 /// A.2: the client Initial, unprotected, and protected.
 pub const client_header = hex("c300000001088394c8f03e5157080000449e00000002");
-pub const client_payload_listed = hex(
-    "060040f1010000ed0303ebf8fa56f12939b9584a3896472ec40bb863cfd3e868" ++
+pub const client_payload_listed = hex("060040f1010000ed0303ebf8fa56f12939b9584a3896472ec40bb863cfd3e868" ++
     "04fe3a47f06a2b69484c00000413011302010000c000000010000e00000b6578" ++
     "616d706c652e636f6dff01000100000a00080006001d00170018001000070005" ++
     "04616c706e000500050100000000003300260024001d00209370b2c9caa47fba" ++
     "baf4559fedba753de171fa71f50f1ce15d43e994ec74d748002b000302030400" ++
     "0d0010000e0403050306030203080408050806002d00020101001c0002400100" ++
     "3900320408ffffffffffffffff05048000ffff07048000ffff08011001048000" ++
-    "75300901100f088394c8f03e51570806048000ffff"
-);
+    "75300901100f088394c8f03e51570806048000ffff");
 
 /// A.2 lists the CRYPTO frame and leaves the rest of the 1162-byte payload as
 /// PADDING frames, which are zero bytes.
 pub const client_payload = client_payload_listed ++ @as([917]u8, @splat(0));
 
-pub const client_packet = hex(
-    "c000000001088394c8f03e5157080000449e7b9aec34d1b1c98dd7689fb8ec11" ++
+pub const client_packet = hex("c000000001088394c8f03e5157080000449e7b9aec34d1b1c98dd7689fb8ec11" ++
     "d242b123dc9bd8bab936b47d92ec356c0bab7df5976d27cd449f63300099f399" ++
     "1c260ec4c60d17b31f8429157bb35a1282a643a8d2262cad67500cadb8e7378c" ++
     "8eb7539ec4d4905fed1bee1fc8aafba17c750e2c7ace01e6005f80fcb7df6212" ++
@@ -121,8 +118,7 @@ pub const client_packet = hex(
     "f96f3ca9ec1dde434da7d2d392b905ddf3d1f9af93d1af5950bd493f5aa731b4" ++
     "056df31bd267b6b90a079831aaf579be0a39013137aac6d404f518cfd4684064" ++
     "7e78bfe706ca4cf5e9c5453e9f7cfd2b8b4c8d169a44e55c88d4a9a7f9474241" ++
-    "e221af44860018ab0856972e194cd934"
-);
+    "e221af44860018ab0856972e194cd934");
 
 pub const client_sample = hex("d1b1c98dd7689fb8ec11d242b123dc9b");
 pub const client_mask = hex("437b9aec36");
@@ -130,20 +126,16 @@ pub const client_mask = hex("437b9aec36");
 /// A.3: the server Initial, unprotected, and protected.
 pub const server_header = hex("c1000000010008f067a5502a4262b50040750001");
 
-pub const server_payload = hex(
-    "02000000000600405a020000560303eefce7f7b37ba1d1632e96677825ddf739" ++
+pub const server_payload = hex("02000000000600405a020000560303eefce7f7b37ba1d1632e96677825ddf739" ++
     "88cfc79825df566dc5430b9a045a1200130100002e00330024001d00209d3c94" ++
     "0d89690b84d08a60993c144eca684d1081287c834d5311bcf32bb9da1a002b00" ++
-    "020304"
-);
+    "020304");
 
-pub const server_packet = hex(
-    "cf000000010008f067a5502a4262b5004075c0d95a482cd0991cd25b0aac406a" ++
+pub const server_packet = hex("cf000000010008f067a5502a4262b5004075c0d95a482cd0991cd25b0aac406a" ++
     "5816b6394100f37a1c69797554780bb38cc5a99f5ede4cf73c3ec2493a1839b3" ++
     "dbcba3f6ea46c5b7684df3548e7ddeb9c3bf9c73cc3f3bded74b562bfb19fb84" ++
     "022f8ef4cdd93795d77d06edbb7aaf2f58891850abbdca3d20398c276456cbc4" ++
-    "2158407dd074ee"
-);
+    "2158407dd074ee");
 
 pub const server_sample = hex("2cd0991c" ++ "d25b0aac406a5816b6394100");
 pub const server_mask = hex("2ec0d8356a");

@@ -5,10 +5,10 @@
 default:
     @just --list
 
-[doc("Unit tests")]
+[doc("Unit tests, including the TLS seam checks against baskingspot/tls, which is why the build needs -Dtls and the devshell's openssl")]
 [group("test")]
 test:
-    zig build test --summary all
+    zig build test -Dtls --summary all
 
 [doc("Build and run the echo example: the machine called as an application would")]
 [group("test")]
@@ -59,7 +59,7 @@ interop:
 [group("lint")]
 lint:
     ziglint
-    zig fmt --check src tools examples build.zig
+    zig fmt --check src tools examples tests build.zig
     # The validator validates itself first: the fixtures are what tell the next
     # person who edits it that a rule they changed stopped working.
     zig run tools/changelog.zig -- --self-test
@@ -73,7 +73,7 @@ lint:
 [doc("Format everything lint checks")]
 [group("lint")]
 fmt:
-    zig fmt src tools examples build.zig
+    zig fmt src tools examples tests build.zig
     nix fmt
     oxfmt README.md AGENTS.md .github
     just --fmt

@@ -652,3 +652,126 @@ is the one answer either role's caller asks for.
 
 The queue in this note is empty; the next session starts at item 1 above, or at
 whatever Matt puts ahead of it.
+
+## The TLS driver, and where tls stops it
+
+Attempted 2026-11-09, from main at `9caabb1`. No driver is written, because two
+of the seam's requirements have no tls API to satisfy them, and the third is a
+shape the driver cannot supply without a second handshake implementation. What
+did land is the wiring that proves the packages meet in one build, and five
+checks that fail when the gaps close: `tests/tls_seam.zig`, run by `just test`,
+which now passes `-Dtls`.
+
+The dependency is a commit, not a release: `baskingspot/tls` at `40dd9e8`,
+because v0.2.1 predates the Zig 0.17 port and this package is 0.17 only. It goes
+back to a `baskingspot.dev` tarball with the next tls tag. `-Dtls` fetches it the
+way tls gates its own xev integration, so a consumer that never asks for the
+driver never fetches the dependency. The dev shell gained openssl and
+pkg-config, because tls translates and links libcrypto from source.
+
+The driver is over the step core (`tls.handshake_core`), which is the right
+seam: it owns the transcript, the key schedule, the state machine, and the
+encryption level of every message, and it never frames or encrypts anything.
+
+### The blockers
+
+**1. A server never gets its application traffic secrets.** RFC 8446 §7.1
+derives "s ap traffic" at the server's Finished; RFC 9001 §4.1.1 makes that the
+moment the server's 1-RTT keys exist. The core derives `s ap traffic` nowhere:
+`deriveApplicationSecrets` is a `Client` method called from `sendClientFinished`,
+and `Server` has `handshakeSecrets()` and no application counterpart. A QUIC
+server therefore cannot install its 1-RTT space, which means it cannot send a
+byte of stream data. The five-line shape asked for: derive both application
+secrets in `Server.sendFlight` after the Finished is absorbed, and expose
+`Server.applicationSecrets()` returning the same `HandshakeSecrets`. The check in
+`tests/tls_seam.zig` names this.
+
+**2. A client cannot read the server's transport parameters.** RFC 9001 §8.2
+puts `quic_transport_parameters` (0x0039) in EncryptedExtensions, and every
+conformant server sends it. `Client.provideHandshake` calls
+`encrypted_extensions.parse(msg, self.alpn, .{ .offered_extensions = self.offered })`
+with no `allowed_extensions` and no `received` sink, and the parser's unknown-type
+branch rejects anything not allowlisted: `error.UnsupportedExtension`. The parser
+already has the whole mechanism (`Options.allowed_extensions` plus
+`ExtensionSink`), so the ask is one field on `Client` and passing it through.
+Without that, a client that talks to any real QUIC peer fails at the first
+EncryptedExtensions, and there is no driver-side workaround that does not
+re-parse and rewrite handshake bytes, which would move the transcript.
+
+**3. A server can neither read nor send transport parameters.** The client's
+parameters arrive in the ClientHello, and `client_hello.parse` was built before
+anyone needed them: it keeps only the extensions it recognizes and exposes no
+sink. `Server.provideClientHello` takes `(level, bytes, suite)` and nothing else.
+In the other direction, `Server.sendFlight` encodes EncryptedExtensions with
+`encrypted_extensions.encode(...)`, while `encodeWithExtensions` sits beside it
+unused. The asks: an `Options`/`ExtensionSink` on `client_hello.parse` and a
+`Server` accessor for the received ones; and extras through `sendFlight`, or a
+field on `Server` that `sendFlight` reads.
+
+The ordering matters: (2) blocks the loopback proof's client half as soon as the
+server is conformant, and (1) blocks the server half outright. So the proof the
+brief asks for cannot be built today, and a loopback that omitted the extension
+would prove the seam's plumbing while proving a handshake no QUIC peer accepts.
+
+### Smaller misfits, recorded so the driver is written once
+
+- **`suite()` has no "not negotiated yet".** The seam's `Suite` is a required
+  return, and `Conn.installSecrets` asks for it before it looks at whether any
+  secret exists. A TLS client does not know the suite until ServerHello, so a
+  driver must return a placeholder, and that placeholder must be a suite this
+  package implements or `installSecrets` refuses the connection before the
+  handshake starts. The machine-side fix is one move: ask only where a secret is
+  non-null. The seam-side fix is `?Suite`. Until one happens, the driver returns
+  `.aes_128_gcm_sha256` and the placeholder is never read.
+- **`KeyPairs` is not exported from `tls.root`,** so no consumer can call
+  `Client.startEncoded` or `Client.startEncodedWithPsk`: the parameter type is
+  unreachable. The driver encodes with `client_hello.encode…` and calls
+  `Client.start`, which works, but it means the driver owns the keypairs and
+  every encoding argument.
+- **ECDHE is the caller's.** `Client.provide(level, server_hello, dhe)` and
+  `Server.provideServerHello(level, server_hello, dhe)` take the shared secret,
+  so the driver parses key shares, picks the group, and computes the secret —
+  the same twenty lines `ClientHandshake` carries at 1784-1830. It is a second
+  copy of the key-exchange choice, not of the handshake, but a public
+  `handshake_core.sharedSecret(parsed_peer_share, keypairs)` would delete it.
+- **Nobody owns the message boundary.** The seam hands contiguous CRYPTO bytes
+  per level (§19.6 puts offsets on the wire and the machine reassembles them);
+  the core takes one complete handshake message and parses its type. The driver
+  must split the 4-byte TLV stream, including a message that straddles two fed
+  chunks, because a CRYPTO frame can end anywhere. A `handshake.Reader` in tls,
+  or `provide` accepting a stream, would keep that parse in the package that
+  owns message encoding.
+- **The client's completion has no output.** After the server's Finished
+  verifies, `provideHandshake` queues nothing: there is no event saying the
+  client's flight is due, and `state` is a field rather than an accessor. The
+  driver has to call `sendClientFinished` after every handshake message and
+  ignore `error.UnexpectedMessage`, which hides a genuine out-of-order error
+  behind a retry. That call is also what derives the client's application
+  secrets, so a driver that drains messages lazily has no 1-RTT read keys when
+  the first 1-RTT packet arrives coalesced with the Handshake flight
+  (§12.2). Ask: derive on Finished and queue an event that says the flight is
+  owed.
+- **The server's completion has no output either.** `provideClientFlight`
+  verifies the client's Finished and sets `state = .connected` with nothing
+  queued, so `confirmed()` must read the field. Ask: queue `.done`, as the
+  client does.
+
+### One finding that belongs to this repo, not tls
+
+`Conn.feedCrypto` hands the driver its bytes and never installs the spaces the
+driver just reported: `installSpaces` is called from `writeHandshake` only. A
+datagram that coalesces a Handshake Finished with the first 1-RTT packet — which
+§12.2 allows and a server does, because HANDSHAKE_DONE rides immediately after
+the handshake — has that 1-RTT packet dropped for lack of keys (RFC 9001 §4.1.1).
+The fix is to call `installSpaces` after the driver has been fed, or at each
+packet boundary in the walk. It cannot be tested before the driver exists,
+because no stub reports a secret at the moment it is fed; it is first on the
+list for the session that has one.
+
+### Where the next session starts
+
+Whichever of the three blockers Matt chooses to unblock first, the driver starts
+at `src/tls.zig` as a `quic-tls` module beside the core, and `tests/tls_seam.zig`
+is the checklist. The server secret gap is the cheapest to close and the largest
+unlock: it is one derivation and one accessor in tls, and without it no QUIC
+server in any language speaks 1-RTT.

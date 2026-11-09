@@ -10,6 +10,11 @@ QUIC in Zig: sans-I/O packet and frame codecs, transport parameters, and the los
 
 Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix develop` provides Zig, `ziglint`, and the base tools, and nothing comes from the system PATH. The justfile is the command interface: `just test`, `just lint`, `just fuzz`, `just ci`. Run `just fmt` before you commit.
 
+`just test` passes `-Dtls`, which fetches `baskingspot/tls` and builds the
+handshake seam checks in `tests/tls_seam.zig`. A bare `zig build test` skips
+them, and a clean build needs the dev shell's openssl and pkg-config because tls
+translates and links libcrypto.
+
 ## Design
 
 - Sans-I/O, no allocator. Nothing here opens a socket, holds a clock, or

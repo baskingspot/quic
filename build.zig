@@ -12,6 +12,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The TLS driver over baskingspot/tls lives behind an option, the way tls
+    // gates its own xev integration: a consumer that never asks for the driver
+    // never fetches the dependency. `just test` passes -Dtls, so the driver
+    // tests run in CI without making TLS part of every quic build.
+    const expose_tls = b.option(
+        bool,
+        "tls",
+        "Expose the quic-tls driver and fetch the baskingspot/tls dependency",
+    ) orelse false;
+    const tls_dep: ?*std.Build.Dependency = if (expose_tls)
+        b.lazyDependency("tls", .{ .target = target, .optimize = optimize })
+    else
+        null;
+
     if (b.pkg_hash.len != 0) return;
 
     const test_step = b.step("test", "Run the unit tests");
@@ -31,6 +45,25 @@ pub fn build(b: *std.Build) void {
     const vector_tests = b.addTest(.{ .root_module = vector_mod });
     const run_vector_tests = b.addRunArtifact(vector_tests);
     test_step.dependOn(&run_vector_tests.step);
+
+    // What the seam asks of a TLS driver, checked against the package that has
+    // to provide it. These tests exist to fail when baskingspot/tls closes a
+    // gap: each one pins a place the two packages do not meet today, so the
+    // day it meets them the work resumes instead of being forgotten.
+    if (tls_dep) |dependency| {
+        const seam_mod = b.createModule(.{
+            .root_source_file = b.path("tests/tls_seam.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "tls", .module = dependency.module("tls") },
+            },
+        });
+        const seam_tests = b.addTest(.{ .root_module = seam_mod });
+        const run_seam_tests = b.addRunArtifact(seam_tests);
+        test_step.dependOn(&run_seam_tests.step);
+    }
 
     // The echo example: the machine called the way an application would. It is
     // an executable rather than a test because its value is in being read.

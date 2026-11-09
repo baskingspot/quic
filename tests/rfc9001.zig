@@ -134,7 +134,7 @@ test "RFC 9001 A.5, the ChaCha20 short header packet" {
     try testing.expectEqualSlices(u8, &data.chacha_packet, packet[0..total]);
 
     // The protected header and ciphertext the RFC prints, separately.
-    try testing.expectEqualSlices(u8, &data.chacha_protected_header, packet[0 .. data.chacha_header.len]);
+    try testing.expectEqualSlices(u8, &data.chacha_protected_header, packet[0..data.chacha_header.len]);
     try testing.expectEqualSlices(u8, &data.chacha_ciphertext, packet[4..]);
 
     const sample = packet[1 + 4 ..][0..16];
