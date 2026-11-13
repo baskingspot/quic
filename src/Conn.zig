@@ -1472,14 +1472,22 @@ pub fn replayCrypto(self: *const Conn, id: SpaceId) []const u8 {
 fn installSecrets(self: *Conn, tls: seam.Driver) Error!void {
     if (self.handshake != null and self.app != null) return;
 
-    // Asked once per install and never defaulted: a machine that picked a suite
-    // would protect packets the peer cannot read.
-    const suite = try tls.suite().protectionSuite();
+    // The suite is asked for only where a secret exists to protect with it, and
+    // never defaulted: a machine that picked a suite would protect packets the
+    // peer cannot read. Asked before any secret, the driver's answer is a
+    // placeholder — a TLS client does not know the suite until ServerHello
+    // (RFC 8446 §4.1.3) — so acting on it would refuse a connection over a
+    // suite nobody chose. Each level asks for itself, because the application
+    // secrets arrive after the handshake and the answer is final by then.
     if (self.handshake == null) {
-        if (try tls.secrets(.handshake)) |secrets| try self.installSpace(.handshake, secrets, suite);
+        if (try tls.secrets(.handshake)) |secrets| {
+            try self.installSpace(.handshake, secrets, try tls.suite().protectionSuite());
+        }
     }
     if (self.app == null) {
-        if (try tls.secrets(.app)) |secrets| try self.installSpace(.app, secrets, suite);
+        if (try tls.secrets(.app)) |secrets| {
+            try self.installSpace(.app, secrets, try tls.suite().protectionSuite());
+        }
     }
 }
 
@@ -4513,6 +4521,34 @@ test "RFC 9000 §20.1, a driver failure carries the CRYPTO_ERROR to close with" 
     // CRYPTO_ERROR value the driver named, not a table of alerts here.
     try testing.expectError(error.HandshakeFailed, client.writeHandshake(&frames, &datagram, 0));
     try testing.expectEqual(@as(u64, 0x150), client.tls.?.errorCode());
+}
+
+test "RFC 8446 §B.4, a suite a driver reports before it is negotiated is not acted on" {
+    const dcid = [_]u8{0x96};
+    const sha384: [48]u8 = @splat(0x44);
+    // Before ServerHello a client has no negotiated suite, so a real driver's
+    // answer here is a placeholder. This one is deliberately a suite the
+    // package cannot protect with, and the machine must not refuse a handshake
+    // over an answer it has no secret to use (§4.1.3 of RFC 8446).
+    var stub: seam.Stub = .{ .cipher_suite = .aes_256_gcm_sha384 };
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x9c},
+        .tls = stub.driver(),
+    });
+
+    try client.installSpaces();
+    try testing.expectEqual(@as(?Space, null), client.handshake);
+    try testing.expectEqual(@as(?Space, null), client.app);
+
+    // The moment a secret exists, the reported suite is the one that would
+    // protect it, and it is still refused by name rather than substituted.
+    stub.handshake_secrets = .{ .client = &sha384, .server = &sha384 };
+    try testing.expectError(error.UnsupportedCipherSuite, client.installSpaces());
 }
 
 test "RFC 8446 §B.4, a suite this package cannot do is refused, never substituted" {

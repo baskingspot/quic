@@ -725,13 +725,11 @@ would prove the seam's plumbing while proving a handshake no QUIC peer accepts.
 ### Smaller misfits, recorded so the driver is written once
 
 - **`suite()` has no "not negotiated yet".** The seam's `Suite` is a required
-  return, and `Conn.installSecrets` asks for it before it looks at whether any
-  secret exists. A TLS client does not know the suite until ServerHello, so a
-  driver must return a placeholder, and that placeholder must be a suite this
-  package implements or `installSecrets` refuses the connection before the
-  handshake starts. The machine-side fix is one move: ask only where a secret is
-  non-null. The seam-side fix is `?Suite`. Until one happens, the driver returns
-  `.aes_128_gcm_sha256` and the placeholder is never read.
+  return, so a client driver has to answer before ServerHello names the suite.
+  The machine half is fixed: `installSecrets` asks only where a secret exists to
+  protect with the answer, so a placeholder is never acted on and a suite the
+  peer has not picked cannot refuse the connection. What remains is the honest
+  type: `?Suite` would let a driver say "not yet" instead of inventing one.
 - **`KeyPairs` is not exported from `tls.root`,** so no consumer can call
   `Client.useKeypairs`, `Server.useKeypairs`, or `Client.startEncoded`: the
   parameter type has no public name. The only route is assigning the field, as

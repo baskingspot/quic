@@ -397,6 +397,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- `Conn.installSpaces` asks the TLS driver for its cipher suite only where a
+  traffic secret exists to protect with the answer. A client's driver cannot
+  know the negotiated suite before ServerHello, so a placeholder answer used to
+  be able to refuse a connection over a suite nobody had chosen; the refusal
+  still happens, at the moment a secret arrives.
 - The machine installs the driver's secrets after every packet, not only when
   the caller writes: a 1-RTT packet coalesced behind the packet that carried the
   peer's Finished was dropped for lack of keys, even though the driver had just
