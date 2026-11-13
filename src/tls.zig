@@ -163,6 +163,14 @@ pub const Tls = struct {
     failure: u64 = crypto_error + internal_error,
     /// The alert description the peer sent, when one arrived.
     alert: ?u8 = null,
+    /// The traffic secrets the last `secrets` call reported, one pair per
+    /// level. The seam lets a driver hand back borrowed bytes and promises they
+    /// stay valid until the next call, so the bytes live here: the core returns
+    /// its secrets by value, and a slice into that value is dead the moment the
+    /// call returns. It reads as working code on a target whose stack happens
+    /// not to be reused yet, and as an authentication failure everywhere else.
+    handshake_secrets: SecretPair = .{},
+    app_secrets: SecretPair = .{},
 
     const Engine = union(Role) {
         client: core.Client,
@@ -172,6 +180,27 @@ pub const Tls = struct {
     const Stream = struct {
         buf: []u8,
         len: u32 = 0,
+    };
+
+    /// One level's secrets, own storage, with the length the suite's hash
+    /// gives them (32 for SHA-256, 48 for SHA-384).
+    const SecretPair = struct {
+        client: [48]u8 = undefined,
+        server: [48]u8 = undefined,
+        len: u8 = 0,
+
+        fn take(self: *SecretPair, pair: core.HandshakeSecrets) seam.Secrets {
+            @memcpy(self.client[0..pair.len], pair.client[0..pair.len]);
+            @memcpy(self.server[0..pair.len], pair.server[0..pair.len]);
+            self.len = pair.len;
+            return .{ .client = self.client[0..pair.len], .server = self.server[0..pair.len] };
+        }
+
+        fn zero(self: *SecretPair) void {
+            std.crypto.secureZero(u8, &self.client);
+            std.crypto.secureZero(u8, &self.server);
+            self.len = 0;
+        }
     };
 
     pub const allowed_extensions = [_]tls.extension_type.ExtraExtension{
@@ -242,6 +271,8 @@ pub const Tls = struct {
             .server => |*server| server.deinit(),
         }
         self.keypairs.secureZero();
+        self.handshake_secrets.zero();
+        self.app_secrets.zero();
         self.* = undefined;
     }
 
@@ -342,6 +373,8 @@ pub const Tls = struct {
     fn secretsReported(ctx: *anyopaque, level: seam.Level) seam.Error!?seam.Secrets {
         const self: *Tls = @ptrCast(@alignCast(ctx));
         if (self.failed) return null;
+        // The core returns its secrets by value; copying them here is what makes
+        // the returned slices outlive this call, as the seam requires.
         const pair: ?core.HandshakeSecrets = switch (level) {
             // Initial keys come from the connection ID (§5.2 of RFC 9001).
             .initial => return null,
@@ -355,7 +388,12 @@ pub const Tls = struct {
             },
         };
         const secrets = pair orelse return null;
-        return .{ .client = secrets.client[0..secrets.len], .server = secrets.server[0..secrets.len] };
+        const storage = switch (level) {
+            .initial => unreachable,
+            .handshake => &self.handshake_secrets,
+            .app => &self.app_secrets,
+        };
+        return storage.take(secrets);
     }
 
     fn setParameters(ctx: *anyopaque, bytes: []const u8) seam.Error!void {

@@ -155,6 +155,20 @@ test "RFC 9001 §4, a client and a server complete a TLS handshake through Conn"
     try testing.expectEqualSlices(u8, &client_parameters, server_driver.peerTransportParameters().?);
     try testing.expectEqualSlices(u8, &server_parameters, client_driver.peerTransportParameters().?);
 
+    // The seam lets `secrets` hand back borrowed bytes and promises they stay
+    // valid until the next call, so both roles must report the same pair and
+    // the client's copy must live in the driver, not in the frame that produced
+    // it. Getting this wrong reads as correct on one target and as an AEAD
+    // authentication failure on another, which is how it was found.
+    const client_secrets = (try client_driver.driver().secrets(.handshake)).?;
+    const server_secrets = (try server_driver.driver().secrets(.handshake)).?;
+    try testing.expectEqualSlices(u8, server_secrets.client, client_secrets.client);
+    try testing.expectEqualSlices(u8, server_secrets.server, client_secrets.server);
+    try testing.expectEqual(
+        @intFromPtr(&client_driver.handshake_secrets.client),
+        @intFromPtr(client_secrets.client.ptr),
+    );
+
     // §7.1 of RFC 9001 through §4.9.2 of RFC 9000: the 1-RTT space exists on
     // both ends, and a server's handshake is confirmed by its own Finished.
     try testing.expect(client.app != null);
