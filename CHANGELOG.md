@@ -7,6 +7,15 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- The `quic-tls` module: a real TLS 1.3 driver for `Conn.tls`, over
+  `baskingspot/tls`'s step core. Build it with `-Dtls`; a consumer that fetches
+  `quic` alone never fetches tls. It carries transport parameters both ways
+  (RFC 9001 §8.2), reports handshake and application secrets per level, ALPN,
+  and a server's confirmation, and maps a peer's TLS alert to its CRYPTO_ERROR
+  code (§20.1 of RFC 9000). `tests/tls_loopback.zig` runs a full handshake
+  between two `Conn`s with real certificates and exchanges a stream each way.
+  HelloRetryRequest, 0-RTT, post-handshake key updates and tickets, and client
+  authentication are refused with named errors, not emulated.
 - `Conn.clientConfig` builds a client's configuration from the name it invents
   for the server, its own connection ID, and its loss state, mirroring
   `Opening.serverConfig`. The two numbers the Initial keys depend on cannot

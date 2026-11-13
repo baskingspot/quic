@@ -50,7 +50,22 @@ pub fn build(b: *std.Build) void {
     // to provide it. These tests exist to fail when baskingspot/tls closes a
     // gap: each one pins a place the two packages do not meet today, so the
     // day it meets them the work resumes instead of being forgotten.
+    // The driver itself, and a second module because it imports tls: a
+    // consumer that fetches `quic` must not fetch tls, so `quic-tls` exists
+    // only behind `-Dtls`.
     if (tls_dep) |dependency| {
+        const driver_mod = b.addModule("quic-tls", .{
+            .root_source_file = b.path("src/tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "tls", .module = dependency.module("tls") },
+            },
+        });
+        const driver_tests = b.addTest(.{ .root_module = driver_mod });
+        test_step.dependOn(&b.addRunArtifact(driver_tests).step);
+
         const seam_mod = b.createModule(.{
             .root_source_file = b.path("tests/tls_seam.zig"),
             .target = target,
@@ -63,6 +78,29 @@ pub fn build(b: *std.Build) void {
         const seam_tests = b.addTest(.{ .root_module = seam_mod });
         const run_seam_tests = b.addRunArtifact(seam_tests);
         test_step.dependOn(&run_seam_tests.step);
+
+        // The proof: two machines, two real drivers, certificates from tls's
+        // own fixtures, and one stream each way. The fixture files are the
+        // dependency's, so they are anonymous imports rather than paths this
+        // repository could copy and let go stale.
+        const loopback_mod = b.createModule(.{
+            .root_source_file = b.path("tests/tls_loopback.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "quic-tls", .module = driver_mod },
+                .{ .name = "tls", .module = dependency.module("tls") },
+            },
+        });
+        loopback_mod.addAnonymousImport("tls_server_crt", .{
+            .root_source_file = dependency.path("tests/fixtures/server.crt"),
+        });
+        loopback_mod.addAnonymousImport("tls_server_key", .{
+            .root_source_file = dependency.path("tests/fixtures/server.key"),
+        });
+        const loopback_tests = b.addTest(.{ .root_module = loopback_mod });
+        test_step.dependOn(&b.addRunArtifact(loopback_tests).step);
     }
 
     // The echo example: the machine called the way an application would. It is

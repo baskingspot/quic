@@ -878,10 +878,31 @@ the field.
 
 ### Start here
 
-State on 2026-11-13: tls#179 is merged (`2e4a1f4`), this package pins that
-commit, `just ci` is green, and **no driver exists yet**. The first file is
-`src/tls.zig`, exported as the `quic-tls` module and built only under `-Dtls`;
-the vtable is `src/handshake.zig`, and the mapping table above is the whole
-design. The first test to make pass is one handshake between two `Conn`s with
-this driver on both ends and one stream each way, in memory; the socket version
-and interop come after it.
+State on 2026-11-13, later the same day: the driver exists. `src/tls.zig` is the
+`quic-tls` module, built only under `-Dtls`, and `tests/tls_loopback.zig` runs a
+full handshake between two `Conn`s with real certificates from tls's own
+fixtures, real key schedules, and one stream each way. `just ci` is green.
+
+What is left, in the order it matters:
+
+1. **The machine never asks for the peer's transport parameters.**
+   `peerTransportParameters` is in the vtable and the driver answers it, but
+   `Conn` never calls it: `send_limit`, `peer_max_streams`, and the stream data
+   limits are all caller configuration. A real peer's numbers arrive in its
+   ClientHello and are then ignored. The loopback reads them from the driver
+   directly, which is the workaround that shows the gap. Until the machine takes
+   them, a connection to a real peer runs on guessed limits.
+2. **An alert before the handshake completes cannot be reported through tls.**
+   `Client.provideAlert` requires `state == .connected`, and `Server` has no
+   `provideAlert` at all, so a server that rejects a ClientHello cannot be read
+   back through the core. The driver reads the description byte itself
+   (`receiveAlert`), which is two bytes of RFC 8446 §6 and not handshake logic,
+   but the core should take an alert at any level and hand back the alert it
+   recorded.
+3. Interop with a foreign peer. `just interop` still needs `quiche-client`
+   installed; nothing has been run against a stack that is not this one.
+
+Entropy is the caller's, like the clock: Zig 0.17 has no `std.crypto.random`
+outside `std.Io`, so `Tls.init` takes the 32 Hello bytes. tls reads its own
+entropy for keypairs, by its own decision; this package does not gain an OS
+syscall for one field.
