@@ -902,6 +902,17 @@ What is left, in the order it matters:
 3. Interop with a foreign peer. `just interop` still needs `quiche-client`
    installed; nothing has been run against a stack that is not this one.
 
+One bug is worth writing down because of how it looked: the driver used to
+return `secrets()` as slices into the core's return value, a `HandshakeSecrets`
+by value. That is a slice into a frame that has already returned, kept alive
+only by the luck of the stack. On arm64 the bytes were still there and every
+test passed; on the x86_64 runner the intervening `suite()` call reused them,
+so the client installed different handshake keys than the server and the first
+Handshake packet failed its AEAD tag. The seam's rule is that borrowed bytes
+stay valid until the next call, which makes the driver's own storage the only
+correct answer. `tests/tls_loopback.zig` now asserts the reported slice's
+address, so the lesson is a failing test rather than a comment.
+
 Entropy is the caller's, like the clock: Zig 0.17 has no `std.crypto.random`
 outside `std.Io`, so `Tls.init` takes the 32 Hello bytes. tls reads its own
 entropy for keypairs, by its own decision; this package does not gain an OS
