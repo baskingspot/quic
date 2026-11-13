@@ -655,19 +655,28 @@ whatever Matt puts ahead of it.
 
 ## The TLS driver, and where tls stops it
 
-Attempted 2026-11-09, from main at `9caabb1`. No driver is written, because two
-of the seam's requirements have no tls API to satisfy them, and the third is a
-shape the driver cannot supply without a second handshake implementation. What
-did land is the wiring that proves the packages meet in one build, and five
-checks that fail when the gaps close: `tests/tls_seam.zig`, run by `just test`,
-which now passes `-Dtls`.
+Attempted 2026-11-09 from main at `9caabb1`, resumed 2026-11-13. No driver is
+written, because two of the seam's requirements have no tls API to satisfy them,
+and the third is a shape the driver cannot supply without a second handshake
+implementation. What did land is the wiring that proves the packages meet in one
+build, and six checks that fail when the gaps close: `tests/tls_seam.zig`, run
+by `just test`, which passes `-Dtls`.
 
-The dependency is a commit, not a release: `baskingspot/tls` at `40dd9e8`,
-because v0.2.1 predates the Zig 0.17 port and this package is 0.17 only. It goes
-back to a `baskingspot.dev` tarball with the next tls tag. `-Dtls` fetches it the
-way tls gates its own xev integration, so a consumer that never asks for the
-driver never fetches the dependency. The dev shell gained openssl and
-pkg-config, because tls translates and links libcrypto from source.
+The dependency is `https://baskingspot.dev/tls/v0.4.0.tar.gz`. v0.4.0 is the
+first tls release that builds on Zig 0.17. The first pin was a commit, `40dd9e8`,
+because v0.2.1 predated the 0.17 port; it stopped configuring on 2026-11-13
+without anything in this repository changing. That commit's zon still declared
+the libxev integration dependency, Zig fetches a dependency's lazy dependencies,
+and libxev's build script uses 0.16's `b.findProgram(name, paths)` signature, so
+the configurer failed to compile a build script for an integration nobody asked
+for. v0.4.0 removed xev and that dependency. `-Dtls` fetches tls only when a
+build asks for the driver; the dev shell gained openssl and pkg-config, because
+tls translates and links libcrypto from source.
+
+v0.4.0 also moved the key exchange into the core: `Client.provide` and
+`Server.provideServerHello` take the peer's hello and derive the shared secret
+from the keypairs the core now holds, so the driver no longer parses key shares
+or runs ECDHE. That deleted one of this note's misfits.
 
 The driver is over the step core (`tls.handshake_core`), which is the right
 seam: it owns the transcript, the key schedule, the state machine, and the
@@ -724,16 +733,10 @@ would prove the seam's plumbing while proving a handshake no QUIC peer accepts.
   non-null. The seam-side fix is `?Suite`. Until one happens, the driver returns
   `.aes_128_gcm_sha256` and the placeholder is never read.
 - **`KeyPairs` is not exported from `tls.root`,** so no consumer can call
-  `Client.startEncoded` or `Client.startEncodedWithPsk`: the parameter type is
-  unreachable. The driver encodes with `client_hello.encode…` and calls
-  `Client.start`, which works, but it means the driver owns the keypairs and
-  every encoding argument.
-- **ECDHE is the caller's.** `Client.provide(level, server_hello, dhe)` and
-  `Server.provideServerHello(level, server_hello, dhe)` take the shared secret,
-  so the driver parses key shares, picks the group, and computes the secret —
-  the same twenty lines `ClientHandshake` carries at 1784-1830. It is a second
-  copy of the key-exchange choice, not of the handshake, but a public
-  `handshake_core.sharedSecret(parsed_peer_share, keypairs)` would delete it.
+  `Client.useKeypairs`, `Server.useKeypairs`, or `Client.startEncoded`: the
+  parameter type has no public name. The only route is assigning the field, as
+  `tests/tls_seam.zig` does, which works because Zig fields are public. Export
+  the type; the driver then builds keypairs and calls the setter.
 - **Nobody owns the message boundary.** The seam hands contiguous CRYPTO bytes
   per level (§19.6 puts offsets on the wire and the machine reassembles them);
   the core takes one complete handshake message and parses its type. The driver
@@ -756,17 +759,23 @@ would prove the seam's plumbing while proving a handshake no QUIC peer accepts.
   queued, so `confirmed()` must read the field. Ask: queue `.done`, as the
   client does.
 
-### One finding that belongs to this repo, not tls
+### One finding that belonged to this repo, not tls, and is fixed
 
-`Conn.feedCrypto` hands the driver its bytes and never installs the spaces the
-driver just reported: `installSpaces` is called from `writeHandshake` only. A
+`Conn.feedCrypto` handed the driver its bytes and never installed the spaces the
+driver just reported: `installSpaces` was called from `writeHandshake` only. A
 datagram that coalesces a Handshake Finished with the first 1-RTT packet — which
 §12.2 allows, and §4.1.1 of RFC 9001 lets a server send as soon as its Finished
-goes out — has that 1-RTT packet dropped for lack of keys.
-The fix is to call `installSpaces` after the driver has been fed, or at each
-packet boundary in the walk. It cannot be tested before the driver exists,
-because no stub reports a secret at the moment it is fed; it is first on the
-list for the session that has one.
+goes out — had that 1-RTT packet dropped for lack of keys.
+
+Fixed in `Conn.commitPacket`: the walk now records the packet and then installs
+what the driver reported, once per packet rather than once per datagram, which
+is also what the server's Initial-plus-Handshake first flight needs. The install
+runs after the packet is accounted for, because a server's confirmation discards
+the Handshake space (§4.9.2) and the walk must not be recording into a space it
+has just taken away. `handshake.Stub.app_secrets_after_feed` holds a driver's
+application secrets until the first `feed` — a real driver's timing — and the
+test "a coalesced 1-RTT packet opens once the Finished is fed" fails without the
+change.
 
 ### Where the next session starts
 

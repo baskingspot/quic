@@ -27,7 +27,6 @@ const ClientAtEncryptedExtensions = struct {
     server_hello_buf: [256]u8 = undefined,
     client_keypair: tls.x25519.KeyPair = undefined,
     server_keypair: tls.x25519.KeyPair = undefined,
-    shared: [32]u8 = undefined,
 
     fn init(self: *ClientAtEncryptedExtensions) !void {
         self.client_keypair = tls.x25519.KeyPair.generate();
@@ -37,6 +36,16 @@ const ClientAtEncryptedExtensions = struct {
         var policy: tls.certificate.Policy = .init;
         policy.insecure_no_chain_anchor = true;
         self.client = tls.handshake_core.Client.init(&self.slots, policy);
+        // `KeyPairs` is not exported from `tls.root`, so `Client.useKeypairs`
+        // cannot be called by a consumer: the parameter's type has no public
+        // name. The field assignment is the only route, and it works because
+        // Zig fields are public. Exporting the type is the fix.
+        self.client.keypairs = .{
+            .x25519 = self.client_keypair,
+            .p256 = p256_keypair,
+            .p384 = null,
+            .derived = .full,
+        };
 
         // The client's own transport parameters, opaque to TLS (RFC 9001 §8.2).
         // Sending them works: this is the direction tls already carries.
@@ -63,12 +72,9 @@ const ClientAtEncryptedExtensions = struct {
             .aes_128_gcm_sha256,
             &.{ .x25519 = self.server_keypair.public_key },
         );
-        try tls.x25519.sharedSecret(
-            self.client_keypair.secret_key,
-            self.server_keypair.public_key,
-            &self.shared,
-        );
-        try self.client.provide(.plaintext, server_hello, &self.shared);
+        // The core derives the shared secret itself from the keypairs it holds,
+        // so a consumer cannot hand it a wrong one.
+        try self.client.provide(.plaintext, server_hello);
 
         // The two level transitions and the key event that follow ServerHello.
         while (self.client.next()) |_| {}
@@ -152,6 +158,18 @@ test "RFC 8446 §4.3.1: the same core accepts an EncryptedExtensions without the
         0x00, 0x00, // no extensions
     };
     try peer.client.provideHandshake(.handshake, &encrypted_extensions);
+}
+
+// RFC 8446 §4.2.8 — the core now derives the shared secret itself from the
+// keypairs it holds, so a caller has to hand it keypairs. The type it takes,
+// `handshake_key_pairs.KeyPairs`, has no public name: `useKeypairs` and
+// `startEncoded` cannot be called by any consumer. The harness above assigns
+// the field instead, which works because Zig fields are public. A root export
+// appearing is the signal to switch to it.
+test "RFC 8446 §4.2.8: the keypairs a consumer must hand the core have no public name" {
+    try testing.expect(@hasDecl(tls.handshake_core.Client, "useKeypairs"));
+    try testing.expect(!@hasDecl(tls, "KeyPairs"));
+    try testing.expect(!@hasDecl(tls.handshake_core, "KeyPairs"));
 }
 
 // RFC 9001 §8.2 — a QUIC server MUST read the client's quic_transport_parameters
