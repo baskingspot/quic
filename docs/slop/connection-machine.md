@@ -875,3 +875,13 @@ both borrow the message that carried them.
 
 `KeyPairs` is public now, so the driver calls `useKeypairs` rather than assigning
 the field.
+
+### Start here
+
+State on 2026-11-13: tls#179 is merged (`2e4a1f4`), this package pins that
+commit, `just ci` is green, and **no driver exists yet**. The first file is
+`src/tls.zig`, exported as the `quic-tls` module and built only under `-Dtls`;
+the vtable is `src/handshake.zig`, and the mapping table above is the whole
+design. The first test to make pass is one handshake between two `Conn`s with
+this driver on both ends and one stream each way, in memory; the socket version
+and interop come after it.
