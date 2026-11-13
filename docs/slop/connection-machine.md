@@ -782,3 +782,88 @@ at `src/tls.zig` as a `quic-tls` module beside the core, and `tests/tls_seam.zig
 is the checklist. The server secret gap is the cheapest to close and the largest
 unlock: it is one derivation and one accessor in tls, and without it no QUIC
 server in any language speaks 1-RTT.
+
+## The driver, mapped onto the step core
+
+Written 2026-11-13 against the branch that closes the three tls gaps, so the next
+session starts by typing, not by discovering. `src/tls.zig`, exported as the
+`quic-tls` module, importing `quic` and `tls` and nothing else. A consumer that
+does not handshake over TLS never adds the module, and the dependency is lazy.
+
+### What the caller hands the driver
+
+The driver is a value the caller owns; everything it needs is in `Config`:
+`role`, an `out: []u8` where the core's queued messages live until the machine
+copies them, `queue: []tls.level.Output` for the core's event slots, `host` (a
+client's SNI and certificate name), `credentials` (a server's chain and signer),
+`alpn`, a client's `policy`, and the server's suite preference. Inbound
+reassembly is one buffer per level the driver owns; a handshake message that
+overruns it is a named error, never a truncated message.
+
+### The ordering that is not obvious
+
+1. **Both roles compose their first message on the first `next()`, not at
+   `init` or in `feed`.** A client cannot encode its ClientHello before it has
+   the transport parameters, because 0x0039 is in it; a server cannot compose
+   its flight before the parameters are in EncryptedExtensions. The machine
+   hands them in `installSpaces`, which runs before `writeHandshake` drains and
+   after the first packet is read, so `next()` is the first moment either role
+   has them. `next()` therefore builds what is missing before it pops.
+2. **A server's ClientHello is buffered, not processed, in `feed`.** Same
+   reason: `feed` runs before `installSpaces`, so composing the flight there
+   would write EncryptedExtensions without 0x0039. `feed` copies the
+   ClientHello and sets a flag; `next()` does `provideClientHello`, picks the
+   suite and group, encodes the ServerHello, calls `provideServerHello`, sets
+   the extensions, and calls `sendFlight`.
+3. **The machine now installs spaces per packet** (`Conn.commitPacket`), so the
+   driver never needs the caller to call `installSpaces` between packets. That
+   landed on 2026-11-13 and the coalesced-packet test covers it.
+4. **`next()` must finish what `feed` started for a client.** When the server's
+   Finished has been fed, the core queues nothing and derives the application
+   secrets only inside `sendClientFinished`. `Client.state` is a public field
+   (there is no accessor), so the driver checks for `server_finished_verified`
+   after each handshake message and composes the client flight.
+5. **A server's completion is a state field, not an event.** `provideClientFlight`
+   verifies the client's Finished and queues nothing, so `confirmed()` reads
+   `Server.state == .connected`.
+
+### Per-function mapping
+
+| seam | core |
+| --- | --- |
+| `feed(level, bytes)` | buffer per level; split the 4-byte handshake header (RFC 8446 §4); dispatch each complete message |
+| client `.initial` | `provide(.plaintext, server_hello)` — the core derives the shared secret from its keypairs |
+| either `.handshake` | `provideHandshake(.handshake, msg)` / `provideClientFlight(.handshake, msg)` |
+| client, server Finished done | `sendClientFinished(out)` |
+| `.app` | `provideApplication(.application, msg)` |
+| `next()` | lazy compose, then pop; `.message` → `seam.Message`, `.alert` → `HandshakeFailed` plus `0x100 + description`, `.done` → nothing (the machine asks `confirmed`) |
+| `suite()` | client: `Client.selected`; server: the suite it chose. Before either, the config's first suite, and the machine no longer acts on it (`installSecrets` asks only where a secret exists) |
+| `secrets(level)` | `handshakeSecrets()` / `applicationSecrets()`, copied into driver storage because the machine may ask again later |
+| `setTransportParameters` | copied; then the client adds `0x0039` to the ClientHello extras and the server calls `Server.sendExtensions` before `sendFlight` |
+| `peerTransportParameters` | copied out of `peerExtensions()` at the moment the message carrying it is processed, because the bytes borrow that message |
+| `confirmed` | server: `state == .connected`; client: false, because §4.1.2 gives a client HANDSHAKE_DONE |
+| `alpn` | `selectedAlpn()`, copied for the same reason |
+| `errorCode` | `0x100 + lastAlert`, or `0x150` (`internal_error`) when there is no alert |
+
+### What the driver owns that tls used to
+
+The core takes the suite and the encoded ServerHello from the caller, so the
+driver owns three policy decisions the record engine keeps to itself: the suite
+preference order, the key-share group choice (x25519, then P-256, then P-384,
+from what the ClientHello carries and the driver has keypairs for), and the
+ServerHello's `legacy_session_id_echo`. Those are three small pieces of TLS
+policy in a QUIC driver because the step core's `Server` is deliberately an
+absorb-and-report machine rather than a policy engine.
+
+### Deliberately absent from the first driver
+
+HelloRetryRequest (a client that offers x25519 and P-256 shares, and a server
+that picks one of them, never needs it; anything else fails with a named error),
+0-RTT, post-handshake KeyUpdate and NewSessionTicket handling, and client
+authentication. Each is a gate, not a cleanup.
+
+### The one line that waits on tls
+
+`KeyPairs` has no public name, so the driver builds the value as a struct
+literal and assigns `Client.keypairs` / `Server.keypairs` directly. The day the
+type is exported, that becomes `useKeypairs`.
