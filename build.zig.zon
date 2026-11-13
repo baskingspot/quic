@@ -38,9 +38,14 @@
         // without the libxev dependency, whose build script does not compile on
         // 0.17: as a fetched dependency it reached the configurer even with
         // xev unused, and stopped the build before a line of ours ran.
+        //
+        // Pinned past v0.4.0 at the merge of baskingspot/tls#179, which the
+        // driver needs and no release carries yet: transport parameters in both
+        // directions, a server's application secrets, and a public `KeyPairs`.
+        // It goes back to a baskingspot.dev tarball with the next tls tag.
         .tls = .{
-            .url = "https://baskingspot.dev/tls/v0.4.0.tar.gz",
-            .hash = "tls-0.4.0-nf2MKAeKKABRX8cOVVBQ94nNrB6CanMbunosGmKTL067",
+            .url = "git+https://github.com/baskingspot/tls#2e4a1f4bbdd0e72239c6d171da63fa8b7025f39b",
+            .hash = "tls-0.4.1-nf2MKEnvKQA9oiI9Xitzf-JLYqEJAmAp3YtV2tvxVoq4",
             .lazy = true,
         },
     },

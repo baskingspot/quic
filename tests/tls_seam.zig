@@ -25,27 +25,25 @@ const ClientAtEncryptedExtensions = struct {
     client: tls.handshake_core.Client = undefined,
     client_hello_buf: [1024]u8 = undefined,
     server_hello_buf: [256]u8 = undefined,
-    client_keypair: tls.x25519.KeyPair = undefined,
+    keypairs: tls.KeyPairs = undefined,
     server_keypair: tls.x25519.KeyPair = undefined,
 
+    fn deinit(self: *ClientAtEncryptedExtensions) void {
+        self.client.deinit();
+        self.keypairs.secureZero();
+    }
+
     fn init(self: *ClientAtEncryptedExtensions) !void {
-        self.client_keypair = tls.x25519.KeyPair.generate();
+        self.keypairs = try tls.KeyPairs.init(tls.x25519.KeyPair.generate());
         self.server_keypair = tls.x25519.KeyPair.generate();
-        const p256_keypair = try tls.p256.KeyPair.generate();
 
         var policy: tls.certificate.Policy = .init;
         policy.insecure_no_chain_anchor = true;
         self.client = tls.handshake_core.Client.init(&self.slots, policy);
-        // `KeyPairs` is not exported from `tls.root`, so `Client.useKeypairs`
-        // cannot be called by a consumer: the parameter's type has no public
-        // name. The field assignment is the only route, and it works because
-        // Zig fields are public. Exporting the type is the fix.
-        self.client.keypairs = .{
-            .x25519 = self.client_keypair,
-            .p256 = p256_keypair,
-            .p384 = null,
-            .derived = .full,
-        };
+        // `KeyPairs` became a public type in the change this pin carries
+        // (baskingspot/tls#179); before that the only route was the public
+        // field.
+        self.client.useKeypairs(self.keypairs);
 
         // The client's own transport parameters, opaque to TLS (RFC 9001 §8.2).
         // Sending them works: this is the direction tls already carries.
@@ -53,8 +51,8 @@ const ClientAtEncryptedExtensions = struct {
         const client_hello = try tls.client_hello.encodeWithHybridGroupsAndExtensions(
             &self.client_hello_buf,
             .init(@splat(0x11)),
-            self.client_keypair.public_key,
-            p256_keypair.public_key,
+            self.keypairs.x25519.public_key,
+            self.keypairs.p256.public_key,
             null,
             "localhost",
             &.{"h3"},
@@ -130,7 +128,7 @@ test "RFC 8446 §B.4: tls's suites satisfy the seam's cipher suite vocabulary" {
 // QUIC server is required to send fails the handshake here.
 test "RFC 9001 §8.2: the client core refuses the server's transport parameters" {
     var peer: ClientAtEncryptedExtensions = .{};
-    defer peer.client.deinit();
+    defer peer.deinit();
     try peer.init();
 
     // EncryptedExtensions carrying one extension: 0x0039 with two opaque bytes.
@@ -150,7 +148,7 @@ test "RFC 9001 §8.2: the client core refuses the server's transport parameters"
 // is the transport parameters, not the message.
 test "RFC 8446 §4.3.1: the same core accepts an EncryptedExtensions without them" {
     var peer: ClientAtEncryptedExtensions = .{};
-    defer peer.client.deinit();
+    defer peer.deinit();
     try peer.init();
 
     const encrypted_extensions = [_]u8{
@@ -160,34 +158,61 @@ test "RFC 8446 §4.3.1: the same core accepts an EncryptedExtensions without the
     try peer.client.provideHandshake(.handshake, &encrypted_extensions);
 }
 
-// RFC 8446 §4.2.8 — the core now derives the shared secret itself from the
-// keypairs it holds, so a caller has to hand it keypairs. The type it takes,
-// `handshake_key_pairs.KeyPairs`, has no public name: `useKeypairs` and
-// `startEncoded` cannot be called by any consumer. The harness above assigns
-// the field instead, which works because Zig fields are public. A root export
-// appearing is the signal to switch to it.
-test "RFC 8446 §4.2.8: the keypairs a consumer must hand the core have no public name" {
+// RFC 8446 §4.2.8 — the core derives the shared secret itself from the
+// keypairs it holds, so a caller hands it keypairs and a ClientHello. The type
+// has to be nameable from outside the package, or `useKeypairs` and
+// `startEncoded` are uncallable: it became public in the change this pin
+// carries (baskingspot/tls#179), and the harness above now uses it.
+test "RFC 8446 §4.2.8: the keypairs the core takes are a public type" {
+    try testing.expect(@hasDecl(tls, "KeyPairs"));
     try testing.expect(@hasDecl(tls.handshake_core.Client, "useKeypairs"));
-    try testing.expect(!@hasDecl(tls, "KeyPairs"));
-    try testing.expect(!@hasDecl(tls.handshake_core, "KeyPairs"));
 }
 
 // RFC 9001 §8.2 — a QUIC server MUST read the client's quic_transport_parameters
-// from the ClientHello. `client_hello.Parsed`, the only ClientHello parse in
-// tls, keeps the extensions it recognizes and drops the rest, so the core has
-// nowhere to put them. Asserting the absence is the point: a field appearing
-// here is the signal to write the server half of the driver.
-test "RFC 9001 §8.2: the ClientHello parser keeps no unknown extensions" {
-    try testing.expect(!@hasField(tls.client_hello.Parsed, "extensions"));
+// from the ClientHello. This is the consumer-level check that the parse path is
+// reachable and keeps the bytes verbatim; the server's own use of it is
+// `Server.receiveExtensions`.
+test "RFC 9001 §8.2: the ClientHello parser keeps a listed extension verbatim" {
+    var keypairs = try tls.KeyPairs.init(tls.x25519.KeyPair.generate());
+    defer keypairs.secureZero();
+    const parameters = [_]u8{ 0xca, 0xfe, 0xba, 0xbe };
+    const sent = [_]tls.extension_type.ExtraExtension{
+        .{ .extension_type = 0x0039, .data = &parameters },
+    };
+    var hello_buf: [1024]u8 = undefined;
+    const hello = try tls.client_hello.encodeWithHybridGroupsAndExtensions(
+        &hello_buf,
+        .init(@splat(0x77)),
+        keypairs.x25519.public_key,
+        keypairs.p256.public_key,
+        null,
+        "localhost",
+        &.{"h3"},
+        &.{},
+        null,
+        &sent,
+    );
+
+    const allowed = [_]tls.extension_type.ExtraExtension{
+        .{ .extension_type = 0x0039, .data = &.{} },
+    };
+    var slots: [2]tls.extension_type.ExtraExtension = undefined;
+    var sink: tls.extension_type.ExtensionSink = .init(&slots);
+    const parsed = try tls.client_hello.parseWithExtensions(hello, .{
+        .allowed_extensions = &allowed,
+        .received = &sink,
+    });
+    try testing.expectEqual(@as(usize, 1), parsed.extensions.len);
+    try testing.expectEqual(@as(u16, 0x0039), parsed.extensions[0].extension_type);
+    try testing.expectEqualSlices(u8, &parameters, parsed.extensions[0].data);
 }
 
 // RFC 8446 §7.1, RFC 9001 §4.1.1 — the server derives "s ap traffic" when it
-// sends its Finished, and every 1-RTT packet it sends is protected with it.
-// The step core derives and exposes application secrets for the client only, so
-// no QUIC server can install its 1-RTT space. A decl appearing here is the
-// signal to write the server half of the driver.
-test "RFC 8446 §7.1: the core's server has no application secrets" {
+// sends its Finished, and every 1-RTT packet it sends is protected with it. The
+// core could not answer this before baskingspot/tls#179, and the driver's server
+// half was blocked on it. The derivation and its value are tested in tls; this
+// is the consumer-level check that both roles can be asked.
+test "RFC 8446 §7.1: both roles hand over application secrets" {
     try testing.expect(@hasDecl(tls.handshake_core.Client, "applicationSecrets"));
-    try testing.expect(@hasDecl(tls.handshake_core.Server, "handshakeSecrets"));
-    try testing.expect(!@hasDecl(tls.handshake_core.Server, "applicationSecrets"));
+    try testing.expect(@hasDecl(tls.handshake_core.Server, "applicationSecrets"));
 }

@@ -655,12 +655,12 @@ whatever Matt puts ahead of it.
 
 ## The TLS driver, and where tls stops it
 
-Attempted 2026-11-09 from main at `9caabb1`, resumed 2026-11-13. No driver is
-written, because two of the seam's requirements have no tls API to satisfy them,
-and the third is a shape the driver cannot supply without a second handshake
-implementation. What did land is the wiring that proves the packages meet in one
-build, and six checks that fail when the gaps close: `tests/tls_seam.zig`, run
-by `just test`, which passes `-Dtls`.
+Attempted 2026-11-09 from main at `9caabb1`, resumed 2026-11-13. The three
+requirements tls could not satisfy were closed in `baskingspot/tls#179`
+(`2e4a1f4`), and the wiring that proved the packages meet in one build —
+`tests/tls_seam.zig`, run by `just test` with `-Dtls` — now checks the APIs the
+driver calls instead of their absence. The driver itself is the next session's
+work, mapped function by function below.
 
 The dependency is `https://baskingspot.dev/tls/v0.4.0.tar.gz`. v0.4.0 is the
 first tls release that builds on Zig 0.17. The first pin was a commit, `40dd9e8`,
@@ -682,7 +682,7 @@ The driver is over the step core (`tls.handshake_core`), which is the right
 seam: it owns the transcript, the key schedule, the state machine, and the
 encryption level of every message, and it never frames or encrypts anything.
 
-### The blockers
+### The blockers, and what closed them
 
 **1. A server never gets its application traffic secrets.** RFC 8446 §7.1
 derives "s ap traffic" at the server's Finished; RFC 9001 §4.1.1 makes that the
@@ -717,10 +717,14 @@ unused. The asks: an `Options`/`ExtensionSink` on `client_hello.parse` and a
 `Server` accessor for the received ones; and extras through `sendFlight`, or a
 field on `Server` that `sendFlight` reads.
 
-The ordering matters: (2) blocks the loopback proof's client half as soon as the
-server is conformant, and (1) blocks the server half outright. So the proof the
-brief asks for cannot be built today, and a loopback that omitted the extension
-would prove the seam's plumbing while proving a handshake no QUIC peer accepts.
+All three landed in tls#179 as separate commits, with tests: `Server.sendFlight`
+derives the application secrets, `Client.receiveExtensions` and
+`Server.receiveExtensions` keep allowed extension bytes, and
+`Server.sendExtensions` puts the server's own in EncryptedExtensions. The same
+PR fixed two things the driver would have inherited: a client that authenticated
+derived its application secrets over the wrong transcript (RFC 8446 §7.1), and
+`Client.applicationSecrets` returned uninitialized memory before the client
+Finished. `KeyPairs` is exported from `tls.root`, so `useKeypairs` is callable.
 
 ### Smaller misfits, recorded so the driver is written once
 
@@ -730,11 +734,10 @@ would prove the seam's plumbing while proving a handshake no QUIC peer accepts.
   protect with the answer, so a placeholder is never acted on and a suite the
   peer has not picked cannot refuse the connection. What remains is the honest
   type: `?Suite` would let a driver say "not yet" instead of inventing one.
-- **`KeyPairs` is not exported from `tls.root`,** so no consumer can call
+- **`KeyPairs` was not exported from `tls.root`,** so no consumer could call
   `Client.useKeypairs`, `Server.useKeypairs`, or `Client.startEncoded`: the
-  parameter type has no public name. The only route is assigning the field, as
-  `tests/tls_seam.zig` does, which works because Zig fields are public. Export
-  the type; the driver then builds keypairs and calls the setter.
+  parameter type had no public name. Fixed in tls#179; the seam test now builds
+  keypairs and calls the setter.
 - **Nobody owns the message boundary.** The seam hands contiguous CRYPTO bytes
   per level (§19.6 puts offsets on the wire and the machine reassembles them);
   the core takes one complete handshake message and parses its type. The driver
@@ -862,8 +865,13 @@ that picks one of them, never needs it; anything else fails with a named error),
 0-RTT, post-handshake KeyUpdate and NewSessionTicket handling, and client
 authentication. Each is a gate, not a cleanup.
 
-### The one line that waits on tls
+### Storage the driver still owns
 
-`KeyPairs` has no public name, so the driver builds the value as a struct
-literal and assigns `Client.keypairs` / `Server.keypairs` directly. The day the
-type is exported, that becomes `useKeypairs`.
+One handshake-message buffer per level (a CRYPTO chunk can end inside a message,
+so the driver reassembles the 4-byte header's message before handing it to the
+core), one `out` buffer for the core's queued messages, one event queue, and
+fixed storage for the peer's transport parameters and the selected ALPN, because
+both borrow the message that carried them.
+
+`KeyPairs` is public now, so the driver calls `useKeypairs` rather than assigning
+the field.
