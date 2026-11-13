@@ -397,6 +397,13 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- The machine installs the driver's secrets after every packet, not only when
+  the caller writes: a 1-RTT packet coalesced behind the packet that carried the
+  peer's Finished was dropped for lack of keys, even though the driver had just
+  reported them. `Conn.feed` and `Conn.Datagram.next` both install through one
+  `commitPacket`, so a coalesced flight works at every level. The new
+  `handshake.Stub.app_secrets_after_feed` holds the application secrets until
+  the first `feed`, which is a real driver's timing, so a test can see the bug.
 - `just interop` never built anything runnable: `interop-bin` compiled the tool
   and installed nothing, so the recipe's `./zig-out/bin/interop` was always
   missing. Both developer binaries are installed by their steps now.

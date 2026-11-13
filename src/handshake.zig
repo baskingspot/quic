@@ -199,6 +199,12 @@ pub const Stub = struct {
     /// What `suite` reports.
     cipher_suite: Suite = .aes_128_gcm_sha256,
     confirmed: bool = false,
+    /// Whether the application secrets appear only after the first `feed`.
+    /// A real driver derives them from the peer's Finished, which arrives as
+    /// CRYPTO bytes, so this is what makes a test's timing match a handshake's:
+    /// a machine that installs the 1-RTT space too late drops a coalesced
+    /// packet that a driver like this one would have unlocked.
+    app_secrets_after_feed: bool = false,
     /// What `errorCode` reports after a failed call.
     failure: u64 = 0,
     fail_next: bool = false,
@@ -262,7 +268,10 @@ pub const Stub = struct {
             // from TLS, so a driver never has them.
             .initial => null,
             .handshake => self.handshake_secrets,
-            .app => self.app_secrets,
+            .app => if (self.app_secrets_after_feed and self.fed_calls == 0)
+                null
+            else
+                self.app_secrets,
         };
     }
 

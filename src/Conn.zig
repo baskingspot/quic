@@ -920,8 +920,30 @@ pub fn feed(
 
     const raw = try self.open(try self.locate(datagram), plaintext);
     const opened = try self.finish(raw, frames, stream_events, events, now);
-    self.commit(raw.id, raw.packet_number);
+    try self.commitPacket(raw.id, raw.packet_number);
     return opened;
+}
+
+/// Record the packet, then act on what the driver learned while it was
+/// processed.
+///
+/// Per packet, not per datagram: one datagram may carry the packet that yields
+/// a level's keys and the packet that needs them. The server's first flight is
+/// Initial plus Handshake in one datagram (RFC 9000 §12.2), and a client's
+/// Finished can be coalesced with its first 1-RTT packet, which §4.1.1 of
+/// RFC 9001 lets a server send as soon as its own Finished goes out.
+///
+/// After the packet is accounted for, not before: a server confirms its
+/// handshake on the client's Finished, and §4.9.2 discards the Handshake space
+/// there, so the space the walk was recording into has to be finished with
+/// first.
+fn commitPacket(self: *Conn, id: SpaceId, number: u64) Error!void {
+    self.commit(id, number);
+    // The packet may have closed the connection, which is the one case where
+    // there is nothing left to install and no error to report: the caller gets
+    // the Opened it asked for.
+    if (self.state != .open) return;
+    try self.installSpaces();
 }
 
 /// One packet of a datagram, located and assigned to a space, before it is
@@ -1325,7 +1347,7 @@ pub const Datagram = struct {
             // packet to skip: the peer's own bytes arrived intact and say
             // something invalid (§12.4).
             const opened = try conn.finish(raw, frames, stream_events, events, now);
-            conn.commit(raw.id, raw.packet_number);
+            try conn.commitPacket(raw.id, raw.packet_number);
             return opened;
         }
         return null;
@@ -6190,6 +6212,89 @@ test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram"
     // to answer each level with an ACK of its own (§13.2.1).
     try testing.expect(client.ackOwed(.initial));
     try testing.expect(client.ackOwed(.handshake));
+}
+
+test "RFC 9001 §4.1.1, a coalesced 1-RTT packet opens once the Finished is fed" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0x3d, 0x3e };
+    const client_cid = [_]u8{0x3a};
+    const client_secret: [protection.secret_length]u8 = @splat(0x66);
+    const server_secret: [protection.secret_length]u8 = @splat(0x67);
+    const app_client_secret: [protection.secret_length]u8 = @splat(0x68);
+    const app_server_secret: [protection.secret_length]u8 = @splat(0x69);
+
+    var client_stub: seam.Stub = .{
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+        .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
+    };
+    // A real driver derives the application secrets from the peer's Finished
+    // (§7.1 of RFC 8446), so this one holds them back until the handshake's
+    // bytes arrive. That is what makes the install's timing observable: the
+    // 1-RTT packet is coalesced behind the packet carrying that Finished.
+    var server_stub: seam.Stub = .{
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+        .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
+        .app_secrets_after_feed = true,
+    };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &client_cid,
+        .tls = client_stub.driver(),
+    });
+    var server_loss: LossTables = .{};
+    var server_crypto: [128]u8 = undefined;
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &client_cid,
+        .source_connection_id = &dcid,
+        .tls = server_stub.driver(),
+        .crypto = .{ .handshake = &server_crypto },
+    });
+
+    try client.installSpaces();
+    try server.installSpaces();
+    try testing.expect(server.handshake != null);
+    // Not yet: nothing has told this endpoint that the handshake's last message
+    // arrived, so there is no 1-RTT space to read with.
+    try testing.expectEqual(@as(?Space, null), server.app);
+
+    // The client's Finished and its first 1-RTT packet in one datagram, which
+    // §12.2 of RFC 9000 allows and §4.1.1 of RFC 9001 lets it send.
+    var flight: [1024]u8 = undefined;
+    var frames_buf: [64]u8 = undefined;
+    var writer: Writer = .init(&frames_buf);
+    try frame.write(&writer, .{ .crypto = .{ .offset = 0, .data = "Finished bytes" } });
+    const handshake_len = try client.writeFrames(.handshake, writer.written(), &flight, .data(0));
+    const app_len = try client.writeFrames(.app, &pings(1), flight[handshake_len..], .data(0));
+
+    var datagram: Datagram = .init(flight[0 .. handshake_len + app_len]);
+    var plaintext: [512]u8 = undefined;
+    var events: [8]frame.Frame = undefined;
+
+    const finished = (try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(.handshake, finished.space);
+    try testing.expectEqual(@as(u32, 1), server_stub.fed_calls);
+    // The driver learned what it needed from this packet's bytes, and the
+    // machine installed the level before locating the next packet. A machine
+    // that waited for the caller's next write would drop the packet below.
+    try testing.expect(server.app != null);
+
+    const one_rtt = (try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(.app, one_rtt.space);
+    try testing.expectEqual(@as(usize, 1), one_rtt.frames.len);
+    try testing.expectEqual(@as(u16, 0), datagram.dropped);
 }
 
 test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next is processed" {
