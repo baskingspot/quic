@@ -9,12 +9,10 @@
 //! each example and is built in place by `start`: the machine records its own
 //! address and the driver is pointed at by the machine, so neither may move.
 //!
-//! The connection IDs are the examples' own convention, not a protocol rule. A
-//! server is built before any datagram arrives, so it cannot read the client's
-//! IDs out of the first Initial (`Conn.Opening`), and the pair therefore agree
-//! on them here. A foreign client picks its own, and serving one needs a way to
-//! build the connection after the first datagram, which `quic-io` does not yet
-//! have.
+//! Neither end agrees on a connection ID beforehand. A client invents the name
+//! it gives the server and its own, from the platform's entropy; a server
+//! learns both from the client's first Initial (`Connection.accept`) and picks
+//! its own the same way. So a foreign client works as well as `hq_client`.
 
 const std = @import("std");
 const quic = @import("quic");
@@ -40,44 +38,24 @@ pub const body = "hello from baskingspot/quic\n";
 /// stuck handshake fails instead of hanging.
 pub const exchange_limit_ns: u64 = 5 * std.time.ns_per_s;
 
-/// The name the client gives the server in its first Initial, which also seeds
-/// the Initial keys (RFC 9001 §5.2). §7.2 asks for at least eight bytes.
-const original_destination_id = [_]u8{ 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78 };
-/// What the server calls itself, which the client adopts from the server's first
-/// Initial (§7.2).
-const server_id = [_]u8{ 0x51, 0x52, 0x53, 0x54 };
-const client_id = [_]u8{ 0xc1, 0xc2 };
-
 /// The most one stream holds in either direction, and the size of its ring.
 const stream_bytes = 1024;
 
-/// What the handshake carries opaquely (RFC 9001 §8.2), and what each `Conn`
-/// adopts as the peer's limits: one bidirectional stream of `stream_bytes`.
-fn encodeParameters(comptime sender: TransportParameters.Role, comptime identity: TransportParameters) []const u8 {
-    const bytes = comptime blk: {
-        var buffer: [128]u8 = undefined;
-        var writer: quic.Writer = .init(&buffer);
-        var parameters = identity;
-        parameters.initial_max_data = 4096;
-        parameters.initial_max_stream_data_bidi_local = stream_bytes;
-        parameters.initial_max_stream_data_bidi_remote = stream_bytes;
-        parameters.initial_max_streams_bidi = 1;
-        TransportParameters.encode(&writer, parameters, sender) catch unreachable;
-        const written = buffer[0..writer.written().len].*;
-        break :blk written;
-    };
-    return &bytes;
-}
+/// §7.2: the least a client's first Destination Connection ID may be.
+const original_id_len = 8;
+const own_id_len = 4;
 
-/// §7.3: a client names itself, and a server also echoes the connection ID the
-/// client first addressed.
-const client_parameters = encodeParameters(.client, .{
-    .initial_source_connection_id = &client_id,
-});
-const server_parameters = encodeParameters(.server, .{
-    .original_destination_connection_id = &original_destination_id,
-    .initial_source_connection_id = &server_id,
-});
+/// The limits each end advertises in the handshake (RFC 9001 §8.2), which the
+/// peer's `Conn` adopts: one bidirectional stream of `stream_bytes`. The caller
+/// adds the connection IDs, which differ per connection (§7.3).
+fn limits(identity: TransportParameters) TransportParameters {
+    var parameters = identity;
+    parameters.initial_max_data = 4096;
+    parameters.initial_max_stream_data_bidi_local = stream_bytes;
+    parameters.initial_max_stream_data_bidi_remote = stream_bytes;
+    parameters.initial_max_streams_bidi = 1;
+    return parameters;
+}
 
 /// When the exchange started and when it must be over.
 pub const Deadline = struct {
@@ -137,6 +115,14 @@ pub const Endpoint = struct {
     sent_crypto_initial: [2048]u8 = undefined,
     sent_crypto_handshake: [4096]u8 = undefined,
     adopted_id: [20]u8 = undefined,
+    /// The names. A client's `original_id` is what it first addresses the server
+    /// as, and `own_id` is what either end calls itself. A server's
+    /// `client_ids` is where `accept` copies the client's pair.
+    original_id: [original_id_len]u8 = undefined,
+    own_id: [own_id_len]u8 = undefined,
+    client_ids: [40]u8 = undefined,
+    parameter_bytes: [128]u8 = undefined,
+    accepting: quic_io.Connection.Accepting = undefined,
     slots: [2]quic.StreamTable.Slot = undefined,
     send_bytes: [2][stream_bytes]u8 = undefined,
     recv_bytes: [2][stream_bytes]u8 = undefined,
@@ -181,10 +167,11 @@ pub const Endpoint = struct {
     }
 
     /// Build the driver and the connection in place. A server passes no `peer`
-    /// and learns it from the first datagram; a client is given it.
+    /// and learns it from the first datagram, and builds its machine in
+    /// `accept`; a client is given the peer and builds its machine here.
     ///
-    /// The TLS random fields and ephemeral keys come from the platform, never
-    /// from a constant.
+    /// The TLS random fields, the ephemeral keys, and the connection IDs come
+    /// from the platform, never from a constant.
     pub fn start(
         self: *Endpoint,
         io: Io,
@@ -202,22 +189,22 @@ pub const Endpoint = struct {
         var random: [32]u8 = undefined;
         io.random(&random);
         self.tls_driver = try driver.Tls.init(self.storage(), tls_config, random);
+        io.random(&self.original_id);
+        io.random(&self.own_id);
 
+        // A server's names are the client's, which it has not met: `accept`
+        // fills them in, and what is written here is ignored.
         var conn: Conn.Config = switch (tls_config) {
-            .client => Conn.clientConfig(&original_destination_id, &client_id, self.loss()),
+            .client => Conn.clientConfig(&self.original_id, &self.own_id, self.loss()),
             .server => .{
                 .role = .server,
                 .loss = self.loss(),
-                .original_destination_connection_id = &original_destination_id,
-                .destination_connection_id = &client_id,
-                .source_connection_id = &server_id,
+                .original_destination_connection_id = "",
+                .destination_connection_id = "",
+                .source_connection_id = &self.own_id,
             },
         };
         conn.tls = self.tls_driver.driver();
-        conn.transport_parameters = switch (tls_config) {
-            .client => client_parameters,
-            .server => server_parameters,
-        };
         conn.crypto = .{ .initial = &self.crypto_initial, .handshake = &self.crypto_handshake };
         conn.crypto_sent = .{
             .initial = &self.sent_crypto_initial,
@@ -229,11 +216,31 @@ pub const Endpoint = struct {
         conn.receive_limit = 4096;
         conn.max_streams_bidi = 1;
 
+        switch (tls_config) {
+            .client => {
+                // §7.3: a client names itself in its parameters.
+                var writer: quic.Writer = .init(&self.parameter_bytes);
+                TransportParameters.encode(&writer, limits(.{
+                    .initial_source_connection_id = &self.own_id,
+                }), .client) catch unreachable;
+                conn.transport_parameters = writer.written();
+            },
+            .server => self.accepting = .{
+                .conn = conn,
+                .parameters = limits(.{}),
+                .parameter_storage = &self.parameter_bytes,
+            },
+        }
+
         self.connection = .init(.{
             .io = io,
             .socket = socket,
             .peer = peer,
-            .conn = conn,
+            .conn = switch (tls_config) {
+                .client => conn,
+                .server => null,
+            },
+            .connection_ids = &self.client_ids,
             .datagram = &self.datagram,
             .write_frames = &self.write_frames,
             .plaintext = &self.plaintext,
@@ -251,6 +258,16 @@ pub const Endpoint = struct {
     /// Send what the machine owes without waiting for anything: a client's
     /// first Initial goes out here.
     pub fn flush(self: *Endpoint, deadline: Deadline) Error!void {
+        _ = try self.connection.flush(deadline.now());
+    }
+
+    /// A server waits for its client's first Initial, builds its machine from
+    /// it, and answers. Returns once the machine exists, or `error.Timeout`.
+    pub fn accept(self: *Endpoint, deadline: Deadline) Error!void {
+        while (self.connection.state == .listening) {
+            const timeout = deadline.timeout() orelse return error.Timeout;
+            _ = try self.connection.accept(self.accepting, deadline.now(), timeout);
+        }
         _ = try self.connection.flush(deadline.now());
     }
 
@@ -298,3 +315,93 @@ pub const Endpoint = struct {
         );
     }
 };
+
+// -- Tests -------------------------------------------------------------------
+
+const testing = std.testing;
+
+/// File scope: an `Endpoint` is tens of kilobytes, and the machine points into
+/// it, so it is built in place and stays put.
+var test_client: Endpoint = undefined;
+var test_server: Endpoint = undefined;
+
+test "RFC 9000 §7.2, a server learns the client's connection IDs from its first Initial" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The server is bound first, on a port the client is then told. The client
+    // binds anywhere: the server learns where from the first datagram.
+    var server_address: Io.net.IpAddress = undefined;
+    const server_socket = bound: {
+        var port: u16 = 47401;
+        while (port < 47451) : (port += 1) {
+            server_address = .{ .ip4 = .loopback(port) };
+            break :bound Io.net.IpAddress.bind(&server_address, io, .{ .mode = .dgram }) catch continue;
+        }
+        return error.NoFreePort;
+    };
+    defer server_socket.close(io);
+    const local: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const client_socket = try local.bind(io, .{ .mode = .dgram });
+    defer client_socket.close(io);
+
+    // The fixture's own certificate, as `tls_loopback.zig` uses it.
+    const cert_pem = @embedFile("tls_server_crt");
+    var der: [cert_pem.len]u8 = undefined;
+    var chain_slots: [1][]const u8 = undefined;
+    const chain = try tls.certificate_chain.CertificateChain.fromPem(cert_pem, &der, &chain_slots);
+    var key = try tls.signature.PrivateKey.fromPemAuto(@embedFile("tls_server_key"));
+    defer key.deinit();
+    var policy: tls.certificate.Policy = .init;
+    policy.insecure_no_chain_anchor = true;
+
+    try test_client.start(io, client_socket, server_address, .{ .client = .{
+        .policy = policy,
+        .alpn = &.{alpn},
+    } });
+    defer test_client.deinit();
+    try test_server.start(io, server_socket, null, .{ .server = .{
+        .credentials = .{ .chain = chain, .signer = key.signer() },
+        .alpn = &.{alpn},
+    } });
+    defer test_server.deinit();
+
+    // Nothing tells the server who the client is until its first Initial lands.
+    try testing.expectEqual(quic_io.Connection.State.listening, test_server.connection.state);
+
+    const deadline: Deadline = .init(io);
+    try test_client.flush(deadline);
+    try test_server.accept(deadline);
+    try testing.expectEqual(quic_io.Connection.State.open, test_server.connection.state);
+
+    // What the server learned is what the client invented: its first
+    // Destination Connection ID, then its Source Connection ID.
+    const learned = test_server.connection.connection_ids;
+    try testing.expectEqualSlices(u8, &test_client.original_id, learned[0..original_id_len]);
+    try testing.expectEqualSlices(u8, &test_client.own_id, learned[original_id_len..][0..own_id_len]);
+
+    // The handshake completes on both ends: the client sees its own driver
+    // finish and the 1-RTT keys, the server its confirmation.
+    while (!(test_client.tls_driver.done() and test_client.connection.conn.app != null)) {
+        try test_client.step(deadline);
+    }
+    while (!test_server.connection.established()) try test_server.step(deadline);
+
+    // And a byte crosses a stream.
+    const stream = try test_client.connection.conn.openStream(request_stream);
+    try stream.send.write("Q");
+    try stream.send.finish();
+    try test_client.sendStream(deadline);
+
+    var received: [8]u8 = undefined;
+    var length: usize = 0;
+    while (true) {
+        if (test_server.connection.conn.stream(request_stream)) |arrived| {
+            length += try arrived.recv.readInto(received[length..]);
+            if (arrived.recv.isTerminal()) break;
+        }
+        try test_server.step(deadline);
+    }
+    try testing.expectEqualStrings("Q", received[0..length]);
+}

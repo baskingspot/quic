@@ -17,6 +17,12 @@
 //! Like `Conn`, a `Connection` must not move after `init`: the machine inside it
 //! records its own address and refuses a later move, so build one in place.
 //!
+//! A server cannot build its `Conn` before it has met its client: the client's
+//! connection IDs seed the Initial keys (§5.2 of RFC 9001), and they arrive in
+//! the first Initial. So a server's `Connection` starts listening, with no
+//! `Conn` at all, and `accept` builds the machine in place from that first
+//! datagram, without moving anything.
+//!
 //! Entropy and the clock stay the caller's: `flush` takes `now`, and the socket
 //! cannot block longer than the timeout the caller passes to `receive`.
 
@@ -28,12 +34,19 @@ const quic = @import("quic");
 const Conn = quic.Conn;
 const Recovery = quic.Recovery;
 const frame = quic.frame;
+const TransportParameters = quic.TransportParameters;
 
 const Io = std.Io;
 
 pub const Error = Conn.Error ||
+    TransportParameters.Error ||
     Io.net.Socket.ReceiveTimeoutError ||
-    Io.net.Socket.SendError;
+    Io.net.Socket.SendError ||
+    error{
+        /// The connection is still listening: `accept` has not met its client, so
+        /// there is no machine to flush or to receive for.
+        NotOpen,
+    };
 
 /// One connection, its socket, and the buffers the machine writes into.
 pub const Connection = struct {
@@ -42,7 +55,13 @@ pub const Connection = struct {
     /// Where packets go. A server sets it from the first datagram; a client is
     /// given it.
     peer: Io.net.IpAddress,
-    conn: Conn,
+    /// Valid only once `state` is `.open`. A client's is built by `init`; a
+    /// server's by `accept`, in this very field, because a `Conn` refuses to move.
+    conn: Conn = undefined,
+    state: State,
+    /// Where `accept` copies the client's two connection IDs. The `Conn` borrows
+    /// them for its whole life, so this stays the caller's and stays put.
+    connection_ids: []u8,
     datagram: []u8,
     /// Scratch for the frames a packet carries. Distinct from `datagram`: the
     /// machine composes a frame here and then copies it into the packet it
@@ -66,11 +85,23 @@ pub const Connection = struct {
     /// What this endpoint's own send loop still owes, per packet number space.
     owed: [3]Conn.SpaceId = undefined,
 
+    /// Whether the machine exists yet. Two states and one transition, `accept`:
+    /// a client is born open.
+    pub const State = enum { listening, open };
+
     pub const Config = struct {
         io: Io,
         socket: Io.net.Socket,
         peer: ?Io.net.IpAddress = null,
-        conn: Conn.Config,
+        /// A client's configuration, and a server's when it already knows its
+        /// client's connection IDs. Null is a server that has not met its client:
+        /// `accept` builds the machine later, from `Accepting`.
+        conn: ?Conn.Config,
+        /// Where `accept` keeps the client's two connection IDs. A version 1
+        /// connection ID is at most 20 bytes, so 40 holds any pair; `accept`
+        /// returns `error.NoSpace` for a pair that does not fit. Unused, and may
+        /// be empty, when `conn` is given.
+        connection_ids: []u8 = &.{},
         /// One datagram, in and out. The machine's `max_send_size` is the
         /// caller's; this is the buffer it is written into.
         datagram: []u8,
@@ -84,12 +115,35 @@ pub const Connection = struct {
         recovery_events: *Recovery.Events,
     };
 
+    /// What `accept` needs to build a server's machine once it has met its
+    /// client.
+    pub const Accepting = struct {
+        /// The server's configuration: its own `source_connection_id`, the loss
+        /// state, the driver, the streams, everything but the client's names.
+        /// `original_destination_connection_id`, `destination_connection_id`, and
+        /// `transport_parameters` are overwritten, so what they hold is ignored.
+        conn: Conn.Config,
+        /// The server's limits. §7.3: its transport parameters name the
+        /// connection ID the client first addressed and the server's own, and
+        /// the first is unknown until the Initial arrives, so `accept` fills in
+        /// `original_destination_connection_id` and `initial_source_connection_id`
+        /// and encodes the rest. They must agree with `conn`, as `Conn` asserts.
+        parameters: TransportParameters,
+        /// Where the encoded parameters live; the `Conn` points at them for its
+        /// whole life. `error.NoSpace` when they do not fit.
+        parameter_storage: []u8,
+    };
+
     pub fn init(config: Config) Connection {
-        return .{
+        // A listener has no peer to be given, and nowhere to put the client's
+        // names without a buffer.
+        assert(config.conn != null or (config.peer == null and config.connection_ids.len > 0));
+        var self: Connection = .{
             .io = config.io,
             .socket = config.socket,
             .peer = config.peer orelse .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
-            .conn = .init(config.conn),
+            .state = if (config.conn == null) .listening else .open,
+            .connection_ids = config.connection_ids,
             .datagram = config.datagram,
             .write_frames = config.write_frames,
             .plaintext = config.plaintext,
@@ -99,6 +153,69 @@ pub const Connection = struct {
             .walk = .init(config.datagram),
             .peer_settled = config.peer != null,
         };
+        if (config.conn) |conn| self.conn = .init(conn);
+        return self;
+    }
+
+    /// Wait up to `timeout` for a client's first Initial, learn its connection
+    /// IDs from it, build the machine in place, and return the Initial's first
+    /// packet, as `receive` would.
+    ///
+    /// §7.2: the Destination Connection ID of the first Initial names this
+    /// endpoint and seeds the Initial keys, and its Source Connection ID is where
+    /// answers go. `Conn.Opening` copies both into `connection_ids`, and the
+    /// `Conn` is built from them; only then is the datagram walked, by the same
+    /// code `receive` uses, so the rest of its packets come from `receive`.
+    ///
+    /// Null is either the wait expiring, with `state` still `.listening`, or the
+    /// machine now existing while no packet of the datagram opened. The caller
+    /// tells them apart by `state`, and calls `accept` again only in the first.
+    /// `accept` on a connection that is open is a bug, not an error: a second
+    /// client is not this layer's to serve.
+    ///
+    /// A datagram that does not start a connection returns the error
+    /// `Conn.Opening.fromDatagram` gives and builds nothing: `error.NotInitial`,
+    /// `error.InvalidConnectionId`, `error.NoSpace`, and `error.UnsupportedVersion`.
+    /// After any of them `peer` is where the datagram came from and `datagram`
+    /// still holds it, so the caller can answer an unsupported version with a
+    /// Version Negotiation packet (§6 of RFC 9000, `quic.connection_setup`);
+    /// whether to is the caller's policy. `peer_settled` stays false, so the next `accept` takes
+    /// a fresh sender.
+    ///
+    /// `now` dates the datagram, as in `receive`.
+    pub fn accept(
+        self: *Connection,
+        accepting: Accepting,
+        now: Conn.Duration,
+        timeout: Io.Timeout,
+    ) Error!?Conn.Opened {
+        assert(self.state == .listening);
+        assert(!self.walking);
+        assert(accepting.conn.role == .server);
+
+        const message = self.socket.receiveTimeout(self.io, self.datagram, timeout) catch |err| switch (err) {
+            error.Timeout => return null,
+            else => return err,
+        };
+        self.peer = message.from;
+        const opening = try Conn.Opening.fromDatagram(message.data, self.connection_ids);
+
+        var conn = accepting.conn;
+        conn.original_destination_connection_id = opening.destination_connection_id;
+        conn.destination_connection_id = opening.source_connection_id;
+        var parameters = accepting.parameters;
+        parameters.original_destination_connection_id = opening.destination_connection_id;
+        parameters.initial_source_connection_id = conn.source_connection_id;
+        var writer: quic.Writer = .init(accepting.parameter_storage);
+        try TransportParameters.encode(&writer, parameters, .server);
+        conn.transport_parameters = writer.written();
+
+        // In place: the `Conn` is assigned into the field it will live in, and
+        // is first used, and so pinned, after that.
+        self.conn = .init(conn);
+        self.state = .open;
+        self.peer_settled = true;
+        return self.beginWalk(message.data, now);
     }
 
     /// Return the next packet the machine has, waiting up to `timeout` for a
@@ -115,6 +232,7 @@ pub const Connection = struct {
     /// also returns null: the machine counted them, and there is nothing to
     /// report.
     pub fn receive(self: *Connection, now: Conn.Duration, timeout: Io.Timeout) Error!?Conn.Opened {
+        if (self.state != .open) return error.NotOpen;
         while (self.walking) {
             if (try self.nextPacket()) |opened| return opened;
         }
@@ -132,8 +250,16 @@ pub const Connection = struct {
         } else if (!self.peer.eql(&message.from)) {
             return null;
         }
+        return self.beginWalk(message.data, now);
+    }
+
+    /// Start walking a datagram that arrived at `now`, and return its first
+    /// packet. Shared by `receive` and `accept`, so a server's first Initial is
+    /// opened by the code every later packet is.
+    fn beginWalk(self: *Connection, data: []u8, now: Conn.Duration) Error!?Conn.Opened {
+        assert(self.state == .open);
         self.received_at = now;
-        self.walk = .init(message.data);
+        self.walk = .init(data);
         self.walking = true;
         return self.nextPacket();
     }
@@ -163,6 +289,7 @@ pub const Connection = struct {
     /// been recorded in flight (§6 of RFC 9002) and loss recovery will bring it
     /// back.
     pub fn flush(self: *Connection, now: Conn.Duration) Error!usize {
+        if (self.state != .open) return error.NotOpen;
         var sent: usize = 0;
         while (try self.conn.writeHandshake(self.write_frames, self.datagram, now)) |length| {
             try self.socket.send(self.io, &self.peer, self.datagram[0..length]);
@@ -181,8 +308,10 @@ pub const Connection = struct {
     /// completed and the peer has confirmed what it must.
     ///
     /// §4.1.2 of RFC 9001: a client finishes when a HANDSHAKE_DONE frame lands,
-    /// a server when its own handshake does.
+    /// a server when its own handshake does. A server still listening has no
+    /// handshake, so it is not established.
     pub fn established(self: *const Connection) bool {
+        if (self.state != .open) return false;
         return self.conn.handshakeConfirmed() and (self.conn.app != null);
     }
 };
@@ -258,6 +387,8 @@ const Harness = struct {
     server_events: Recovery.Events = undefined,
     server_parsed: [8]frame.Frame = undefined,
     server_streams: [8]Conn.StreamEvent = undefined,
+    server_ids: [40]u8 = undefined,
+    server_parameters: [128]u8 = undefined,
     client: Connection = undefined,
     server: Connection = undefined,
 
@@ -310,6 +441,39 @@ const Harness = struct {
             .stream_events = &self.server_streams,
             .recovery_events = &self.server_events,
         });
+    }
+
+    /// Replace the server with one that has not met its client: no `Conn`, and
+    /// a buffer for the client's names.
+    fn listen(self: *Harness) void {
+        self.server = .init(.{
+            .io = self.io,
+            .socket = self.server_socket,
+            .conn = null,
+            .connection_ids = &self.server_ids,
+            .datagram = &self.server_datagram,
+            .write_frames = &self.server_write_frames,
+            .plaintext = &self.server_plaintext,
+            .frames = &self.server_parsed,
+            .stream_events = &self.server_streams,
+            .recovery_events = &self.server_events,
+        });
+    }
+
+    /// What a server accepts with: the name the client already addresses it by, so
+    /// the client needs no storage to adopt a new one.
+    fn accepting(self: *Harness) Connection.Accepting {
+        return .{
+            .conn = .{
+                .role = .server,
+                .loss = self.server_loss.value(),
+                .original_destination_connection_id = "",
+                .destination_connection_id = "",
+                .source_connection_id = &self.dcid,
+            },
+            .parameters = .{},
+            .parameter_storage = &self.server_parameters,
+        };
     }
 
     fn deinit(self: *Harness) void {
@@ -390,4 +554,59 @@ test "RFC 9000 §9.3, a datagram from another address is not a migration" {
     try testing.expect(nothing == null);
     try testing.expect(h.server.peer_settled);
     try testing.expect(h.server.peer.eql(&h.client_address));
+}
+
+test "RFC 9000 §7.2, accept builds the connection from the first Initial's connection IDs" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.listen();
+
+    // The client's IDs are the harness's: the server was built knowing neither.
+    const sealed = try h.sealPing(&h.client_datagram);
+    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0..sealed]);
+
+    const opened = (try h.server.accept(h.accepting(), 0, test_timeout)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Conn.SpaceId.initial, opened.space);
+    try testing.expectEqual(Connection.State.open, h.server.state);
+    try testing.expectEqualSlices(u8, &h.dcid, h.server_ids[0..h.dcid.len]);
+    try testing.expectEqualSlices(u8, &.{0x44}, h.server.conn.destination_connection_id);
+    try testing.expect(h.server.peer.eql(&h.client_address));
+
+    // And the machine it built works: it owes an acknowledgment, which the
+    // client reads.
+    try testing.expectEqual(1, try h.server.flush(0));
+    _ = (try h.client.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), h.client_events.ackedPackets().len);
+}
+
+test "RFC 9000 §7.2, an unsupported version is refused before a connection exists" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.listen();
+
+    // §17.2: the version follows the first byte. Version 0x1a2a3a4a is one of
+    // the reserved ones that no endpoint implements (§15).
+    const sealed = try h.sealPing(&h.client_datagram);
+    @memcpy(h.client_datagram[1..5], &[_]u8{ 0x1a, 0x2a, 0x3a, 0x4a });
+    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0..sealed]);
+
+    try testing.expectError(error.UnsupportedVersion, h.server.accept(h.accepting(), 0, test_timeout));
+    try testing.expectEqual(Connection.State.listening, h.server.state);
+    try testing.expect(!h.server.peer_settled);
+    // The caller can still answer: the sender and the datagram are kept.
+    try testing.expect(h.server.peer.eql(&h.client_address));
+    try testing.expectError(error.NotOpen, h.server.flush(0));
+}
+
+test "RFC 9000 §7.2, a server that has not accepted has no connection to flush" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    h.listen();
+
+    try testing.expectError(error.NotOpen, h.server.flush(0));
+    try testing.expectError(error.NotOpen, h.server.receive(0, test_timeout));
+    try testing.expect(!h.server.established());
 }

@@ -2,10 +2,11 @@
 //! one response.
 //!
 //! Usage: `hq_server <cert.pem> <key.pem> <port>`. It binds 127.0.0.1:<port>,
-//! learns its peer from the first datagram, finishes the handshake, reads
-//! `GET /<path>\r\n` off stream 0 until the client's FIN, answers on the same
-//! stream with a fixed body and a FIN, closes with NO_ERROR, and exits. It never
-//! accepts a second connection, which is why every buffer is static.
+//! learns its peer and the client's connection IDs from the first Initial,
+//! finishes the handshake, reads `GET /<path>\r\n` off stream 0 until the
+//! client's FIN, answers on the same stream with a fixed body and a FIN, closes
+//! with NO_ERROR, and exits. It never accepts a second connection, which is why
+//! every buffer is static.
 //!
 //! Every wait is bounded by one deadline: a handshake that goes nowhere prints
 //! `hq_server: TIMEOUT` and exits 1.
@@ -74,6 +75,10 @@ pub fn main(init: std.process.Init) !void {
 
 fn serve(io: Io) !void {
     const deadline: hq.Deadline = .init(io);
+
+    // The client's first Initial names this connection, and the machine is
+    // built from it.
+    try endpoint.accept(deadline);
 
     // The handshake, driven by the client's datagrams.
     while (!endpoint.connection.established()) try endpoint.step(deadline);

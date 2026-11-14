@@ -133,6 +133,29 @@ pub fn build(b: *std.Build) void {
             const hq_exe = b.addExecutable(.{ .name = name, .root_module = hq_mod });
             install_hq_step.dependOn(&b.addInstallArtifact(hq_exe, .{}).step);
         }
+
+        // The pair's shared file also holds the test that runs a server against
+        // a client, both built from it: its own module, because a test needs the
+        // fixture certificate and the executables do not.
+        const hq_test_mod = b.createModule(.{
+            .root_source_file = b.path("examples/hq.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "quic-io", .module = io_mod },
+                .{ .name = "quic-tls", .module = driver_mod },
+                .{ .name = "tls", .module = dependency.module("tls") },
+            },
+        });
+        hq_test_mod.addAnonymousImport("tls_server_crt", .{
+            .root_source_file = dependency.path("tests/fixtures/server.crt"),
+        });
+        hq_test_mod.addAnonymousImport("tls_server_key", .{
+            .root_source_file = dependency.path("tests/fixtures/server.key"),
+        });
+        const hq_tests = b.addTest(.{ .root_module = hq_test_mod });
+        test_step.dependOn(&b.addRunArtifact(hq_tests).step);
     }
 
     // The echo example: the machine called the way an application would. It is
