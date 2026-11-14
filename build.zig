@@ -103,6 +103,18 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(loopback_tests).step);
     }
 
+    // The I/O shell over `std.Io`: a socket, a receive that waits, and a flush
+    // that sends what the machine owes. Separate from `quic` so a caller that
+    // never opens a socket never compiles std.Io.
+    const io_mod = b.addModule("quic-io", .{
+        .root_source_file = b.path("src/io.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "quic", .module = mod }},
+    });
+    const io_tests = b.addTest(.{ .root_module = io_mod });
+    test_step.dependOn(&b.addRunArtifact(io_tests).step);
+
     // The echo example: the machine called the way an application would. It is
     // an executable rather than a test because its value is in being read.
     const echo_mod = b.createModule(.{

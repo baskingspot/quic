@@ -7,6 +7,14 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- The `quic-io` module: the socket half of a connection, over `std.Io`. It
+  binds or takes a UDP socket, waits for one datagram at a time with a caller's
+  timeout, feeds it to `Conn`, and flushes whatever the machine owes (handshake
+  bytes, then acknowledgments). It learns the peer's address from the datagrams
+  and follows it, because a connection can migrate (RFC 9000 §9). The machine
+  stays sans-I/O and allocator-free; this module owns no policy and no timer.
+- `quic-io` has a loopback test with two real sockets: one seals an Initial,
+  the other receives it and sends back the acknowledgment it owes.
 - The `quic-tls` module: a real TLS 1.3 driver for `Conn.tls`, over
   `baskingspot/tls`'s step core. Build it with `-Dtls`; a consumer that fetches
   `quic` alone never fetches tls. It carries transport parameters both ways
