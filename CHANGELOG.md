@@ -10,9 +10,9 @@ All notable changes to quic are recorded here. The format follows
 - The `quic-io` module: the socket half of a connection, over `std.Io`. It
   binds or takes a UDP socket, waits for one datagram at a time with a caller's
   timeout, feeds it to `Conn`, and flushes whatever the machine owes (handshake
-  bytes, then acknowledgments). It learns the peer's address from the datagrams
-  and follows it, because a connection can migrate (RFC 9000 §9). The machine
-  stays sans-I/O and allocator-free; this module owns no policy and no timer.
+  bytes, then acknowledgments). It learns the peer's address from the first
+  datagram it accepts and keeps it. The machine stays sans-I/O and
+  allocator-free; this module owns no policy and no timer.
 - `quic-io` has a loopback test with two real sockets: one seals an Initial,
   the other receives it and sends back the acknowledgment it owes.
 - The `quic-tls` module: a real TLS 1.3 driver for `Conn.tls`, over
@@ -430,6 +430,13 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- `quic-io` opens every packet a datagram carries, not only the first. A
+  client's first flight coalesces Initial and Handshake into one datagram
+  (RFC 9000 §12.2), and the shell used to hand the machine the Initial alone.
+- `quic-io` keeps the peer address it learned from the first datagram and drops
+  datagrams from anywhere else. Following a new address is migration, and
+  migration requires path validation (RFC 9000 §9.3), which this layer does not
+  do.
 - `Conn.installSpaces` asks the TLS driver for its cipher suite only where a
   traffic secret exists to protect with the answer. A client's driver cannot
   know the negotiated suite before ServerHello, so a placeholder answer used to

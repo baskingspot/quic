@@ -8,10 +8,11 @@
 //!
 //! What it does own is one decision the machine cannot make: which address a
 //! datagram goes to. A client knows its peer before the first packet; a server
-//! learns it from the first datagram that opens, and uses it for everything
-//! after. It also learns the peer's address on every datagram, because a
-//! connection can migrate (§9 of RFC 9000) and the machine below has already
-//! said which one it believes.
+//! takes it from the first datagram and then stops looking. A datagram from
+//! anywhere else is dropped, not followed: migration is only legal once the new
+//! path is validated (§9.3 of RFC 9000), and this layer does not validate
+//! paths. A server behind a NAT that rebinds its port therefore goes quiet
+//! rather than guessing.
 //!
 //! Like `Conn`, a `Connection` must not move after `init`: the machine inside it
 //! records its own address and refuses a later move, so build one in place.
@@ -51,6 +52,17 @@ pub const Connection = struct {
     frames: []frame.Frame,
     stream_events: []Conn.StreamEvent,
     recovery_events: *Recovery.Events,
+    /// The datagram being walked, one packet at a time. One datagram may carry
+    /// several packets (§12.2 of RFC 9000), and every one of them belongs to
+    /// the machine, not just the first.
+    walk: Conn.Datagram,
+    walking: bool = false,
+    /// When the datagram being walked arrived. Every packet in it shares one
+    /// arrival time, so an RTT sample does not drift down the datagram.
+    received_at: Conn.Duration = 0,
+    /// Whether `peer` is settled. A client is given it; a server takes it from
+    /// the first datagram and keeps it.
+    peer_settled: bool,
     /// What this endpoint's own send loop still owes, per packet number space.
     owed: [3]Conn.SpaceId = undefined,
 
@@ -82,30 +94,61 @@ pub const Connection = struct {
             .frames = config.frames,
             .stream_events = config.stream_events,
             .recovery_events = config.recovery_events,
+            .walk = .init(config.datagram),
+            .peer_settled = config.peer != null,
         };
     }
 
-    /// Wait up to `timeout` for one datagram and feed it to the machine.
+    /// Return the next packet the machine has, waiting up to `timeout` for a
+    /// datagram when the last one is used up.
     ///
-    /// Null means the wait expired with nothing to do, which is a caller's
-    /// timer firing, not an error. A datagram that does not open is not an
-    /// error either: the machine counts it and returns null.
+    /// The caller loops until it gets null, and every packet reports its own
+    /// frames; that is the whole contract. A datagram that carries several
+    /// packets (§12.2) is handed over one at a time, and the wait only happens
+    /// when the previous datagram is exhausted, so a coalesced flight cannot
+    /// lose its tail.
+    ///
+    /// Null means the wait expired with nothing to do, which is the caller's
+    /// timer firing, not an error. A datagram whose every packet fails to open
+    /// also returns null: the machine counted them, and there is nothing to
+    /// report.
     pub fn receive(self: *Connection, now: Conn.Duration, timeout: Io.Timeout) Error!?Conn.Opened {
+        while (self.walking) {
+            if (try self.nextPacket()) |opened| return opened;
+        }
         const message = self.socket.receiveTimeout(self.io, self.datagram, timeout) catch |err| switch (err) {
             error.Timeout => return null,
             else => return err,
         };
-        // §9: the address the machine believes is the one the last datagram
-        // came from, and it is also where replies go.
-        self.peer = message.from;
-        const opened = try self.conn.feed(
-            message.data,
+        // §9: the peer is where the first datagram came from, and where the
+        // answers go. A later datagram from somewhere else is not a migration
+        // to follow; it is the start of one this endpoint cannot validate, so
+        // the path stays where it is and the datagram is dropped.
+        if (!self.peer_settled) {
+            self.peer = message.from;
+            self.peer_settled = true;
+        } else if (!self.peer.eql(&message.from)) {
+            return null;
+        }
+        self.received_at = now;
+        self.walk = .init(message.data);
+        self.walking = true;
+        return self.nextPacket();
+    }
+
+    /// Open the next packet of the datagram being walked, or mark the walk
+    /// finished. `walk.next` leaves the cursor after the packet it returned, so
+    /// a second call reads the next one rather than the same one again.
+    fn nextPacket(self: *Connection) Error!?Conn.Opened {
+        const opened = try self.walk.next(
+            &self.conn,
             self.plaintext,
             self.frames,
             self.stream_events,
             self.recovery_events,
-            now,
+            self.received_at,
         );
+        if (opened == null) self.walking = false;
         return opened;
     }
 
@@ -144,10 +187,10 @@ pub const Connection = struct {
 
 // -- Tests -------------------------------------------------------------------
 //
-// One datagram each way over a real socket: the machine seals an Initial, the
-// shell sends it, the other shell receives it, and its acknowledgment comes
-// back. No TLS, because Initial keys are the connection ID's (§5.2 of RFC
-// 9001) and this is a test of the socket layer, not the handshake.
+// Two real sockets on the loopback interface, driven the way a program drives
+// them: seal a packet with the machine, send it with the socket, wait for the
+// other side. No TLS, because Initial keys come from the connection ID (§5.2 of
+// RFC 9001), and these are tests of the socket layer, not of the handshake.
 
 const Loss = struct {
     shared: Recovery = .{},
@@ -167,6 +210,12 @@ const Loss = struct {
     }
 };
 
+/// A bound on every wait, so a regression fails the test instead of hanging CI.
+const test_timeout: Io.Timeout = .{ .duration = .{
+    .raw = .{ .nanoseconds = 2 * std.time.ns_per_s },
+    .clock = .awake,
+} };
+
 /// Bind 127.0.0.1 until a port is free. A test cannot ask for port 0 and learn
 /// the port back, so it walks a small range instead.
 fn bindLoopback(io: Io) !struct { socket: Io.net.Socket, address: Io.net.IpAddress } {
@@ -179,91 +228,164 @@ fn bindLoopback(io: Io) !struct { socket: Io.net.Socket, address: Io.net.IpAddre
     return error.NoFreePort;
 }
 
+/// Two connections on real sockets, with every buffer they need. Built in place
+/// because a `Connection` must not move after `init`.
+const Harness = struct {
+    threaded: Io.Threaded = undefined,
+    io: Io = undefined,
+    server_socket: Io.net.Socket = undefined,
+    server_address: Io.net.IpAddress = undefined,
+    client_socket: Io.net.Socket = undefined,
+    client_address: Io.net.IpAddress = undefined,
+    dcid: [3]u8 = .{ 0x11, 0x22, 0x33 },
+    client_loss: Loss = .{},
+    server_loss: Loss = .{},
+    client_datagram: [1200]u8 = undefined,
+    client_write_frames: [64]u8 = undefined,
+    client_plaintext: [1200]u8 = undefined,
+    client_recovery: [8]Recovery.SentPacket = undefined,
+    client_lost: [8]Recovery.SentPacket = undefined,
+    client_events: Recovery.Events = undefined,
+    client_parsed: [8]frame.Frame = undefined,
+    client_streams: [8]Conn.StreamEvent = undefined,
+    server_datagram: [1200]u8 = undefined,
+    server_write_frames: [64]u8 = undefined,
+    server_plaintext: [1200]u8 = undefined,
+    server_recovery: [8]Recovery.SentPacket = undefined,
+    server_lost: [8]Recovery.SentPacket = undefined,
+    server_events: Recovery.Events = undefined,
+    server_parsed: [8]frame.Frame = undefined,
+    server_streams: [8]Conn.StreamEvent = undefined,
+    client: Connection = undefined,
+    server: Connection = undefined,
+
+    fn init(self: *Harness) !void {
+        self.threaded = .init(testing.allocator, .{});
+        self.io = self.threaded.io();
+        const server = try bindLoopback(self.io);
+        self.server_socket = server.socket;
+        self.server_address = server.address;
+        const client = try bindLoopback(self.io);
+        self.client_socket = client.socket;
+        self.client_address = client.address;
+
+        self.client_events = .init(&self.client_recovery, &self.client_lost);
+        self.server_events = .init(&self.server_recovery, &self.server_lost);
+
+        self.client = .init(.{
+            .io = self.io,
+            .socket = self.client_socket,
+            .peer = self.server_address,
+            .conn = .{
+                .role = .client,
+                .loss = self.client_loss.value(),
+                .original_destination_connection_id = &self.dcid,
+                .destination_connection_id = &self.dcid,
+                .source_connection_id = &.{0x44},
+            },
+            .datagram = &self.client_datagram,
+            .write_frames = &self.client_write_frames,
+            .plaintext = &self.client_plaintext,
+            .frames = &self.client_parsed,
+            .stream_events = &self.client_streams,
+            .recovery_events = &self.client_events,
+        });
+        self.server = .init(.{
+            .io = self.io,
+            .socket = self.server_socket,
+            .peer = null,
+            .conn = .{
+                .role = .server,
+                .loss = self.server_loss.value(),
+                .original_destination_connection_id = &self.dcid,
+                .destination_connection_id = &.{0x44},
+                .source_connection_id = &self.dcid,
+            },
+            .datagram = &self.server_datagram,
+            .write_frames = &self.server_write_frames,
+            .plaintext = &self.server_plaintext,
+            .frames = &self.server_parsed,
+            .stream_events = &self.server_streams,
+            .recovery_events = &self.server_events,
+        });
+    }
+
+    fn deinit(self: *Harness) void {
+        self.server_socket.close(self.io);
+        self.client_socket.close(self.io);
+        self.threaded.deinit();
+        self.* = undefined;
+    }
+
+    /// Seal one PING in an Initial at `out`, returning its length.
+    fn sealPing(self: *Harness, out: []u8) !u32 {
+        var payload: [8]u8 = undefined;
+        var writer: quic.Writer = .init(&payload);
+        try frame.write(&writer, .{ .ping = {} });
+        return self.client.conn.writeFrames(.initial, writer.written(), out, .data(0));
+    }
+};
+
 test "RFC 9001 §5.2, two sockets exchange an Initial and its acknowledgment" {
-    var threaded: Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const server_bound = try bindLoopback(io);
-    defer server_bound.socket.close(io);
-    const client_bound = try bindLoopback(io);
-    defer client_bound.socket.close(io);
-
-    const dcid = [_]u8{ 0x11, 0x22, 0x33 };
-    var client_loss: Loss = .{};
-    var server_loss: Loss = .{};
-
-    var client_datagram: [1200]u8 = undefined;
-    var client_frames: [64]u8 = undefined;
-    var client_plaintext: [1200]u8 = undefined;
-    var client_recovery: [8]Recovery.SentPacket = undefined;
-    var client_lost: [8]Recovery.SentPacket = undefined;
-    var client_events: Recovery.Events = .init(&client_recovery, &client_lost);
-    var client_parsed: [8]frame.Frame = undefined;
-    var client_streams: [8]Conn.StreamEvent = undefined;
-
-    var server_datagram: [1200]u8 = undefined;
-    var server_frames: [64]u8 = undefined;
-    var server_plaintext: [1200]u8 = undefined;
-    var server_recovery: [8]Recovery.SentPacket = undefined;
-    var server_lost: [8]Recovery.SentPacket = undefined;
-    var server_events: Recovery.Events = .init(&server_recovery, &server_lost);
-    var server_parsed: [8]frame.Frame = undefined;
-    var server_streams: [8]Conn.StreamEvent = undefined;
-
-    var client: Connection = .init(.{
-        .io = io,
-        .socket = client_bound.socket,
-        .peer = server_bound.address,
-        .conn = .{
-            .role = .client,
-            .loss = client_loss.value(),
-            .original_destination_connection_id = &dcid,
-            .destination_connection_id = &dcid,
-            .source_connection_id = &.{0x44},
-        },
-        .datagram = &client_datagram,
-        .write_frames = &client_frames,
-        .plaintext = &client_plaintext,
-        .frames = &client_parsed,
-        .stream_events = &client_streams,
-        .recovery_events = &client_events,
-    });
-    var server: Connection = .init(.{
-        .io = io,
-        .socket = server_bound.socket,
-        .peer = null,
-        .conn = .{
-            .role = .server,
-            .loss = server_loss.value(),
-            .original_destination_connection_id = &dcid,
-            .destination_connection_id = &.{0x44},
-            .source_connection_id = &dcid,
-        },
-        .datagram = &server_datagram,
-        .write_frames = &server_frames,
-        .plaintext = &server_plaintext,
-        .frames = &server_parsed,
-        .stream_events = &server_streams,
-        .recovery_events = &server_events,
-    });
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
 
     // The client seals a PING in an Initial and sends it with the socket, the
     // way an application would.
-    var payload: [8]u8 = undefined;
-    var writer: quic.Writer = .init(&payload);
-    try frame.write(&writer, .{ .ping = {} });
-    const sealed = try client.conn.writeFrames(.initial, writer.written(), &client_datagram, .data(0));
-    try client.socket.send(io, &server_bound.address, client_datagram[0..sealed]);
+    const sealed = try h.sealPing(&h.client_datagram);
+    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0..sealed]);
 
     // The server waits for it, then answers with the acknowledgment the machine
     // owes; `flush` is what turns that into a datagram.
-    const opened = (try server.receive(0, .none)) orelse return error.TestUnexpectedResult;
+    const opened = (try h.server.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(Conn.SpaceId.initial, opened.space);
     try testing.expectEqual(@as(usize, 1), opened.frames.len);
-    try testing.expectEqual(1, try server.flush(0));
+    try testing.expectEqual(1, try h.server.flush(0));
 
     // And the client learns its packet arrived.
-    _ = (try client.receive(0, .none)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), client_events.ackedPackets().len);
+    _ = (try h.client.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), h.client_events.ackedPackets().len);
+}
+
+test "RFC 9000 §12.2, a coalesced datagram yields every packet it carries" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+
+    // Two Initials, back to back in one datagram. A client's first flight does
+    // exactly this with Initial and Handshake, which is why the shell may not
+    // stop at the first packet it opens.
+    const first = try h.sealPing(h.client_datagram[0..]);
+    const second = try h.sealPing(h.client_datagram[first..]);
+    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0 .. first + second]);
+
+    const one = (try h.server.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
+    const two = (try h.server.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), one.frames.len);
+    try testing.expectEqual(@as(usize, 1), two.frames.len);
+    try testing.expectEqual(one.packet_number + 1, two.packet_number);
+    try testing.expectEqual(first + second, one.packet_len + two.packet_len);
+}
+
+test "RFC 9000 §9.3, a datagram from another address is not a migration" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+
+    const sealed = try h.sealPing(h.client_datagram[0..]);
+    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0..sealed]);
+    _ = (try h.server.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
+
+    // The same connection ID from a different port: the server has validated
+    // no path there, so the datagram is dropped rather than followed.
+    const stranger = try bindLoopback(h.io);
+    defer stranger.socket.close(h.io);
+    const second = try h.sealPing(h.client_datagram[0..]);
+    try stranger.socket.send(h.io, &h.server_address, h.client_datagram[0..second]);
+
+    const nothing = try h.server.receive(0, test_timeout);
+    try testing.expect(nothing == null);
+    try testing.expect(h.server.peer_settled);
+    try testing.expect(h.server.peer.eql(&h.client_address));
 }
