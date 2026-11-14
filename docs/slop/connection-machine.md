@@ -878,6 +878,30 @@ the field.
 
 ### Start here
 
+State on 2026-11-13, later the same day: the driver exists, and `quic-io` is
+the socket half over `std.Io`.
+
+**The transport-parameters decision is made** (Opus 5.5 review, 2026-11-13):
+`Conn` parses and adopts the peer's parameters itself, in `installSpaces`,
+before `installSecrets`. Not the caller: a value that sets flow control must
+come from the handshake, not from a second source of truth.
+- `Conn.PeerParameters` (public, read-only) holds what the peer's parameters
+  set: `max_data`, `stream_data`, `max_streams`, `max_ack_delay`,
+  `ack_delay_exponent`, `max_idle_timeout`, `max_udp_payload_size`,
+  `active_connection_id_limit`, `disable_active_migration`,
+  `stateless_reset_token`.
+- `Config` loses `send_limit`, `send_streams`, `peer_max_streams`, and
+  `max_ack_delay`; it gains `peer: ?PeerParameters` for the no-driver case, and
+  `init` asserts that a driver and caller-supplied parameters never coexist.
+- `installSecrets` refuses to install the 1-RTT space until the peer's
+  parameters are adopted (§8.2 of RFC 9001): no 1-RTT packet on guessed limits.
+- §7.3 identity checks live in `checkIdentity`: `initial_source_connection_id`
+  must echo what we address, a client checks `original_destination_connection_id`
+  and, after a Retry, `retry_source_connection_id`. Every failure is
+  `error.TransportParameter` (TRANSPORT_PARAMETER_ERROR, 0x08).
+- The peer's `ack_delay_exponent` is the one `ackDelay` must decode with
+  (§19.3), not ours; that was a latent bug.
+
 State on 2026-11-13, later the same day: the driver exists. `src/tls.zig` is the
 `quic-tls` module, built only under `-Dtls`, and `tests/tls_loopback.zig` runs a
 full handshake between two `Conn`s with real certificates from tls's own
