@@ -75,6 +75,8 @@ pub const Connection = struct {
         /// caller's; this is the buffer it is written into.
         datagram: []u8,
         /// Scratch the machine writes a packet's frames into before sealing.
+        /// An Initial datagram is padded to 1200 bytes (RFC 9000 §14.1) and the
+        /// padding lives here, so this must hold a whole Initial payload.
         write_frames: []u8,
         plaintext: []u8,
         frames: []frame.Frame,
@@ -241,7 +243,7 @@ const Harness = struct {
     client_loss: Loss = .{},
     server_loss: Loss = .{},
     client_datagram: [1200]u8 = undefined,
-    client_write_frames: [64]u8 = undefined,
+    client_write_frames: [1500]u8 = undefined,
     client_plaintext: [1200]u8 = undefined,
     client_recovery: [8]Recovery.SentPacket = undefined,
     client_lost: [8]Recovery.SentPacket = undefined,
@@ -249,7 +251,7 @@ const Harness = struct {
     client_parsed: [8]frame.Frame = undefined,
     client_streams: [8]Conn.StreamEvent = undefined,
     server_datagram: [1200]u8 = undefined,
-    server_write_frames: [64]u8 = undefined,
+    server_write_frames: [1500]u8 = undefined,
     server_plaintext: [1200]u8 = undefined,
     server_recovery: [8]Recovery.SentPacket = undefined,
     server_lost: [8]Recovery.SentPacket = undefined,

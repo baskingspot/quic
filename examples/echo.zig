@@ -196,7 +196,9 @@ pub fn main(init: std.process.Init) !void {
     client_config.max_streams_bidi = 1;
     client.start(client_config);
     var wire: [1500]u8 = undefined;
-    var frames: [512]u8 = undefined;
+    // §14.1: an Initial datagram is padded to 1200 bytes, and the padding is
+    // written into this scratch.
+    var frames: [1500]u8 = undefined;
 
     // The client's handshake flight.
     const flight = (try client.conn.writeHandshake(&frames, &wire, now(io))) orelse

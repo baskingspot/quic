@@ -290,6 +290,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- An Initial datagram is expanded to 1200 bytes (RFC 9000 §14.1), because a
+  server drops a smaller one without answering. The padding is written into the
+  `frames` scratch that `writeHandshake` takes, so that buffer must now hold a
+  whole Initial payload; a scratch sized only for the frames fails with
+  `error.NoSpace`.
+
 - `Conn` parses and adopts the peer's transport parameters from the handshake
   itself, so `Config.send_limit`, `Config.send_streams`,
   `Config.peer_max_streams`, and `Config.max_ack_delay` are gone: delete them

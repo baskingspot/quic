@@ -352,6 +352,23 @@ pub const LongOffsets = struct {
     packet_number: u32,
 };
 
+/// How many bytes `writeLong` writes for `header`, without writing them.
+///
+/// The Length field is a varint, so this changes when `body_len` does: a caller
+/// that is choosing a payload size has to ask twice, once for the size it wants
+/// and once to confirm the field did not widen.
+pub fn longHeaderLen(header: LongToWrite) u32 {
+    var length: u32 = 1 + 4; // first byte, then the version
+    length += 1 + @as(u32, @intCast(header.destination_connection_id.len));
+    length += 1 + @as(u32, @intCast(header.source_connection_id.len));
+    if (header.kind == .initial) {
+        length += @as(u32, @intCast(varint.size(@intCast(header.token.len))));
+        length += @as(u32, @intCast(header.token.len));
+    }
+    length += @as(u32, @intCast(varint.size(@intCast(header.body_len))));
+    return length;
+}
+
 /// Write an Initial, 0-RTT, or Handshake header.
 ///
 /// The Length field counts `body_len`, so the caller sizes the payload before

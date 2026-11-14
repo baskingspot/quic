@@ -1575,6 +1575,47 @@ fn ownParametersAgree(self: *const Conn) bool {
 ///
 /// `now` dates the packet: handshake bytes are ack-eliciting and in flight like
 /// any other (§6.1 of RFC 9002).
+/// §14.1 of RFC 9000: the smallest datagram size a server accepts. A datagram
+/// that carries an Initial is expanded to this many bytes, because a server
+/// that receives a smaller one drops it without a word.
+pub const min_initial_datagram: u32 = 1200;
+
+/// The payload length that brings an Initial datagram to `min_initial_datagram`
+/// with these frames already written.
+///
+/// The Length field is a varint, so the header grows when the payload crosses
+/// 63, 16383, or 2^30 - 1: the size is found by correction rather than in one
+/// step. Grow to the target, then give back whatever a wider field cost, which
+/// settles in two passes. A payload that overshoots is legal under §14.1 — the
+/// rule is a floor — so a loop that never settles leaves the overshoot alone.
+fn paddedInitialPayload(self: *Conn, written: u32) Error!u32 {
+    const pn_len = self.packet_number_len;
+    var payload = written;
+    var attempt: u8 = 0;
+    while (attempt < 4) : (attempt += 1) {
+        const body_len = @as(u32, pn_len) + payload + protection.tag_length;
+        const header: packet.LongToWrite = .{
+            .kind = .initial,
+            .destination_connection_id = self.destination_connection_id,
+            .source_connection_id = self.source_connection_id,
+            .token = self.token,
+            .packet_number_len = pn_len,
+            .body_len = body_len,
+        };
+        const total = packet.longHeaderLen(header) + body_len;
+        if (total == min_initial_datagram) return payload;
+        if (total > min_initial_datagram) {
+            const excess = total - min_initial_datagram;
+            if (excess > payload - written) return payload;
+            payload -= excess;
+            continue;
+        }
+        payload += min_initial_datagram - total;
+    }
+    std.debug.assert(payload <= std.math.maxInt(u32));
+    return payload;
+}
+
 pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8, now: Duration) Error!?u32 {
     // Before the driver is asked: a message taken from it cannot be given back.
     try self.installSpaces();
@@ -1603,7 +1644,21 @@ pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8, now: Duration) Error
     var writer: Writer = .init(frames);
     try frame.write(&writer, .{ .crypto = .{ .offset = offset, .data = message.bytes } });
 
-    const total = try self.writeFrames(id, writer.written(), out, .data(now));
+    // §14.1: a datagram carrying an Initial reaches 1200 bytes, and a server
+    // drops one that does not. PADDING frames are single zero bytes (§19.1), so
+    // the expansion is the tail of the caller's scratch buffer, and a scratch
+    // too small for it is `error.NoSpace` like any other short buffer.
+    var payload = writer.written();
+    if (id == .initial) {
+        const padded = try self.paddedInitialPayload(@intCast(payload.len));
+        if (padded > payload.len) {
+            if (padded > frames.len) return error.NoSpace;
+            @memset(frames[payload.len..padded], 0);
+            payload = frames[0..padded];
+        }
+    }
+
+    const total = try self.writeFrames(id, payload, out, .data(now));
 
     // After the seal: a frame that never left must not be replayed as though it
     // had, or the peer would see the same offset twice with different data the
@@ -2982,7 +3037,7 @@ test "RFC 9000 §6.2, a version negotiation counts only before the server has sp
     var report: Recovery.Events = .init(&acked, &lost);
     var stream_events: [16]StreamEvent = undefined;
     var datagram: [256]u8 = undefined;
-    var plaintext: [256]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     const sent = try server.writeFrames(.initial, &pings(1), &datagram, .data(0));
     _ = try answered.feed(datagram[0..sent], &plaintext, &frames, &stream_events, &report, 0);
@@ -3052,8 +3107,8 @@ test "RFC 9000 §13.3, sent CRYPTO bytes are kept and the replay is idempotent" 
         .crypto_sent = .{ .initial = &sent_initial, .handshake = &sent_handshake },
     });
 
-    var frames: [128]u8 = undefined;
-    var datagram: [512]u8 = undefined;
+    var frames: [1400]u8 = undefined;
+    var datagram: [1400]u8 = undefined;
     _ = (try client.writeHandshake(&frames, &datagram, 0)) orelse return error.TestUnexpectedResult;
 
     // §13.3: the bytes are kept where they went out, from offset zero, because
@@ -3072,6 +3127,75 @@ test "RFC 9000 §13.3, sent CRYPTO bytes are kept and the replay is idempotent" 
     try testing.expectEqualStrings(finished, client.replayCrypto(.handshake));
     try testing.expect(client.initial == null);
     try testing.expectEqual(@as(usize, 0), client.replayCrypto(.initial).len);
+}
+
+test "RFC 9000 §14.1, an Initial datagram is expanded to 1200 bytes" {
+    const dcid = [_]u8{ 0x95, 0x96 };
+    const hello = "ClientHello bytes";
+    const client_secret: [protection.secret_length]u8 = @splat(0x71);
+    const server_secret: [protection.secret_length]u8 = @splat(0x72);
+    var stub: seam.Stub = .{
+        .outbox = &.{
+            .{ .level = .initial, .bytes = hello },
+            .{ .level = .handshake, .bytes = "Finished" },
+        },
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+    };
+    var sent_initial: [64]u8 = undefined;
+    var sent_handshake: [64]u8 = undefined;
+    var loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x97},
+        .tls = stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &.{0x97}),
+        .crypto_sent = .{ .initial = &sent_initial, .handshake = &sent_handshake },
+    });
+
+    var frames: [1400]u8 = undefined;
+    var datagram: [1400]u8 = undefined;
+    const initial = (try client.writeHandshake(&frames, &datagram, 0)) orelse
+        return error.TestUnexpectedResult;
+    // A server drops an Initial datagram smaller than this without answering,
+    // so the size is the packet's, not the message's.
+    try testing.expectEqual(min_initial_datagram, initial);
+
+    // A Handshake packet is not padded: §14.1 names the Initial alone.
+    const handshake = (try client.writeHandshake(&frames, &datagram, 0)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(handshake < min_initial_datagram);
+}
+
+test "RFC 9000 §14.1, a scratch buffer too small for the padding is NoSpace" {
+    const dcid = [_]u8{0x99};
+    const client_secret: [protection.secret_length]u8 = @splat(0x73);
+    const server_secret: [protection.secret_length]u8 = @splat(0x74);
+    var stub: seam.Stub = .{
+        .outbox = &.{.{ .level = .initial, .bytes = "ClientHello" }},
+        .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
+    };
+    var sent_initial: [64]u8 = undefined;
+    var sent_handshake: [64]u8 = undefined;
+    var loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0x9a},
+        .tls = stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &.{0x9a}),
+        .crypto_sent = .{ .initial = &sent_initial, .handshake = &sent_handshake },
+    });
+
+    // The padding lives in the frames scratch, so a scratch sized for the
+    // frames alone is short by the whole expansion.
+    var frames: [64]u8 = undefined;
+    var datagram: [1400]u8 = undefined;
+    try testing.expectError(error.NoSpace, client.writeHandshake(&frames, &datagram, 0));
 }
 
 test "RFC 9000 §20.1, a CRYPTO send buffer too small refuses the message" {
@@ -3165,8 +3289,8 @@ test "RFC 9000 §17.2.5.3, a Retry rekeys the Initial space and keeps its packet
         .retry_storage = &retry_storage,
     });
 
-    var frames: [128]u8 = undefined;
-    var datagram: [512]u8 = undefined;
+    var frames: [1400]u8 = undefined;
+    var datagram: [1400]u8 = undefined;
     _ = (try client.writeHandshake(&frames, &datagram, 0)) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u64, 1), client.initial.?.next_packet_number);
 
@@ -3226,7 +3350,7 @@ test "RFC 9000 §17.2.5.3, a Retry rekeys the Initial space and keeps its packet
     var lost: [16]Recovery.SentPacket = undefined;
     var report: Recovery.Events = .init(&acked, &lost);
     var stream_events: [16]StreamEvent = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames_in: [8]frame.Frame = undefined;
     const opened = try server.feed(datagram[0..resent], &plaintext, &frames_in, &stream_events, &report, 0);
     try testing.expectEqual(.initial, opened.space);
@@ -3260,7 +3384,7 @@ test "RFC 9000 §17.2.5.2, a Retry that is not ours, or is late, is ignored" {
 
     var retry_bytes: [256]u8 = undefined;
     var datagram: [256]u8 = undefined;
-    var plaintext: [256]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
 
     // A Retry that names some other connection: discarded before its tag is even
@@ -3337,7 +3461,7 @@ test "RFC 9000 §4.6, a finished stream returns its credit as MAX_STREAMS" {
     var report: Recovery.Events = .init(&acked, &lost);
     var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var payload: [64]u8 = undefined;
     var owed: [4]frame.Frame = undefined;
@@ -3644,7 +3768,7 @@ test "RFC 9000 §19.8, a packed packet reports its number and the frames it carr
     var written: [2]Written = undefined;
     var frame_bytes: [256]u8 = undefined;
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var parsed: [8]frame.Frame = undefined;
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
@@ -3874,7 +3998,7 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     });
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
 
     // Nothing has arrived yet, so there is nothing to acknowledge.
     try testing.expectError(error.NothingToAcknowledge, server.writeAck(.initial, &datagram, 0));
@@ -3951,7 +4075,7 @@ test "RFC 9000 §7.2, a server is built from the datagram that called it" {
     // The proof that the pairing is right: the Initial opens under the keys the
     // client's name seeded. Any other connection ID here is a packet that will
     // not decrypt.
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     const at_server = try server.feed(
         datagram[0..sent],
@@ -4025,7 +4149,7 @@ test "RFC 9000 §13.2.1, the acknowledgment summary lists the spaces in order" {
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
 
     // One Initial and one 1-RTT packet arrive, each with a PING.
@@ -4092,7 +4216,7 @@ test "RFC 9000 §7.2, a client adopts the name the server's first Initial gives"
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     const payload = pings(1);
 
@@ -4180,7 +4304,7 @@ test "RFC 9000 §12.3, a Handshake packet opens in the handshake space" {
     installHandshake(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
 
     const payload = pings(3);
     var frames: [8]frame.Frame = undefined;
@@ -4240,7 +4364,7 @@ test "RFC 9000 §12.3, a space with no keys is an error and not a second kind of
     installHandshake(&client, &client, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     const payload = pings(3);
     var frames: [8]frame.Frame = undefined;
     const sent = try client.writeFrames(.handshake, &payload, &datagram, .data(0));
@@ -4322,7 +4446,7 @@ test "RFC 9000 §17.2.2.1, a packet for a discarded space is dropped and the con
     installHandshake(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     const payload = pings(3);
 
@@ -4413,7 +4537,7 @@ test "RFC 9000 §17.3.1, the application space writes a short header and opens o
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
     const payload = pings(2);
 
@@ -4551,9 +4675,9 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
         .crypto = .{ .initial = &initial_crypto, .handshake = &handshake_crypto },
     });
 
-    var datagram: [512]u8 = undefined;
-    var payload: [256]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var datagram: [1400]u8 = undefined;
+    var payload: [1400]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
     // The ClientHello leaves in an Initial packet, and the driver had this
@@ -4984,7 +5108,7 @@ test "RFC 9000 §19.20, only a server sends HANDSHAKE_DONE" {
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var payload: [16]u8 = undefined;
     var writer: Writer = .init(&payload);
@@ -5028,8 +5152,8 @@ test "RFC 9000 §20.1, a driver failure carries the CRYPTO_ERROR to close with" 
         .transport_parameters = identityParameters(.client, &dcid, &.{0x8a}),
     });
 
-    var datagram: [512]u8 = undefined;
-    var frames: [256]u8 = undefined;
+    var datagram: [1400]u8 = undefined;
+    var frames: [1400]u8 = undefined;
     // The alert is one error, and the code the caller closes with is the
     // CRYPTO_ERROR value the driver named, not a table of alerts here.
     try testing.expectError(error.HandshakeFailed, client.writeHandshake(&frames, &datagram, 0));
@@ -5127,8 +5251,8 @@ test "an endpoint with no driver has no handshake to write" {
         .source_connection_id = &.{0xaa},
     });
 
-    var datagram: [512]u8 = undefined;
-    var frames: [256]u8 = undefined;
+    var datagram: [1400]u8 = undefined;
+    var frames: [1400]u8 = undefined;
     try conn.installSpaces();
     try testing.expect((try conn.writeHandshake(&frames, &datagram, 0)) == null);
 }
@@ -5168,7 +5292,7 @@ test "RFC 9000 §19.6, CRYPTO frames that arrive out of order reach the driver i
     });
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var payload: [64]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
@@ -5213,7 +5337,7 @@ test "RFC 9000 §12.4, a frame that will not parse is an error and not a dropped
     });
 
     var datagram: [256]u8 = undefined;
-    var plaintext: [256]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
     // 0x3f is a one-byte frame type the registry does not define.
     const bad = [_]u8{0x3f};
@@ -5401,7 +5525,7 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var payload: [64]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
@@ -5477,7 +5601,7 @@ test "RFC 9000 §3.2, a packet reports the streams it made readable" {
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var payload: [128]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var writer: Writer = .init(&payload);
@@ -5629,7 +5753,7 @@ test "RFC 9000 §19.4, a reset ends the receive half and the application reads t
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var payload: [64]u8 = undefined;
     var writer: Writer = .init(&payload);
@@ -5778,7 +5902,7 @@ test "RFC 9000 §19.5, stop sending resets the sending half and owes a reset" {
     try testing.expectEqual(SendStream.State.ready, own.send.state);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var payload: [64]u8 = undefined;
     var writer: Writer = .init(&payload);
@@ -5893,7 +6017,7 @@ test "RFC 9000 §19.11, the peer's MAX_STREAMS is the credit to open" {
     try testing.expectError(error.NoStreamCredit, client.openStream(2));
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var payload: [64]u8 = undefined;
     var writer: Writer = .init(&payload);
@@ -5984,7 +6108,7 @@ test "RFC 9000 §19.9, a peer's MAX_DATA raises the connection allowance" {
     try testing.expectEqual(@as(u64, 64), server.send_window.available());
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var payload: [64]u8 = undefined;
     var writer: Writer = .init(&payload);
@@ -6057,7 +6181,7 @@ test "RFC 9000 §19.10, a peer's credit reaches the stream it names" {
     try testing.expectEqual(@as(u64, 10), own.send.limit);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var payload: [64]u8 = undefined;
     var writer: Writer = .init(&payload);
@@ -6163,7 +6287,7 @@ test "RFC 9000 §3.3, a frame for a stream this endpoint closed is ignored" {
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var payload: [64]u8 = undefined;
 
@@ -6311,7 +6435,7 @@ test "RFC 9000 §4.2, reading a ring is what makes a window raise due" {
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var payload: [128]u8 = undefined;
     var events: [8]frame.Frame = undefined;
     var owed: [4]frame.Frame = undefined;
@@ -6397,7 +6521,7 @@ test "RFC 9000 §4.6, a full stream table is peer-visible and not a dropped pack
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var payload: [64]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
@@ -6459,7 +6583,7 @@ test "RFC 9000 §4.1, a peer past the stream limit is a connection error" {
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var payload: [64]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
@@ -6523,7 +6647,7 @@ test "RFC 9000 §4.1, a peer past the connection limit is a connection error" {
     installApp(&client, &server, client_secret, server_secret);
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var payload: [64]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
@@ -6586,7 +6710,7 @@ test "RFC 9000 §12.4, a STREAM frame in an Initial packet is a connection error
     });
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var payload: [64]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
@@ -6665,7 +6789,7 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
     try entry.send.finish();
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var payload: [64]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
@@ -6740,7 +6864,7 @@ test "RFC 9000 §12.2, a server flight of Initial and Handshake in one datagram"
     const handshake_len = try server.writeFrames(.handshake, &handshake_payload, flight[initial_len..], .data(0));
     var datagram: Datagram = .init(flight[0 .. initial_len + handshake_len]);
 
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
     const first = (try datagram.next(&client, &plaintext, &events, &stream_events, &report, 0)) orelse
@@ -6832,7 +6956,7 @@ test "RFC 9001 §4.1.1, a coalesced 1-RTT packet opens once the Finished is fed"
     const app_len = try client.writeFrames(.app, &pings(1), flight[handshake_len..], .data(0));
 
     var datagram: Datagram = .init(flight[0 .. handshake_len + app_len]);
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
 
     const finished = (try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) orelse
@@ -6888,7 +7012,7 @@ test "RFC 9001 §5.5, a packet that will not unprotect is dropped and the next i
     // this to any datagram, so it must cost exactly one packet.
     datagram.bytes[initial_len - 8] ^= 0x01;
 
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
     const opened = (try datagram.next(&client, &plaintext, &events, &stream_events, &report, 0)) orelse
         return error.TestUnexpectedResult;
@@ -6935,7 +7059,7 @@ test "RFC 9000 §12.2, a short header ends the datagram and nothing is read past
     const app_len = try client.writeFrames(.app, &pings(3), flight[initial_len..], .data(0));
     var datagram: Datagram = .init(flight[0 .. initial_len + app_len]);
 
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
     const initial = (try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) orelse
         return error.TestUnexpectedResult;
@@ -6982,7 +7106,7 @@ test "RFC 9000 §12.2, bytes with no readable end stop the walk without an error
     @memcpy(flight[initial_len..][0..junk.len], &junk);
     var datagram: Datagram = .init(flight[0 .. initial_len + junk.len]);
 
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
     const opened = (try datagram.next(&server, &plaintext, &events, &stream_events, &report, 0)) orelse
         return error.TestUnexpectedResult;
@@ -7014,7 +7138,7 @@ test "RFC 9000 §12.2, coalesced packets: only the first is taken, the length sa
         .source_connection_id = &.{ 7, 7 },
     });
 
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
     var combined: [1024]u8 = undefined;
     const first = try client.writeFrames(.initial, &pings(2), &combined, .data(0));
@@ -7054,7 +7178,7 @@ test "RFC 9001 §5.5, a packet that will not unprotect changes nothing" {
     });
 
     var datagram: [256]u8 = undefined;
-    var plaintext: [256]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var events: [8]frame.Frame = undefined;
     const sent = try client.writeFrames(.initial, &pings(4), &datagram, .data(0));
 
@@ -7220,7 +7344,7 @@ test "RFC 9002 §6.1.1, an acknowledgment is what declares the gap lost" {
     });
 
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     const ms = Recovery.ms;
 
@@ -7363,7 +7487,7 @@ test "RFC 9000 §19.3.1, an acknowledgment of a packet never sent is a connectio
     var report: Recovery.Events = .init(&acked, &lost);
     var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
 
     // The client sends one packet. The server claims to have received packet 6,
@@ -7452,7 +7576,7 @@ test "RFC 9000 §19.3, a received ACK delay is scaled by the peer's exponent, no
     var report: Recovery.Events = .init(&acked, &lost);
     var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var payload: [64]u8 = undefined;
     var writer: Writer = .init(&payload);
@@ -7518,7 +7642,7 @@ test "RFC 9000 §10.2.1, a close is written once and nothing is processed after 
     var report: Recovery.Events = .init(&acked, &lost);
     var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var scratch: [64]u8 = undefined;
 
@@ -7624,7 +7748,7 @@ test "RFC 9000 §19.19, an application close carries the application's code" {
     var report: Recovery.Events = .init(&acked, &lost);
     var stream_events: [16]StreamEvent = undefined;
     var datagram: [512]u8 = undefined;
-    var plaintext: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
     var frames: [8]frame.Frame = undefined;
     var scratch: [64]u8 = undefined;
 
