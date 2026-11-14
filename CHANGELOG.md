@@ -7,6 +7,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- A server sends HANDSHAKE_DONE (`Conn.writeConfirmation`, and `quic-io`'s
+  `flush` calls it) once its handshake is confirmed, so a client such as quiche
+  or ngtcp2 learns it too (RFC 9000 §13.3). Known limit: a lost HANDSHAKE_DONE
+  is not retransmitted, because the machine has no general queue of frames to
+  resend yet.
 - `examples/hq_server.zig` and `examples/hq_client.zig`: an hq-interop server
   and client that carry one `GET` and its response over a real TLS 1.3
   handshake on loopback UDP. `just interop-hq` builds both (`zig build hq-bin

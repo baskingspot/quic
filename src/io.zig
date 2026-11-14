@@ -280,8 +280,13 @@ pub const Connection = struct {
         return opened;
     }
 
-    /// Send everything the machine owes right now: handshake messages, then an
+    /// Send everything the machine owes right now: handshake messages, a
+    /// server's HANDSHAKE_DONE once its handshake is confirmed, then an
     /// acknowledgment in each space that has one pending.
+    ///
+    /// HANDSHAKE_DONE goes before the acks because the client is waiting on it
+    /// (§13.3 of RFC 9000) and an ack-only packet is neither urgent nor
+    /// ack-eliciting. It is not retransmitted if lost; see `writeConfirmation`.
     ///
     /// Returns how many datagrams went out. `error.NoSpace` from the machine
     /// means the CRYPTO buffer is full, which is fatal by design; a socket that
@@ -292,6 +297,10 @@ pub const Connection = struct {
         if (self.state != .open) return error.NotOpen;
         var sent: usize = 0;
         while (try self.conn.writeHandshake(self.write_frames, self.datagram, now)) |length| {
+            try self.socket.send(self.io, &self.peer, self.datagram[0..length]);
+            sent += 1;
+        }
+        if (try self.conn.writeConfirmation(self.datagram, now)) |length| {
             try self.socket.send(self.io, &self.peer, self.datagram[0..length]);
             sent += 1;
         }

@@ -722,6 +722,9 @@ named: bool = false,
 /// frame arrives, which is the machine's fact alone. A server's is confirmed
 /// when its TLS handshake completes, which is the driver's.
 handshake_done: bool = false,
+/// §19.20: a server has sent its HANDSHAKE_DONE frame. It goes out once; see
+/// `writeConfirmation` for why a lost one is not sent again.
+confirmation_sent: bool = false,
 /// §6.2 and §17.2.5.2: the client's memory of what the server has said, which
 /// is what decides whether a Version Negotiation or a Retry still counts. Absent
 /// on a server, which never has to remember either.
@@ -2868,6 +2871,39 @@ pub fn writeAck(self: *Conn, id: SpaceId, out: []u8, now: Duration) Error!u32 {
     // ack-eliciting nor in flight, so nothing will ever report it lost.
     const total = try self.writeFrames(id, bytes, out, .{ .now = now, .ack_eliciting = false, .in_flight = false });
     space.acked_through = space.largest_received;
+    return total;
+}
+
+/// Seal the packet that tells the client its handshake is confirmed: one
+/// 1-RTT packet carrying HANDSHAKE_DONE (§19.20), or null when none is owed.
+///
+/// §4.1.2 of RFC 9001 has the server send it as soon as its handshake is
+/// confirmed, and §13.3 of RFC 9000 has the client wait for it, so a client
+/// never learns otherwise. It is owed once: to a server, in the 1-RTT space,
+/// after `handshakeConfirmed`, and not yet sent. A client never sends it, and
+/// neither does a closing or draining endpoint (§10.2).
+///
+/// KNOWN LIMIT, for the reader and the next session: a lost HANDSHAKE_DONE is
+/// not retransmitted. §13.3 says to resend its frame in a new packet, but this
+/// machine keeps no queue of control frames to resend (only CRYPTO bytes, in
+/// `crypto_sent`, and stream data), so a loss report for this packet is
+/// dropped like any other frame's. A client that never receives it stays
+/// unconfirmed. Fixing that needs the general retransmission queue first.
+///
+/// The packet is ack-eliciting and in flight, so loss recovery times it and
+/// the peer acknowledges it. `confirmation_sent` is set only after the seal
+/// succeeds, so a full sent table or a short buffer leaves the frame owed.
+pub fn writeConfirmation(self: *Conn, out: []u8, now: Duration) Error!?u32 {
+    if (self.state != .open) return null;
+    if (self.role != .server or self.confirmation_sent) return null;
+    if (self.app == null or !self.handshakeConfirmed()) return null;
+
+    var payload: [1]u8 = undefined;
+    var writer: Writer = .init(&payload);
+    try frame.write(&writer, .{ .handshake_done = {} });
+
+    const total = try self.writeFrames(.app, writer.written(), out, .data(now));
+    self.confirmation_sent = true;
     return total;
 }
 
@@ -5078,6 +5114,130 @@ test "RFC 9000 §18.2, the parameters this endpoint sends must agree with its co
         .initial_max_data = 4096,
     });
     try testing.expect(ownParametersAgree(&conn));
+}
+
+test "RFC 9000 §13.3, a server sends HANDSHAKE_DONE once its handshake is confirmed" {
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var stream_events: [16]StreamEvent = undefined;
+    const dcid = [_]u8{ 0xa1, 0xa2 };
+    var stub: seam.Stub = .{};
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xa3},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0xa3},
+        .source_connection_id = &dcid,
+        .tls = stub.driver(),
+    });
+    installApp(&client, &server, @splat(0xa4), @splat(0xa5));
+
+    var datagram: [512]u8 = undefined;
+    var plaintext: [1400]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+
+    // The driver completes the handshake: the server is confirmed, and owes the
+    // client the frame that says so.
+    stub.confirmed = true;
+    try testing.expect(server.handshakeConfirmed());
+    const sent = (try server.writeConfirmation(&datagram, 0)) orelse return error.TestUnexpectedResult;
+
+    // The client reads it as HANDSHAKE_DONE, which is what confirms its side.
+    try testing.expect(!client.handshakeConfirmed());
+    const opened = try client.feed(datagram[0..sent], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expectEqual(@as(usize, 0), opened.frames.len);
+    try testing.expect(client.handshakeConfirmed());
+
+    // §7.1 of RFC 9002: the packet is ack-eliciting and counted in flight.
+    try testing.expectEqual(@as(u64, 1), server.app.?.next_packet_number);
+    const in_flight = server.app.?.recovery.inFlight();
+    try testing.expectEqual(@as(usize, 1), in_flight.len);
+    try testing.expect(in_flight[0].ack_eliciting and in_flight[0].in_flight);
+
+    // It goes out once.
+    try testing.expectEqual(@as(?u32, null), try server.writeConfirmation(&datagram, 0));
+    try testing.expectEqual(@as(u64, 1), server.app.?.next_packet_number);
+}
+
+test "RFC 9000 §13.3, a client never sends HANDSHAKE_DONE" {
+    const dcid = [_]u8{ 0xa6, 0xa7 };
+    var stub: seam.Stub = .{ .confirmed = true };
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xa8},
+        .tls = stub.driver(),
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0xa8},
+        .source_connection_id = &dcid,
+    });
+    installApp(&client, &server, @splat(0xa9), @splat(0xaa));
+
+    // Even confirmed (a received HANDSHAKE_DONE) with 1-RTT keys, the frame is
+    // the server's to send.
+    client.handshake_done = true;
+    try testing.expect(client.handshakeConfirmed());
+    var datagram: [512]u8 = undefined;
+    try testing.expectEqual(@as(?u32, null), try client.writeConfirmation(&datagram, 0));
+    try testing.expectEqual(@as(u64, 0), client.app.?.next_packet_number);
+}
+
+test "RFC 9000 §13.3, HANDSHAKE_DONE is not sent before confirmation" {
+    const dcid = [_]u8{ 0xab, 0xac };
+    var stub: seam.Stub = .{};
+
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xad},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0xad},
+        .source_connection_id = &dcid,
+        .tls = stub.driver(),
+    });
+
+    // No 1-RTT keys yet, confirmed or not: nothing to seal it in.
+    var datagram: [512]u8 = undefined;
+    stub.confirmed = true;
+    try testing.expectEqual(@as(?u32, null), try server.writeConfirmation(&datagram, 0));
+
+    // Keys, but the handshake is not complete: still nothing owed.
+    installApp(&client, &server, @splat(0xae), @splat(0xaf));
+    stub.confirmed = false;
+    try testing.expectEqual(@as(?u32, null), try server.writeConfirmation(&datagram, 0));
+    try testing.expectEqual(@as(u64, 0), server.app.?.next_packet_number);
+
+    // Confirmation after the first call is not lost to it having been asked.
+    stub.confirmed = true;
+    try testing.expect((try server.writeConfirmation(&datagram, 0)) != null);
 }
 
 test "RFC 9000 §19.20, only a server sends HANDSHAKE_DONE" {
