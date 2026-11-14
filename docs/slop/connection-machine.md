@@ -879,7 +879,27 @@ the field.
 ### Start here
 
 State on 2026-11-13, later the same day: the driver exists, and `quic-io` is
-the socket half over `std.Io`.
+the socket half over `std.Io`. Two wire rules landed with it:
+
+- `quic-io.receive` walks the whole datagram with `Conn.Datagram`, one packet
+  per call, waiting only when the previous datagram is used up. `Conn.feed` was
+  wrong there: it opens the first packet and stops, and a client's first flight
+  is Initial and Handshake in one datagram (§12.2).
+- `quic-io` keeps the address it learned from the first datagram and drops a
+  datagram from anywhere else. A migration is legal only after path validation
+  (§9.3), which this layer does not do, so a NAT that rebinds a port stops the
+  connection instead of silently following it.
+- `Conn.writeHandshake` expands an Initial datagram to 1200 bytes (§14.1). The
+  Length field is a varint, so the padding cannot be computed in one step: the
+  header widens when the payload crosses 63 bytes, and the size is found by
+  growing to the target and giving back what the wider field cost. The padding
+  lives in the caller's `frames` scratch, so that buffer must hold a whole
+  Initial payload.
+
+Still open on the wire: a *server's* ack-eliciting Initial datagram is not
+expanded. §14.1 asks for it in both directions, and clients do not enforce it,
+so it is not blocking a foreign client — but it belongs with `writeAck`, not
+with `writeHandshake`, and it is not done.
 
 **The transport-parameters decision is made** (Opus 5.5 review, 2026-11-13):
 `Conn` parses and adopts the peer's parameters itself, in `installSpaces`,
