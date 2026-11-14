@@ -55,6 +55,46 @@ interop:
         wait "$pid" || exit 1
     done
 
+[doc("A real TLS 1.3 handshake over loopback UDP: an hq-interop server and client in this repo exchange one GET and its response, and the recipe fails unless the client printed the body")]
+[group("test")]
+interop-hq:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    zig build hq-bin -Dtls || exit 1
+    expected="hello from baskingspot/quic"
+    server=""
+    trap '[ -n "$server" ] && kill "$server" 2>/dev/null' EXIT
+    # A port may be taken, and the server then exits on its own: try a few.
+    for attempt in 1 2 3 4 5; do
+        port=$(( 40000 + RANDOM % 20000 ))
+        ./zig-out/bin/hq_server tests/fixtures/server.crt tests/fixtures/server.key "$port" &
+        server=$!
+        sleep 0.3
+        kill -0 "$server" 2>/dev/null && break
+        server=""
+    done
+    if [ -z "$server" ]; then
+        echo "interop-hq: FAIL the server would not stay up on any port" >&2
+        exit 1
+    fi
+    body=$(./zig-out/bin/hq_client "$port" /index.html) || {
+        echo "interop-hq: FAIL the client exited non-zero" >&2
+        exit 1
+    }
+    echo "$body"
+    if [ "$body" != "$expected" ]; then
+        echo "interop-hq: FAIL expected '$expected'" >&2
+        exit 1
+    fi
+    # The server exits by itself once it has answered, so its status counts too.
+    wait "$server" || {
+        server=""
+        echo "interop-hq: FAIL the server exited non-zero" >&2
+        exit 1
+    }
+    server=""
+    echo "interop-hq: ok"
+
 [doc("Lint Zig, Nix, Markdown, the workflows, and this justfile: ziglint, zig fmt, nix fmt, oxfmt, actionlint, zizmor, and just --fmt")]
 [group("lint")]
 lint:

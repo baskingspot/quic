@@ -46,6 +46,18 @@ pub fn build(b: *std.Build) void {
     const run_vector_tests = b.addRunArtifact(vector_tests);
     test_step.dependOn(&run_vector_tests.step);
 
+    // The I/O shell over `std.Io`: a socket, a receive that waits, and a flush
+    // that sends what the machine owes. Separate from `quic` so a caller that
+    // never opens a socket never compiles std.Io.
+    const io_mod = b.addModule("quic-io", .{
+        .root_source_file = b.path("src/io.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "quic", .module = mod }},
+    });
+    const io_tests = b.addTest(.{ .root_module = io_mod });
+    test_step.dependOn(&b.addRunArtifact(io_tests).step);
+
     // What the seam asks of a TLS driver, checked against the package that has
     // to provide it. These tests exist to fail when baskingspot/tls closes a
     // gap: each one pins a place the two packages do not meet today, so the
@@ -101,19 +113,27 @@ pub fn build(b: *std.Build) void {
         });
         const loopback_tests = b.addTest(.{ .root_module = loopback_mod });
         test_step.dependOn(&b.addRunArtifact(loopback_tests).step);
-    }
 
-    // The I/O shell over `std.Io`: a socket, a receive that waits, and a flush
-    // that sends what the machine owes. Separate from `quic` so a caller that
-    // never opens a socket never compiles std.Io.
-    const io_mod = b.addModule("quic-io", .{
-        .root_source_file = b.path("src/io.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "quic", .module = mod }},
-    });
-    const io_tests = b.addTest(.{ .root_module = io_mod });
-    test_step.dependOn(&b.addRunArtifact(io_tests).step);
+        // The hq-interop pair: a real handshake over loopback UDP carrying one
+        // GET and its response. Both share `examples/hq.zig`, which is a file
+        // beside them rather than a module, so each executable owns its copy.
+        const install_hq_step = b.step("hq-bin", "Build the hq-interop server and client examples");
+        for ([_][]const u8{ "hq_server", "hq_client" }) |name| {
+            const hq_mod = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "quic", .module = mod },
+                    .{ .name = "quic-io", .module = io_mod },
+                    .{ .name = "quic-tls", .module = driver_mod },
+                    .{ .name = "tls", .module = dependency.module("tls") },
+                },
+            });
+            const hq_exe = b.addExecutable(.{ .name = name, .root_module = hq_mod });
+            install_hq_step.dependOn(&b.addInstallArtifact(hq_exe, .{}).step);
+        }
+    }
 
     // The echo example: the machine called the way an application would. It is
     // an executable rather than a test because its value is in being read.

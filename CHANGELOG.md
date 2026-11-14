@@ -7,6 +7,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `examples/hq_server.zig` and `examples/hq_client.zig`: an hq-interop server
+  and client that carry one `GET` and its response over a real TLS 1.3
+  handshake on loopback UDP. `just interop-hq` builds both (`zig build hq-bin
+  -Dtls`), runs them against the self-signed certificate in `tests/fixtures`,
+  and fails unless the client prints the body. Both bound every wait and print
+  `TIMEOUT` and exit 1 when the handshake stalls.
 - The `quic-io` module: the socket half of a connection, over `std.Io`. It
   binds or takes a UDP socket, waits for one datagram at a time with a caller's
   timeout, feeds it to `Conn`, and flushes whatever the machine owes (handshake
