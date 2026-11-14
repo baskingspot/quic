@@ -36,6 +36,7 @@ const SendStream = @import("SendStream.zig");
 const StreamTable = @import("StreamTable.zig");
 const stream_id = @import("stream_id.zig");
 const frame = @import("frame.zig");
+const TransportParameters = @import("TransportParameters.zig");
 const setup = @import("connection_setup.zig");
 const seam = @import("handshake.zig");
 const packet = @import("packet.zig");
@@ -151,6 +152,10 @@ pub const Error = protection.Error ||
         /// The call only means something to one end of the connection: a server
         /// has no handshake attempt to remember (§6.2).
         WrongRole,
+        /// §7.3 and §18.2: the peer's transport parameters are missing, will not
+        /// decode, or contradict the connection IDs this endpoint saw. The
+        /// connection closes with TRANSPORT_PARAMETER_ERROR (0x08).
+        TransportParameter,
     };
 
 /// §4.6: how many streams this endpoint lets the peer open, per direction.
@@ -233,6 +238,62 @@ pub const PeerStreamLimits = struct {
     }
 };
 
+/// What the peer's transport parameters set (§18.2), with every default
+/// applied, so a reader never has to know which parameters were absent.
+///
+/// The machine fills it from the handshake and only reads it afterwards: it is
+/// the single source of the limits the peer imposes, and the one place a caller
+/// looks to learn the idle timeout or the largest datagram the peer accepts.
+/// Durations are nanoseconds, like the rest of this package; the wire carries
+/// milliseconds.
+pub const PeerParameters = struct {
+    /// initial_max_data: the connection-wide send allowance (§4.1).
+    max_data: u64 = 0,
+    stream_data: PeerStreamLimits = .{},
+    /// initial_max_streams_bidi and initial_max_streams_uni (§4.6).
+    max_streams: StreamLimits = .{},
+    /// §5.3 of RFC 9002 bounds a reported ACK delay by this once the handshake
+    /// is confirmed.
+    max_ack_delay: Duration = 0,
+    /// §19.3: scales the delay field of an ACK frame the peer sends.
+    ack_delay_exponent: u8 = 3,
+    /// Zero means the peer asked for no idle timeout (§10.1).
+    max_idle_timeout: Duration = 0,
+    max_udp_payload_size: u64 = 65527,
+    active_connection_id_limit: u64 = 2,
+    disable_active_migration: bool = false,
+    /// Only a server sends one (§18.2).
+    stateless_reset_token: ?[16]u8 = null,
+
+    /// Apply the defaults of §18.2 to what a peer sent.
+    ///
+    /// `decode` already refused an exponent above 20, so the narrowing cannot
+    /// lose a bit. The two millisecond values are saturated rather than
+    /// wrapped: a 2^62 idle timeout is "never", not a small number.
+    pub fn fromDecoded(decoded: *const TransportParameters) PeerParameters {
+        std.debug.assert(decoded.ackDelayExponent() <= TransportParameters.max_ack_delay_exponent);
+        return .{
+            .max_data = decoded.initial_max_data orelse 0,
+            .stream_data = .{
+                .bidi_remote = decoded.initial_max_stream_data_bidi_remote orelse 0,
+                .bidi_local = decoded.initial_max_stream_data_bidi_local orelse 0,
+                .uni = decoded.initial_max_stream_data_uni orelse 0,
+            },
+            .max_streams = .{
+                .bidi = decoded.initial_max_streams_bidi orelse 0,
+                .uni = decoded.initial_max_streams_uni orelse 0,
+            },
+            .max_ack_delay = decoded.maxAckDelay() *| std.time.ns_per_ms,
+            .ack_delay_exponent = @intCast(decoded.ackDelayExponent()),
+            .max_idle_timeout = (decoded.max_idle_timeout orelse 0) *| std.time.ns_per_ms,
+            .max_udp_payload_size = decoded.maxUdpPayloadSize(),
+            .active_connection_id_limit = decoded.activeConnectionIdLimit(),
+            .disable_active_migration = decoded.disable_active_migration,
+            .stateless_reset_token = decoded.stateless_reset_token,
+        };
+    }
+};
+
 pub const Config = struct {
     role: Role,
     /// The client's Destination Connection ID: the Initial keys come from it,
@@ -244,16 +305,12 @@ pub const Config = struct {
     /// The caller's loss recovery state: the estimator and one sent-packet
     /// table per space. It stays outside `Conn`; see `Loss`.
     loss: Loss,
-    /// This endpoint's `ack_delay_exponent` (§18.2), which scales the delay
-    /// field of an ACK frame it receives from microseconds to the resolution it
-    /// was measured at. The default is the RFC's, and `init` asserts the
-    /// bound §18.2 gives it.
+    /// This endpoint's `ack_delay_exponent` (§18.2): the one it advertises, and
+    /// so the one the peer scales the delay of the ACKs it sends by. It is ours
+    /// to advertise, not a way to read the peer's ACKs: those are decoded with
+    /// `PeerParameters.ack_delay_exponent`. The default is the RFC's, and `init`
+    /// asserts the bound §18.2 gives it.
     ack_delay_exponent: u8 = 3,
-    /// The peer's `max_ack_delay` in nanoseconds, from its transport parameters
-    /// (§18.2). §5.3 of RFC 9002 uses it to bound a reported delay once the
-    /// handshake is confirmed, and §7.6.1 uses it in the persistent congestion
-    /// period; zero is what the Initial and Handshake spaces have by definition.
-    max_ack_delay: Duration = 0,
     /// §6.2.1 of RFC 9002: a client that has not seen its peer validate its
     /// address keeps its PTO backoff across acknowledgments. The machine cannot
     /// observe validation, so the caller seeds this and flips the field of the
@@ -308,15 +365,8 @@ pub const Config = struct {
     /// (§4.6) rather than a packet anyone drops.
     stream_slots: []StreamTable.Slot = &.{},
     streams: []Stream = &.{},
-    /// §4.1: the connection-wide limit this endpoint advertises, and the one the
-    /// peer advertised in its transport parameters.
+    /// §4.1: the connection-wide limit this endpoint advertises.
     receive_limit: u64 = 0,
-    send_limit: u64 = 0,
-    /// §4.1: the peer's initial per-stream limits, which arrived in its
-    /// transport parameters and stay here: opening or joining a stream is where
-    /// they are needed, and a limit handed in at each call is a second place to
-    /// pair it with the wrong stream.
-    send_streams: PeerStreamLimits = .{},
     /// §4.6: the initial MAX_STREAMS counts this endpoint advertised in its
     /// transport parameters, per direction. They are the peer's credit to open
     /// streams, so the machine has to know them to raise them later, and together
@@ -324,11 +374,11 @@ pub const Config = struct {
     /// it was allowed must never find `error.StreamLimit`.
     max_streams_bidi: u64 = 0,
     max_streams_uni: u64 = 0,
-    /// §4.6: the credit the peer advertised for this endpoint to open streams,
-    /// from its own `initial_max_streams_bidi` and `initial_max_streams_uni`.
-    /// The machine refuses to open past it, because the peer will close the
-    /// connection if it does.
-    peer_max_streams: StreamLimits = .{},
+    /// The peer's limits for a machine with no driver. With a driver they come
+    /// from the handshake and the machine adopts them itself (§7.4), so the two
+    /// never coexist: `init` asserts it. Without either, the peer has granted
+    /// nothing, which is what its transport parameters say until they arrive.
+    peer: ?PeerParameters = null,
 };
 
 /// What a server learns from a client's first Initial, before it has a `Conn`.
@@ -680,14 +730,20 @@ attempt: ?setup.Client,
 /// here points outside this value, so a copy of a `Conn` does not copy any state
 /// that matters. See `Loss`.
 loss: Loss,
+/// What the peer's transport parameters set, once they are adopted: from the
+/// driver's handshake, or from `Config.peer` when there is none. Null until
+/// then, and the 1-RTT space is not installed while it is (§8.2 of RFC 9001).
+peer: ?PeerParameters = null,
+/// §7.3: the Source Connection ID of the Retry this client accepted, copied into
+/// `retry_storage`, which the server's `retry_source_connection_id` must echo.
+/// Empty without a Retry, and `attempt` is what says whether there was one.
+retry_source_connection_id: []const u8 = "",
 /// §4.1: the peer's initial per-stream limits, which every `SendStream` is born
 /// with.
-send_streams: PeerStreamLimits,
-/// §18.2: how the delay field of an incoming ACK is scaled.
-ack_delay_exponent: u8,
+send_streams: PeerStreamLimits = .{},
 /// The peer's `max_ack_delay`, which bounds a reported delay once the handshake
 /// is confirmed (§5.3 of RFC 9002).
-max_ack_delay: Duration,
+max_ack_delay: Duration = 0,
 /// §6.2.1 of RFC 9002: a client that has not seen its peer validate its address
 /// keeps its PTO backoff across acknowledgments. The caller flips this when the
 /// peer's address is validated, because only the caller sees the handshake.
@@ -730,7 +786,7 @@ streams_advertised: StreamLimits,
 opened_local: StreamLimits = .{},
 /// §4.6: how many streams the peer has permitted this endpoint to open, per
 /// direction, counting closed ones. MAX_STREAMS raises it and nothing lowers it.
-peer_max_streams: StreamLimits,
+peer_max_streams: StreamLimits = .{},
 /// Whether the driver has them yet. One call, before the first flight.
 transport_parameters_set: bool = false,
 
@@ -754,6 +810,9 @@ pub fn init(config: Config) Conn {
     std.debug.assert(config.packet_number_len <= 4);
     // §18.2: an exponent above 20 describes a delay nobody can measure.
     std.debug.assert(config.ack_delay_exponent <= 20);
+    // §7.4: with a driver the peer's parameters come from the handshake, and a
+    // second source for the same limits is the bug this refuses.
+    std.debug.assert(config.tls == null or config.peer == null);
 
     std.debug.assert(streamsValid(config.stream_slots, config.streams));
     std.debug.assert(lossTablesValid(config.loss));
@@ -772,7 +831,7 @@ pub fn init(config: Config) Conn {
     const client = protection.deriveKeys(&secrets.client, suite) catch unreachable;
     const server = protection.deriveKeys(&secrets.server, suite) catch unreachable;
 
-    return .{
+    var conn: Conn = .{
         .role = config.role,
         // §6.2: the attempt is built around the Destination Connection ID the
         // first Initial carried, because that is what a Retry's tag covers
@@ -788,8 +847,6 @@ pub fn init(config: Config) Conn {
         .token = config.token,
         .retry_storage = config.retry_storage,
         .connection_id_storage = config.connection_id_storage,
-        .ack_delay_exponent = config.ack_delay_exponent,
-        .max_ack_delay = config.max_ack_delay,
         .peer_address_validated = config.peer_address_validated,
         .tls = config.tls,
         .transport_parameters = config.transport_parameters,
@@ -806,9 +863,7 @@ pub fn init(config: Config) Conn {
         .stream_table = .init(config.stream_slots),
         .streams = config.streams,
         .receive_window = .init(config.receive_limit),
-        .send_window = .init(config.send_limit),
-        .send_streams = config.send_streams,
-        .peer_max_streams = config.peer_max_streams,
+        .send_window = .init(0),
         .streams_allowed = .{
             .bidi = config.max_streams_bidi,
             .uni = config.max_streams_uni,
@@ -826,6 +881,8 @@ pub fn init(config: Config) Conn {
             .recovery = placeAllRecovery(config.loss),
         },
     };
+    if (config.peer) |peer| conn.adopt(peer);
+    return conn;
 }
 
 /// The space for `id` with traffic keys installed, or `error.NoKeys` when there
@@ -1194,12 +1251,17 @@ fn onAck(
     try space.recovery.onAckReceived(&scaled, now, self.recoveryOptions(), events);
 }
 
-/// §18.2: the wire's ACK Delay is microseconds scaled down by the sender's
-/// exponent, and `Recovery` measures nanoseconds. Both multiplications saturate:
-/// a peer that sends 2^62 microseconds is asking for a delay that never fits, and
-/// a saturated delay is one that is never subtracted from the sample (§5.3).
+/// §19.3: the wire's ACK Delay is microseconds scaled down by the sender's
+/// exponent, and `Recovery` measures nanoseconds. The sender is the peer, so its
+/// exponent decodes the field, never ours. Before the peer's parameters arrive
+/// the default of §18.2 applies, which is what `PeerParameters` carries.
+///
+/// Both multiplications saturate: a peer that sends 2^62 microseconds is asking
+/// for a delay that never fits, and a saturated delay is one that is never
+/// subtracted from the sample (§5.3).
 fn ackDelay(self: *const Conn, delay: u64) Duration {
-    const factor = @as(u64, 1) << @intCast(self.ack_delay_exponent);
+    const exponent = (self.peer orelse PeerParameters{}).ack_delay_exponent;
+    const factor = @as(u64, 1) << @intCast(exponent);
     const microseconds = delay *| factor;
     return microseconds *| std.time.ns_per_us;
 }
@@ -1378,11 +1440,13 @@ pub fn installSpaces(self: *Conn) Error!void {
         // §8.2: ours go out in the first message, so the driver takes them
         // before it is asked for one.
         .pending => {
+            std.debug.assert(ownParametersAgree(self));
             try tls.setTransportParameters(self.transport_parameters);
             self.parameters = .handed;
         },
         .handed => {},
     }
+    if (self.peer == null) try self.adoptPeer(tls);
     try self.installSecrets(tls);
 
     // §4.9.2: the Handshake keys go with confirmation, whichever way this
@@ -1390,6 +1454,111 @@ pub fn installSpaces(self: *Conn) Error!void {
     // a server's completion is noticed here; a client's HANDSHAKE_DONE is
     // noticed where the frame lands.
     if (self.handshakeConfirmed()) self.discardIfPresent(.handshake);
+}
+
+/// Adopt the peer's transport parameters the moment the driver has them.
+///
+/// Null from the driver means they have not arrived (a client before the
+/// server's EncryptedExtensions), and the call is a no-op until they do. Once
+/// they have, they are decoded, checked against what this endpoint saw on the
+/// wire (§7.3), and become the limits every stream is born with. Anything wrong
+/// with them is `error.TransportParameter`, whatever the decoder called it:
+/// the caller's answer is one close code, TRANSPORT_PARAMETER_ERROR (§20.1).
+///
+/// §7.4 puts the adoption before the first stream: the limits are read when a
+/// stream opens, so the assertions state that nothing opened or sent before them.
+fn adoptPeer(self: *Conn, tls: seam.Driver) Error!void {
+    std.debug.assert(self.peer == null);
+    const bytes = (try tls.peerTransportParameters()) orelse return;
+
+    // The decoder's role is the endpoint reading: a server refuses the four
+    // parameters only a server may send (§18.2).
+    const reader: TransportParameters.Role = switch (self.role) {
+        .client => .client,
+        .server => .server,
+    };
+    var decoded: TransportParameters = .{};
+    TransportParameters.decode(bytes, reader, &decoded) catch return error.TransportParameter;
+    try self.checkIdentity(&decoded);
+
+    // §7.4: the limits are read at the first stream and the first byte, so
+    // nothing may have used the old zeros.
+    std.debug.assert(self.send_window.sent == 0);
+    std.debug.assert(self.opened_local.bidi == 0);
+    std.debug.assert(self.opened_local.uni == 0);
+    self.adopt(.fromDecoded(&decoded));
+}
+
+/// §7.3: the connection IDs in the peer's parameters must be the ones this
+/// endpoint saw in the packets, or an on-path attacker rewrote them.
+///
+/// Both roles check `initial_source_connection_id`, which must name the peer as
+/// this endpoint addresses it. A client also checks the two a server alone
+/// sends: `original_destination_connection_id` must be the name the client's
+/// first Initial carried, and `retry_source_connection_id` must be the Retry's
+/// Source Connection ID when there was a Retry and absent when there was none.
+/// A server never receives those two, because the decoder refuses them.
+fn checkIdentity(self: *const Conn, decoded: *const TransportParameters) Error!void {
+    const initial_source = decoded.initial_source_connection_id orelse
+        return error.TransportParameter;
+    if (!std.mem.eql(u8, initial_source, self.destination_connection_id)) {
+        return error.TransportParameter;
+    }
+    if (self.role == .server) return;
+
+    const attempt = self.attempt.?;
+    const original = decoded.original_destination_connection_id orelse
+        return error.TransportParameter;
+    if (!std.mem.eql(u8, original, attempt.original_destination_connection_id)) {
+        return error.TransportParameter;
+    }
+
+    // A Retry's Source Connection ID can be zero-length, so "was there one" is
+    // the attempt's memory and not the length of the copy.
+    const retry_source = decoded.retry_source_connection_id;
+    if (!attempt.retried) {
+        if (retry_source != null) return error.TransportParameter;
+        return;
+    }
+    const echoed = retry_source orelse return error.TransportParameter;
+    if (!std.mem.eql(u8, echoed, self.retry_source_connection_id)) {
+        return error.TransportParameter;
+    }
+}
+
+/// Make the peer's parameters the limits this connection works under (§4.1,
+/// §4.6, §5.3 of RFC 9002). Called once, before any stream or data.
+fn adopt(self: *Conn, peer: PeerParameters) void {
+    std.debug.assert(self.peer == null);
+    self.peer = peer;
+    self.send_window = .init(peer.max_data);
+    self.send_streams = peer.stream_data;
+    self.peer_max_streams = peer.max_streams;
+    self.max_ack_delay = peer.max_ack_delay;
+}
+
+/// Whether the parameters this endpoint hands the driver say what its
+/// configuration does: the receive window, the stream counts, and its own
+/// connection ID. A peer enforces what the bytes say and this machine enforces
+/// what the configuration says, so a mismatch is a connection that closes a
+/// legal peer.
+///
+/// Total, like `streamsValid`: bytes that do not decode do not agree, and no
+/// input is an error. The bytes are decoded as the peer would read them, which
+/// is the opposite role's reading.
+fn ownParametersAgree(self: *const Conn) bool {
+    const reader: TransportParameters.Role = switch (self.role) {
+        .client => .server,
+        .server => .client,
+    };
+    var decoded: TransportParameters = .{};
+    TransportParameters.decode(self.transport_parameters, reader, &decoded) catch return false;
+
+    if ((decoded.initial_max_data orelse 0) != self.receive_window.window) return false;
+    if ((decoded.initial_max_streams_bidi orelse 0) != self.streams_advertised.bidi) return false;
+    if ((decoded.initial_max_streams_uni orelse 0) != self.streams_advertised.uni) return false;
+    const source = decoded.initial_source_connection_id orelse return false;
+    return std.mem.eql(u8, source, self.source_connection_id);
 }
 
 /// Drain one handshake message into a packet.
@@ -1486,6 +1655,10 @@ fn installSecrets(self: *Conn, tls: seam.Driver) Error!void {
     }
     if (self.app == null) {
         if (try tls.secrets(.app)) |secrets| {
+            // RFC 9001 §8.2: never 1-RTT on guessed limits. The peer's
+            // parameters are adopted first, and a driver that reports the
+            // application secrets without them has skipped the extension.
+            if (self.peer == null) return error.TransportParameter;
             try self.installSpace(.app, secrets, try tls.suite().protectionSuite());
         }
     }
@@ -1659,7 +1832,7 @@ fn freeStream(self: *Conn) ?usize {
 /// bidirectional stream, a receive half too.
 ///
 /// The sender's initial limit is the peer's, from
-/// `Config.send_streams.bidi_remote` or `.uni` depending on the stream's kind;
+/// `PeerParameters.stream_data`'s `bidi_remote` or `uni` depending on the stream's kind;
 /// MAX_STREAM_DATA raises it through `Stream.send.onMaxStreamData`. An id the
 /// peer initiates is `error.WrongDirection`: that stream already exists on the
 /// receive side, and `joinStream` is how its sending half comes into being.
@@ -1729,8 +1902,8 @@ fn everOpened(self: *const Conn, id: u64) bool {
 ///
 /// Not the same act as `openStream`: nothing is created, the slot the peer's
 /// frames already opened is reused, and the limit is the peer's
-/// `initial_max_stream_data_bidi_local`, which the machine carried from
-/// `Config.send_streams` rather than being handed again. A one-way stream the
+/// `initial_max_stream_data_bidi_local`, which the machine adopted into
+/// `peer.stream_data` rather than being handed again. A one-way stream the
 /// peer opened is `error.WrongDirection`, because §2.1 gives its only direction
 /// to the peer.
 pub fn joinStream(self: *Conn, id: u64) Error!*Stream {
@@ -2418,6 +2591,7 @@ pub fn onRetry(self: *Conn, retry: *const packet.Retry, raw: []const u8) Error!s
     @memcpy(self.retry_storage[0..connection_id.len], connection_id);
     @memcpy(self.retry_storage[connection_id.len..][0..retry.token.len], retry.token);
     self.destination_connection_id = self.retry_storage[0..connection_id.len];
+    self.retry_source_connection_id = self.destination_connection_id;
     self.token = self.retry_storage[connection_id.len..][0..retry.token.len];
 
     self.rekeyInitial(self.destination_connection_id);
@@ -2874,6 +3048,7 @@ test "RFC 9000 §13.3, sent CRYPTO bytes are kept and the replay is idempotent" 
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x97},
         .tls = stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &.{0x97}),
         .crypto_sent = .{ .initial = &sent_initial, .handshake = &sent_handshake },
     });
 
@@ -2917,6 +3092,7 @@ test "RFC 9000 §20.1, a CRYPTO send buffer too small refuses the message" {
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x99},
         .tls = stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &.{0x99}),
         .crypto_sent = .{ .initial = &sent_initial },
     });
 
@@ -2984,6 +3160,7 @@ test "RFC 9000 §17.2.5.3, a Retry rekeys the Initial space and keeps its packet
         .destination_connection_id = &dcid,
         .source_connection_id = &client_scid,
         .tls = stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &client_scid),
         .crypto_sent = .{ .initial = &sent_initial },
         .retry_storage = &retry_storage,
     });
@@ -3229,9 +3406,7 @@ test "RFC 9000 §4.6, closing a stream this endpoint opened grants no credit" {
         .source_connection_id = &.{0xc4},
         .stream_slots = &slots,
         .streams = &streams,
-        .send_limit = 64,
-        .send_streams = .{ .uni = 64 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{ .max_data = 64, .stream_data = .{ .uni = 64 }, .max_streams = .{ .bidi = 8, .uni = 8 } },
         .max_streams_bidi = 1,
     });
 
@@ -3436,9 +3611,11 @@ test "RFC 9000 §19.8, a packed packet reports its number and the frames it carr
         .source_connection_id = &.{0xd3},
         .stream_slots = &client_slots,
         .streams = &client_streams,
-        .send_limit = 64,
-        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{
+            .max_data = 64,
+            .stream_data = .{ .bidi_remote = 64, .bidi_local = 64 },
+            .max_streams = .{ .bidi = 8, .uni = 8 },
+        },
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -3528,9 +3705,11 @@ test "RFC 9000 §4.1, a packet that fits part of an offer says where to resume" 
         .source_connection_id = &.{0xd5},
         .stream_slots = &slots,
         .streams = &streams,
-        .send_limit = 64,
-        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{
+            .max_data = 64,
+            .stream_data = .{ .bidi_remote = 64, .bidi_local = 64 },
+            .max_streams = .{ .bidi = 8, .uni = 8 },
+        },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x43);
     installApp(&client, &client, client_secret, client_secret);
@@ -3602,9 +3781,11 @@ test "RFC 9000 §4.1, a window with no room is a different answer from a used on
         .source_connection_id = &.{0xd7},
         .stream_slots = &slots,
         .streams = &streams,
-        .send_limit = 64,
-        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{
+            .max_data = 64,
+            .stream_data = .{ .bidi_remote = 64, .bidi_local = 64 },
+            .max_streams = .{ .bidi = 8, .uni = 8 },
+        },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x44);
     installApp(&client, &client, client_secret, client_secret);
@@ -4329,10 +4510,12 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
         .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
         .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
         .alpn_protocol = "h3",
+        .peer_parameters = identityParameters(.server, &dcid, &dcid),
     };
     var server_stub: seam.Stub = .{
         .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
         .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
+        .peer_parameters = identityParameters(.client, &dcid, &.{0x7a}),
     };
 
     // CRYPTO reassembly storage, which the caller owns (§19.6), and the buffer
@@ -4351,7 +4534,7 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x7a},
         .tls = client_stub.driver(),
-        .transport_parameters = "our parameters",
+        .transport_parameters = identityParameters(.client, &dcid, &.{0x7a}),
         .crypto_sent = .{ .initial = &client_sent_initial, .handshake = &client_sent_handshake },
     });
     var server_loss: LossTables = .{};
@@ -4364,6 +4547,7 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
         // carries no length, so the two ends have to agree on one (§17.3.1).
         .source_connection_id = &dcid,
         .tls = server_stub.driver(),
+        .transport_parameters = identityParameters(.server, &dcid, &dcid),
         .crypto = .{ .initial = &initial_crypto, .handshake = &handshake_crypto },
     });
 
@@ -4377,7 +4561,11 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
     const first = (try client.writeHandshake(&payload, &datagram, 0)) orelse
         return error.TestUnexpectedResult;
     try testing.expect(client_stub.parameters_set);
-    try testing.expectEqualStrings("our parameters", client_stub.parameters[0..client_stub.parameters_len]);
+    try testing.expectEqualSlices(
+        u8,
+        client.transport_parameters,
+        client_stub.parameters[0..client_stub.parameters_len],
+    );
     // The stub reported both levels up front, so the machine installed them
     // before it needed them; the Initial keys are still here, because no
     // Handshake packet has gone out yet.
@@ -4442,6 +4630,330 @@ test "RFC 9001 §4.9.2, a stub driver takes a client from Initial to 1-RTT" {
     try testing.expect(client.app != null);
     try testing.expectError(error.NoKeys, client.writeFrames(.handshake, "\x01", &datagram, .data(0)));
     _ = try client.writeFrames(.app, &app_payload, &datagram, .data(0));
+}
+
+/// A client over a stub driver that has both levels' secrets and whatever the
+/// peer's parameters say, for the tests of what the machine adopts. Streams are
+/// two slots of 64 bytes, enough to open one and write to it.
+const AdoptionFixture = struct {
+    const dcid = [_]u8{ 0xc1, 0xc2 };
+    const client_cid = [_]u8{0xc3};
+    const handshake_secret: [protection.secret_length]u8 = @splat(0xc4);
+    const app_secret: [protection.secret_length]u8 = @splat(0xc5);
+
+    stub: seam.Stub,
+    loss: LossTables = .{},
+    send_bytes: [2][64]u8 = undefined,
+    recv_bytes: [2][64]u8 = undefined,
+    slots: [2]StreamTable.Slot = undefined,
+    streams: [2]Conn.Stream = undefined,
+    retry_storage: [64]u8 = undefined,
+
+    fn init(peer: ?[]const u8) AdoptionFixture {
+        return .{ .stub = .{
+            .handshake_secrets = .{ .client = &handshake_secret, .server = &handshake_secret },
+            .app_secrets = .{ .client = &app_secret, .server = &app_secret },
+            .peer_parameters = peer,
+        } };
+    }
+
+    /// The client, over this fixture's storage. The fixture must not move after.
+    fn client(self: *AdoptionFixture) Conn {
+        for (&self.streams, 0..) |*entry, index| entry.* = .{
+            .send_buffer = &self.send_bytes[index],
+            .recv_buffer = &self.recv_bytes[index],
+            .recv_limit_bytes = 64,
+        };
+        return .init(.{
+            .role = .client,
+            .loss = self.loss.value(),
+            .original_destination_connection_id = &dcid,
+            .destination_connection_id = &dcid,
+            .source_connection_id = &client_cid,
+            .tls = self.stub.driver(),
+            .transport_parameters = identityParameters(.client, &dcid, &client_cid),
+            .stream_slots = &self.slots,
+            .streams = &self.streams,
+            .retry_storage = &self.retry_storage,
+        });
+    }
+
+    /// The server's parameters as it would send them, echoing this client's
+    /// first Destination Connection ID unless `parameters` says otherwise.
+    fn serverParameters(buffer: []u8, parameters: TransportParameters) []const u8 {
+        var full = parameters;
+        if (full.initial_source_connection_id == null) full.initial_source_connection_id = &dcid;
+        if (full.original_destination_connection_id == null) {
+            full.original_destination_connection_id = &dcid;
+        }
+        return encodeParameters(buffer, .server, full);
+    }
+};
+
+test "RFC 9000 §7.4, the server's initial_max_data bounds the client's first STREAM frame" {
+    var buffer: [128]u8 = undefined;
+    var fixture: AdoptionFixture = .init(AdoptionFixture.serverParameters(&buffer, .{
+        .initial_max_data = 20,
+        .initial_max_stream_data_bidi_remote = 64,
+        .initial_max_streams_bidi = 1,
+    }));
+    var client = fixture.client();
+
+    // Nothing is known until the driver's parameters are adopted, and then they
+    // are the limits, with the defaults of §18.2 for what the server left out.
+    try testing.expect(client.peer == null);
+    try client.installSpaces();
+    try testing.expectEqual(@as(u64, 20), client.peer.?.max_data);
+    try testing.expectEqual(@as(u64, 20), client.send_window.limit);
+    try testing.expectEqual(Recovery.ms(25), client.max_ack_delay);
+
+    const opened = try client.openStream(0);
+    try opened.send.write("thirty-two bytes of stream data..");
+    var offers = [_]Conn.Offer{.{ .stream_id = 0, .length = 33 }};
+    var written: [1]Written = undefined;
+    var frame_bytes: [128]u8 = undefined;
+    var out: [256]u8 = undefined;
+    const packet_out = (try client.writeStreams(.{
+        .offers = &offers,
+        .frames = &frame_bytes,
+        .out = &out,
+        .written = &written,
+        .max_payload = 128,
+        .now = 0,
+    })) orelse return error.TestUnexpectedResult;
+
+    // The offer was 33 bytes and the server allowed 20 in all, so the frame is
+    // cut short. The machine reserves the frame's widest header (11 bytes) out
+    // of the allowance, which is why it is 9 and not 20.
+    try testing.expect(packet_out.length > 0);
+    try testing.expectEqual(@as(u32, 9), written[0].length);
+    try testing.expectEqual(@as(u64, 9), client.send_window.sent);
+}
+
+test "RFC 9000 §4.6, initial_max_streams_bidi of zero refuses openStream" {
+    var buffer: [128]u8 = undefined;
+    var fixture: AdoptionFixture = .init(AdoptionFixture.serverParameters(&buffer, .{
+        .initial_max_data = 64,
+        .initial_max_stream_data_uni = 64,
+        .initial_max_streams_bidi = 0,
+        .initial_max_streams_uni = 1,
+    }));
+    var client = fixture.client();
+    try client.installSpaces();
+
+    // The credit is per direction: no bidirectional stream may open, and the
+    // one-way credit the server did grant is still there.
+    try testing.expectError(error.NoStreamCredit, client.openStream(0));
+    _ = try client.openStream(2);
+    try testing.expectError(error.NoStreamCredit, client.openStream(6));
+}
+
+test "RFC 9000 §7.3, a client refuses an original_destination_connection_id that does not echo" {
+    var buffer: [128]u8 = undefined;
+    var fixture: AdoptionFixture = .init(AdoptionFixture.serverParameters(&buffer, .{
+        .original_destination_connection_id = &.{ 0xc1, 0xff },
+    }));
+    var client = fixture.client();
+
+    // TRANSPORT_PARAMETER_ERROR, and nothing from the parameters was adopted.
+    try testing.expectError(error.TransportParameter, client.installSpaces());
+    try testing.expect(client.peer == null);
+    try testing.expectEqual(@as(?Space, null), client.app);
+
+    // The same bytes with the right name are accepted, so the refusal was the
+    // name and not the parameters around it.
+    fixture.stub.peer_parameters = AdoptionFixture.serverParameters(&buffer, .{});
+    try client.installSpaces();
+    try testing.expect(client.peer != null);
+    try testing.expect(client.app != null);
+}
+
+test "RFC 9000 §7.3, initial_source_connection_id is required and must name the peer" {
+    var buffer: [128]u8 = undefined;
+    var fixture: AdoptionFixture = .init(AdoptionFixture.serverParameters(&buffer, .{
+        .initial_source_connection_id = &.{ 0xc1, 0xff },
+    }));
+    var client = fixture.client();
+    try testing.expectError(error.TransportParameter, client.installSpaces());
+
+    // Absent is as wrong as different: the parameter is mandatory (§7.3).
+    fixture.stub.peer_parameters = encodeParameters(&buffer, .server, .{
+        .original_destination_connection_id = &AdoptionFixture.dcid,
+    });
+    try testing.expectError(error.TransportParameter, client.installSpaces());
+    try testing.expect(client.peer == null);
+
+    // A server checks the same parameter on a client's, against the Source
+    // Connection ID it addresses.
+    const server_dcid = [_]u8{0xc6};
+    var server_stub: seam.Stub = .{
+        .peer_parameters = encodeParameters(&buffer, .client, .{
+            .initial_source_connection_id = &.{0xc7},
+        }),
+    };
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &server_dcid,
+        .destination_connection_id = &.{0xc8},
+        .source_connection_id = &server_dcid,
+        .tls = server_stub.driver(),
+        .transport_parameters = identityParameters(.server, &server_dcid, &server_dcid),
+    });
+    try testing.expectError(error.TransportParameter, server.installSpaces());
+    try testing.expect(server.peer == null);
+}
+
+test "RFC 9000 §7.3, retry_source_connection_id without a Retry is TRANSPORT_PARAMETER_ERROR" {
+    var buffer: [128]u8 = undefined;
+    var fixture: AdoptionFixture = .init(AdoptionFixture.serverParameters(&buffer, .{
+        .retry_source_connection_id = &.{0xc9},
+    }));
+    var client = fixture.client();
+    try testing.expectError(error.TransportParameter, client.installSpaces());
+    try testing.expect(client.peer == null);
+}
+
+test "RFC 9000 §7.3, after a Retry the server's retry_source_connection_id must echo it" {
+    const retry_scid = [_]u8{ 0xca, 0xcb };
+    var buffer: [128]u8 = undefined;
+    var fixture: AdoptionFixture = .init(null);
+    var client = fixture.client();
+
+    var retry_bytes: [256]u8 = undefined;
+    const retry_length = try setup.Retry.write(&retry_bytes, &AdoptionFixture.dcid, .{
+        .destination_connection_id = &AdoptionFixture.client_cid,
+        .source_connection_id = &retry_scid,
+        .token = "retry-token",
+    });
+    const retry = try packet.parseRetry(try packet.parseInvariant(retry_bytes[0..retry_length]));
+    try testing.expectEqual(
+        setup.Client.Outcome.accepted,
+        try client.onRetry(&retry, retry_bytes[0..retry_length]),
+    );
+    // The Retry's bytes are the datagram's, which the caller reuses; the machine
+    // kept its own copy.
+    @memset(retry_bytes[0..retry_length], 0xee);
+    try testing.expectEqualSlices(u8, &retry_scid, client.retry_source_connection_id);
+
+    // The server's first Initial after the Retry comes from the name it gave.
+    const answered: TransportParameters = .{ .initial_source_connection_id = &retry_scid };
+
+    // Absent after a Retry is as wrong as a different one.
+    fixture.stub.peer_parameters = AdoptionFixture.serverParameters(&buffer, answered);
+    try testing.expectError(error.TransportParameter, client.installSpaces());
+
+    var wrong = answered;
+    wrong.retry_source_connection_id = &.{ 0xca, 0xff };
+    fixture.stub.peer_parameters = AdoptionFixture.serverParameters(&buffer, wrong);
+    try testing.expectError(error.TransportParameter, client.installSpaces());
+
+    // Echoing the Retry's Source Connection ID is what is accepted.
+    var right = answered;
+    right.retry_source_connection_id = &retry_scid;
+    fixture.stub.peer_parameters = AdoptionFixture.serverParameters(&buffer, right);
+    try client.installSpaces();
+    try testing.expect(client.peer != null);
+}
+
+test "RFC 9001 §8.2, the 1-RTT space waits for the peer's parameters" {
+    var fixture: AdoptionFixture = .init(null);
+    var client = fixture.client();
+
+    // The driver has the application secrets and no parameters, which is a
+    // handshake that skipped the extension: Handshake keys are fine, 1-RTT on
+    // guessed limits is not.
+    try testing.expectError(error.TransportParameter, client.installSpaces());
+    try testing.expect(client.handshake != null);
+    try testing.expectEqual(@as(?Space, null), client.app);
+    try testing.expect(client.peer == null);
+
+    // Once they arrive the same call installs it.
+    var buffer: [128]u8 = undefined;
+    fixture.stub.peer_parameters = AdoptionFixture.serverParameters(&buffer, .{});
+    try client.installSpaces();
+    try testing.expect(client.app != null);
+    try testing.expect(client.peer != null);
+}
+
+test "RFC 9000 §18.2, a malformed parameter set is TRANSPORT_PARAMETER_ERROR" {
+    var fixture: AdoptionFixture = .init(&.{ 0x03, 0x01 });
+    var client = fixture.client();
+    try testing.expectError(error.TransportParameter, client.installSpaces());
+    try testing.expect(client.peer == null);
+}
+
+test "RFC 9000 §18.2, the peer's parameters carry their defaults and units" {
+    const decoded: TransportParameters = .{
+        .max_idle_timeout = 30_000,
+        .max_ack_delay = 26,
+        .ack_delay_exponent = 5,
+        .disable_active_migration = true,
+        .stateless_reset_token = @splat(0x7e),
+    };
+    const peer: PeerParameters = .fromDecoded(&decoded);
+    try testing.expectEqual(Recovery.ms(30_000), peer.max_idle_timeout);
+    try testing.expectEqual(Recovery.ms(26), peer.max_ack_delay);
+    try testing.expectEqual(@as(u8, 5), peer.ack_delay_exponent);
+    try testing.expect(peer.disable_active_migration);
+    try testing.expectEqual(@as(u8, 0x7e), peer.stateless_reset_token.?[0]);
+    // Absent parameters are their defaults, not zero.
+    try testing.expectEqual(@as(u64, 65527), peer.max_udp_payload_size);
+    try testing.expectEqual(@as(u64, 2), peer.active_connection_id_limit);
+
+    const empty: PeerParameters = .fromDecoded(&.{});
+    try testing.expectEqual(Recovery.ms(25), empty.max_ack_delay);
+    try testing.expectEqual(@as(u8, 3), empty.ack_delay_exponent);
+    try testing.expectEqual(@as(u64, 0), empty.max_data);
+    try testing.expectEqual(@as(Duration, 0), empty.max_idle_timeout);
+
+    // A timeout too large for nanoseconds is "never", not a small number.
+    const huge: TransportParameters = .{ .max_idle_timeout = (1 << 62) - 1 };
+    try testing.expectEqual(std.math.maxInt(u64), PeerParameters.fromDecoded(&huge).max_idle_timeout);
+}
+
+test "RFC 9000 §18.2, the parameters this endpoint sends must agree with its configuration" {
+    var loss: LossTables = .{};
+    const dcid = [_]u8{0xd1};
+    var buffer: [128]u8 = undefined;
+    var conn: Conn = .init(.{
+        .role = .server,
+        .loss = loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0xd2},
+        .source_connection_id = &dcid,
+        .receive_limit = 4096,
+        .max_streams_bidi = 0,
+        .max_streams_uni = 0,
+    });
+
+    // No parameters, undecodable ones, and a window that differs are all
+    // disagreement; only the exact numbers and connection ID agree.
+    try testing.expect(!ownParametersAgree(&conn));
+    conn.transport_parameters = &.{ 0x03, 0x01 };
+    try testing.expect(!ownParametersAgree(&conn));
+    conn.transport_parameters = encodeParameters(&buffer, .server, .{
+        .initial_source_connection_id = &dcid,
+        .initial_max_data = 4095,
+    });
+    try testing.expect(!ownParametersAgree(&conn));
+    conn.transport_parameters = encodeParameters(&buffer, .server, .{
+        .initial_source_connection_id = &dcid,
+        .initial_max_data = 4096,
+        .initial_max_streams_bidi = 1,
+    });
+    try testing.expect(!ownParametersAgree(&conn));
+    conn.transport_parameters = encodeParameters(&buffer, .server, .{
+        .initial_source_connection_id = &.{0xd9},
+        .initial_max_data = 4096,
+    });
+    try testing.expect(!ownParametersAgree(&conn));
+    conn.transport_parameters = encodeParameters(&buffer, .server, .{
+        .initial_source_connection_id = &dcid,
+        .initial_max_data = 4096,
+    });
+    try testing.expect(ownParametersAgree(&conn));
 }
 
 test "RFC 9000 §19.20, only a server sends HANDSHAKE_DONE" {
@@ -4513,6 +5025,7 @@ test "RFC 9000 §20.1, a driver failure carries the CRYPTO_ERROR to close with" 
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x8a},
         .tls = stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &.{0x8a}),
     });
 
     var datagram: [512]u8 = undefined;
@@ -4539,6 +5052,7 @@ test "RFC 8446 §B.4, a suite a driver reports before it is negotiated is not ac
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x9c},
         .tls = stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &.{0x9c}),
     });
 
     try client.installSpaces();
@@ -4566,6 +5080,7 @@ test "RFC 8446 §B.4, a suite this package cannot do is refused, never substitut
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x9b},
         .tls = stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &.{0x9b}),
     });
 
     // The driver says AES-256-GCM, which needs SHA-384 and is not implemented.
@@ -4590,6 +5105,7 @@ test "RFC 9001 §5.1, a driver's 48-byte secret is refused rather than truncated
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x9a},
         .tls = stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &.{0x9a}),
     });
 
     // A driver that says AES-128-GCM and hands out a 48-byte secret has told two
@@ -4647,6 +5163,7 @@ test "RFC 9000 §19.6, CRYPTO frames that arrive out of order reach the driver i
         .destination_connection_id = &.{0x6a},
         .source_connection_id = &.{0x6b},
         .tls = stub.driver(),
+        .transport_parameters = identityParameters(.server, &dcid, &.{0x6b}),
         .crypto = .{ .initial = &initial_crypto },
     });
 
@@ -4807,8 +5324,7 @@ test "RFC 9000 §2.1, opening a stream takes the peer's limit for it" {
         .source_connection_id = &.{0x43},
         .stream_slots = &client_slots,
         .streams = &client_streams,
-        .send_streams = .{ .bidi_remote = 10, .uni = 30 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{ .stream_data = .{ .bidi_remote = 10, .uni = 30 }, .max_streams = .{ .bidi = 8, .uni = 8 } },
     });
 
     var server_rings: [2][8]u8 = .{ undefined, undefined };
@@ -4826,8 +5342,7 @@ test "RFC 9000 §2.1, opening a stream takes the peer's limit for it" {
         .source_connection_id = &dcid,
         .stream_slots = &server_slots,
         .streams = &server_streams,
-        .send_streams = .{ .bidi_remote = 11, .bidi_local = 20 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{ .stream_data = .{ .bidi_remote = 11, .bidi_local = 20 }, .max_streams = .{ .bidi = 8, .uni = 8 } },
     });
 
     // §4.1: a bidirectional stream this endpoint opens carries the limit the
@@ -4879,8 +5394,7 @@ test "RFC 9000 §2.1, a STREAM frame for an unknown stream opens it" {
         .stream_slots = &slots,
         .streams = &streams,
         .receive_limit = 1024,
-        .send_streams = .{ .bidi_local = 64 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{ .stream_data = .{ .bidi_local = 64 }, .max_streams = .{ .bidi = 8, .uni = 8 } },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x25);
     const server_secret: [protection.secret_length]u8 = @splat(0x26);
@@ -5108,8 +5622,7 @@ test "RFC 9000 §19.4, a reset ends the receive half and the application reads t
         .stream_slots = &slots,
         .streams = &streams,
         .receive_limit = 1024,
-        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{ .stream_data = .{ .bidi_remote = 64, .bidi_local = 64 }, .max_streams = .{ .bidi = 8, .uni = 8 } },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x54);
     const server_secret: [protection.secret_length]u8 = @splat(0x55);
@@ -5254,8 +5767,7 @@ test "RFC 9000 §19.5, stop sending resets the sending half and owes a reset" {
         .stream_slots = &slots,
         .streams = &streams,
         .receive_limit = 1024,
-        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{ .stream_data = .{ .bidi_remote = 64, .bidi_local = 64 }, .max_streams = .{ .bidi = 8, .uni = 8 } },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x64);
     const server_secret: [protection.secret_length]u8 = @splat(0x65);
@@ -5360,8 +5872,7 @@ test "RFC 9000 §19.11, the peer's MAX_STREAMS is the credit to open" {
         .source_connection_id = &.{0x8d},
         .stream_slots = &slots,
         .streams = &streams,
-        .send_streams = .{ .bidi_remote = 64, .uni = 64 },
-        .peer_max_streams = .{ .bidi = 1 },
+        .peer = .{ .stream_data = .{ .bidi_remote = 64, .uni = 64 }, .max_streams = .{ .bidi = 1 } },
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -5462,7 +5973,7 @@ test "RFC 9000 §19.9, a peer's MAX_DATA raises the connection allowance" {
         .original_destination_connection_id = &dcid,
         .destination_connection_id = &.{0x83},
         .source_connection_id = &dcid,
-        .send_limit = 64,
+        .peer = .{ .max_data = 64 },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x84);
     const server_secret: [protection.secret_length]u8 = @splat(0x85);
@@ -5536,8 +6047,7 @@ test "RFC 9000 §19.10, a peer's credit reaches the stream it names" {
         .stream_slots = &slots,
         .streams = &streams,
         .receive_limit = 1024,
-        .send_streams = .{ .bidi_remote = 10, .bidi_local = 20 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{ .stream_data = .{ .bidi_remote = 10, .bidi_local = 20 }, .max_streams = .{ .bidi = 8, .uni = 8 } },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x89);
     const server_secret: [protection.secret_length]u8 = @splat(0x8a);
@@ -5643,8 +6153,10 @@ test "RFC 9000 §3.3, a frame for a stream this endpoint closed is ignored" {
         .stream_slots = &slots,
         .streams = &streams,
         .receive_limit = 1024,
-        .send_streams = .{ .bidi_remote = 64, .uni = 64, .bidi_local = 64 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{
+            .stream_data = .{ .bidi_remote = 64, .uni = 64, .bidi_local = 64 },
+            .max_streams = .{ .bidi = 8, .uni = 8 },
+        },
     });
     const client_secret: [protection.secret_length]u8 = @splat(0x74);
     const server_secret: [protection.secret_length]u8 = @splat(0x75);
@@ -6127,9 +6639,11 @@ test "RFC 9000 §19.8, a segment out of the send half goes out in a STREAM frame
         .source_connection_id = &.{0x2f},
         .stream_slots = &client_slots,
         .streams = &client_streams,
-        .send_limit = 64,
-        .send_streams = .{ .bidi_remote = 64, .bidi_local = 64 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
+        .peer = .{
+            .max_data = 64,
+            .stream_data = .{ .bidi_remote = 64, .bidi_local = 64 },
+            .max_streams = .{ .bidi = 8, .uni = 8 },
+        },
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -6265,6 +6779,7 @@ test "RFC 9001 §4.1.1, a coalesced 1-RTT packet opens once the Finished is fed"
     var client_stub: seam.Stub = .{
         .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
         .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
+        .peer_parameters = identityParameters(.server, &dcid, &dcid),
     };
     // A real driver derives the application secrets from the peer's Finished
     // (§7.1 of RFC 8446), so this one holds them back until the handshake's
@@ -6274,6 +6789,7 @@ test "RFC 9001 §4.1.1, a coalesced 1-RTT packet opens once the Finished is fed"
         .handshake_secrets = .{ .client = &client_secret, .server = &server_secret },
         .app_secrets = .{ .client = &app_client_secret, .server = &app_server_secret },
         .app_secrets_after_feed = true,
+        .peer_parameters = identityParameters(.client, &dcid, &client_cid),
     };
 
     var client_loss: LossTables = .{};
@@ -6284,6 +6800,7 @@ test "RFC 9001 §4.1.1, a coalesced 1-RTT packet opens once the Finished is fed"
         .destination_connection_id = &dcid,
         .source_connection_id = &client_cid,
         .tls = client_stub.driver(),
+        .transport_parameters = identityParameters(.client, &dcid, &client_cid),
     });
     var server_loss: LossTables = .{};
     var server_crypto: [128]u8 = undefined;
@@ -6294,6 +6811,7 @@ test "RFC 9001 §4.1.1, a coalesced 1-RTT packet opens once the Finished is fed"
         .destination_connection_id = &client_cid,
         .source_connection_id = &dcid,
         .tls = server_stub.driver(),
+        .transport_parameters = identityParameters(.server, &dcid, &dcid),
         .crypto = .{ .handshake = &server_crypto },
     });
 
@@ -6899,7 +7417,7 @@ test "a full sent table refuses the packet instead of forgetting it" {
     try testing.expectEqual(@as(usize, 0), report.ackedPackets().len);
 }
 
-test "RFC 9000 §18.2, a received ACK delay is scaled by this endpoint's exponent" {
+test "RFC 9000 §19.3, a received ACK delay is scaled by the peer's exponent, not ours" {
     const dcid = [_]u8{ 0x87, 0x88 };
     var client_loss: LossTables = .{};
     var adopted_cid: [20]u8 = undefined;
@@ -6910,7 +7428,10 @@ test "RFC 9000 §18.2, a received ACK delay is scaled by this endpoint's exponen
         .destination_connection_id = &dcid,
         .source_connection_id = &.{0x89},
         .connection_id_storage = &adopted_cid,
-        .ack_delay_exponent = 3,
+        // Ours is what this endpoint advertises, and the peer scales by its own:
+        // the two differ here so reading the wrong one changes every number below.
+        .ack_delay_exponent = 5,
+        .peer = .{ .ack_delay_exponent = 3 },
     });
     var server_loss: LossTables = .{};
     var server: Conn = .init(.{
@@ -7118,6 +7639,41 @@ test "RFC 9000 §19.19, an application close carries the application's code" {
     // §19.19: an application close has no frame type field at all.
     try testing.expectEqual(@as(?u64, null), received.frame_type);
     try testing.expectEqual(State.draining, server.state);
+}
+
+/// The transport parameters an endpoint that sets no limits must still send
+/// (§7.3): its own connection ID, and from a server the one the client first
+/// addressed. Built at compile time so a test can hand the slice to a config
+/// without a buffer to keep alive; the same bytes are what a stub reports as
+/// the peer's.
+fn identityParameters(
+    comptime sender: TransportParameters.Role,
+    comptime original: []const u8,
+    comptime source: []const u8,
+) []const u8 {
+    const bytes = comptime blk: {
+        var buffer: [64]u8 = undefined;
+        var writer: Writer = .init(&buffer);
+        const parameters: TransportParameters = .{
+            .original_destination_connection_id = if (sender == .server) original else null,
+            .initial_source_connection_id = source,
+        };
+        TransportParameters.encode(&writer, parameters, sender) catch unreachable;
+        const written = buffer[0..writer.written().len].*;
+        break :blk written;
+    };
+    return &bytes;
+}
+
+/// `parameters` encoded as `sender` would send them, into the test's buffer.
+fn encodeParameters(
+    buffer: []u8,
+    sender: TransportParameters.Role,
+    parameters: TransportParameters,
+) []const u8 {
+    var writer: Writer = .init(buffer);
+    TransportParameters.encode(&writer, parameters, sender) catch unreachable;
+    return writer.written();
 }
 
 /// Stand in for the TLS driver: hand an endpoint a space directly, with the

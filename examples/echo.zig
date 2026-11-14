@@ -20,6 +20,7 @@ const frame = quic.frame;
 const handshake = quic.handshake;
 const protection = quic.protection;
 const StreamTable = quic.StreamTable;
+const TransportParameters = quic.TransportParameters;
 
 /// One sent-packet table per space, and the report storage the machine fills.
 const tables_max = 16;
@@ -100,6 +101,25 @@ const Endpoint = struct {
 
 var clock_start: Io.Timestamp = undefined;
 
+/// What an endpoint tells the other in the handshake (RFC 9000 §18.2), as bytes
+/// a driver carries. The numbers are this example's own configuration: the
+/// receive window, the stream credit, and the size of the rings, which is also
+/// each stream's window.
+fn encodeParameters(
+    buffer: []u8,
+    sender: TransportParameters.Role,
+    identity: TransportParameters,
+) ![]const u8 {
+    var parameters = identity;
+    parameters.initial_max_data = 4096;
+    parameters.initial_max_stream_data_bidi_local = 1024;
+    parameters.initial_max_stream_data_bidi_remote = 1024;
+    parameters.initial_max_streams_bidi = 1;
+    var writer: quic.Writer = .init(buffer);
+    try TransportParameters.encode(&writer, parameters, sender);
+    return writer.written();
+}
+
 fn now(io: Io) u64 {
     const elapsed = clock_start.durationTo(Io.Timestamp.now(io, .awake));
     return @intCast(@max(elapsed.nanoseconds, 0));
@@ -127,15 +147,29 @@ pub fn main(init: std.process.Init) !void {
     const client_secret: [protection.secret_length]u8 = @splat(0x11);
     const server_secret: [protection.secret_length]u8 = @splat(0x22);
     const secrets: handshake.Secrets = .{ .client = &client_secret, .server = &server_secret };
+    // Both ends send real transport parameters. §7.3 has each name itself, and
+    // the server echo the name the client first used for it.
+    var client_parameters_buffer: [128]u8 = undefined;
+    var server_parameters_buffer: [128]u8 = undefined;
+    const client_parameters = try encodeParameters(&client_parameters_buffer, .client, .{
+        .initial_source_connection_id = &client_id,
+    });
+    const server_parameters = try encodeParameters(&server_parameters_buffer, .server, .{
+        .original_destination_connection_id = &named_server,
+        .initial_source_connection_id = &server_local_id,
+    });
+    // The client has neither the server's parameters nor the 1-RTT secrets until
+    // the server's first flight arrives, as with a real driver; the machine
+    // refuses 1-RTT without the parameters (RFC 9001 §8.2).
     var client_stub: handshake.Stub = .{
         .outbox = &.{.{ .level = .initial, .bytes = "ClientHello, faked" }},
         .handshake_secrets = secrets,
-        .app_secrets = secrets,
     };
     var server_stub: handshake.Stub = .{
         .outbox = &.{.{ .level = .initial, .bytes = "ServerHello, faked" }},
         .handshake_secrets = secrets,
         .app_secrets = secrets,
+        .peer_parameters = client_parameters,
     };
 
     const client = try arena.create(Endpoint);
@@ -146,7 +180,7 @@ pub fn main(init: std.process.Init) !void {
     // also the seed of its Initial keys, and the constructor is what pairs them.
     var client_config = Conn.clientConfig(&named_server, &client_id, client.loss());
     client_config.tls = client_stub.driver();
-    client_config.transport_parameters = "client parameters";
+    client_config.transport_parameters = client_parameters;
     client_config.crypto = .{
         .initial = &client.crypto_in_initial,
         .handshake = &client.crypto_in_handshake,
@@ -158,11 +192,7 @@ pub fn main(init: std.process.Init) !void {
     client_config.stream_slots = &client.slots;
     client_config.streams = &client.streams;
     client_config.receive_limit = 4096;
-    client_config.send_limit = 4096;
-    client_config.send_streams = .{ .bidi_remote = 4096 };
     client_config.connection_id_storage = &client.adopted_cid;
-    // The client opens one stream, so it needs the server's credit for one.
-    client_config.peer_max_streams = .{ .bidi = 1 };
     client_config.max_streams_bidi = 1;
     client.start(client_config);
     var wire: [1500]u8 = undefined;
@@ -181,7 +211,7 @@ pub fn main(init: std.process.Init) !void {
     const opening = try Conn.Opening.fromDatagram(wire[0..flight], &server_ids);
     var server_config = opening.serverConfig(&server_local_id, server.loss());
     server_config.tls = server_stub.driver();
-    server_config.transport_parameters = "server parameters";
+    server_config.transport_parameters = server_parameters;
     server_config.crypto = .{
         .initial = &server.crypto_in_initial,
         .handshake = &server.crypto_in_handshake,
@@ -193,11 +223,7 @@ pub fn main(init: std.process.Init) !void {
     server_config.stream_slots = &server.slots;
     server_config.streams = &server.streams;
     server_config.receive_limit = 4096;
-    server_config.send_limit = 4096;
     server_config.max_streams_bidi = 1;
-    // The server answers on streams the client opened, so its limit is the
-    // client's initial_max_stream_data_bidi_local.
-    server_config.send_streams = .{ .bidi_local = 4096 };
     server.start(server_config);
 
     // The server reads the flight and installs the spaces its driver reported
@@ -213,6 +239,18 @@ pub fn main(init: std.process.Init) !void {
     const hello = (try server.conn.writeHandshake(&frames, &wire, now(io))) orelse
         return error.NoHandshakeWritten;
     _ = try client.feed(wire[0..hello], now(io));
+
+    // The server's flight is what carries its parameters and finishes the
+    // handshake, so this is when the driver has both. The machine adopts the
+    // parameters as the limits it opens streams under: one stream's credit, and
+    // a window of 4096 bytes.
+    client_stub.peer_parameters = server_parameters;
+    client_stub.app_secrets = secrets;
+    try client.conn.installSpaces();
+    std.debug.print("client: the server allows {d} bytes and {d} stream\n", .{
+        client.conn.peer.?.max_data,
+        client.conn.peer.?.max_streams.bidi,
+    });
     std.debug.print("client: sends to {d} bytes named by the server\n", .{
         client.conn.destination_connection_id.len,
     });

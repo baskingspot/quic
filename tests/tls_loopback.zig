@@ -24,10 +24,37 @@ const Conn = quic.Conn;
 const server_cert_pem = @embedFile("tls_server_crt");
 const server_key_pem = @embedFile("tls_server_key");
 
-/// What the handshake carries opaquely (RFC 9001 §8.2). Real enough to have a
-/// length prefix and a varint inside; the driver never looks at them.
-const client_parameters = [_]u8{ 0x04, 0x00, 0x01, 0x80, 0x00, 0x00, 0x40, 0x64 };
-const server_parameters = [_]u8{ 0x06, 0x00, 0x02, 0x80, 0x00, 0x01, 0x08, 0x00 };
+const TransportParameters = quic.TransportParameters;
+
+/// What the handshake carries opaquely (RFC 9001 §8.2), and what `Conn` reads
+/// back out of it: the machine adopts these as the peer's limits, so they are
+/// real. Both ends advertise the same numbers, and they are the ones the two
+/// `Conn.Config`s below must agree with (`receive_limit`, `max_streams_*`).
+fn encodeParameters(comptime sender: TransportParameters.Role, comptime identity: TransportParameters) []const u8 {
+    const bytes = comptime blk: {
+        var buffer: [128]u8 = undefined;
+        var writer: quic.Writer = .init(&buffer);
+        var parameters = identity;
+        parameters.initial_max_data = 4096;
+        parameters.initial_max_stream_data_bidi_local = 1024;
+        parameters.initial_max_stream_data_bidi_remote = 1024;
+        parameters.initial_max_stream_data_uni = 1024;
+        parameters.initial_max_streams_bidi = 1;
+        parameters.initial_max_streams_uni = 1;
+        TransportParameters.encode(&writer, parameters, sender) catch unreachable;
+        const written = buffer[0..writer.written().len].*;
+        break :blk written;
+    };
+    return &bytes;
+}
+
+/// §7.3: a client names itself, and a server also echoes the connection ID the
+/// client first addressed.
+const client_parameters = encodeParameters(.client, .{ .initial_source_connection_id = &client_cid });
+const server_parameters = encodeParameters(.server, .{
+    .original_destination_connection_id = &dcid,
+    .initial_source_connection_id = &dcid,
+});
 
 test "RFC 9001 §4, a client and a server complete a TLS handshake through Conn" {
     // -- The credentials a server has to have -------------------------------
@@ -98,15 +125,12 @@ test "RFC 9001 §4, a client and a server complete a TLS handshake through Conn"
         .source_connection_id = &client_cid,
         .connection_id_storage = &client_cid_storage,
         .tls = client_driver.driver(),
-        .transport_parameters = &client_parameters,
+        .transport_parameters = client_parameters,
         .crypto = .{ .initial = &client_crypto_initial, .handshake = &client_crypto_handshake },
         .crypto_sent = .{ .initial = &client_sent_initial, .handshake = &client_sent_handshake },
         .stream_slots = &client_stream_slots,
         .streams = &client_streams,
-        .send_limit = 4096,
         .receive_limit = 4096,
-        .send_streams = .{ .bidi_remote = 4096, .bidi_local = 4096, .uni = 4096 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
         .max_streams_bidi = 1,
         .max_streams_uni = 1,
     });
@@ -117,15 +141,12 @@ test "RFC 9001 §4, a client and a server complete a TLS handshake through Conn"
         .destination_connection_id = &client_cid,
         .source_connection_id = &dcid,
         .tls = server_driver.driver(),
-        .transport_parameters = &server_parameters,
+        .transport_parameters = server_parameters,
         .crypto = .{ .initial = &server_crypto_initial, .handshake = &server_crypto_handshake },
         .crypto_sent = .{ .initial = &server_sent_initial, .handshake = &server_sent_handshake },
         .stream_slots = &server_stream_slots,
         .streams = &server_streams,
-        .send_limit = 4096,
         .receive_limit = 4096,
-        .send_streams = .{ .bidi_remote = 4096, .bidi_local = 4096, .uni = 4096 },
-        .peer_max_streams = .{ .bidi = 8, .uni = 8 },
         .max_streams_bidi = 1,
         .max_streams_uni = 1,
     });
@@ -152,8 +173,8 @@ test "RFC 9001 §4, a client and a server complete a TLS handshake through Conn"
     try testing.expect(server_driver.done());
     try testing.expectEqualStrings("h3", client_driver.selectedAlpn().?);
     try testing.expectEqualStrings("h3", server_driver.selectedAlpn().?);
-    try testing.expectEqualSlices(u8, &client_parameters, server_driver.peerTransportParameters().?);
-    try testing.expectEqualSlices(u8, &server_parameters, client_driver.peerTransportParameters().?);
+    try testing.expectEqualSlices(u8, client_parameters, server_driver.peerTransportParameters().?);
+    try testing.expectEqualSlices(u8, server_parameters, client_driver.peerTransportParameters().?);
 
     // The seam lets `secrets` hand back borrowed bytes and promises they stay
     // valid until the next call, so both roles must report the same pair and
@@ -173,6 +194,12 @@ test "RFC 9001 §4, a client and a server complete a TLS handshake through Conn"
     // both ends, and a server's handshake is confirmed by its own Finished.
     try testing.expect(client.app != null);
     try testing.expect(server.app != null);
+
+    // §7.4: each `Conn` adopted what the other advertised, from the handshake
+    // and not from its configuration.
+    try testing.expectEqual(@as(u64, 4096), client.peer.?.max_data);
+    try testing.expectEqual(@as(u64, 1), server.peer.?.max_streams.bidi);
+    try testing.expectEqual(@as(u64, 1024), client.peer.?.stream_data.bidi_remote);
 
     // -- One stream each way -------------------------------------------------
     const opened = try client.openStream(0);

@@ -290,6 +290,22 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `Conn` parses and adopts the peer's transport parameters from the handshake
+  itself, so `Config.send_limit`, `Config.send_streams`,
+  `Config.peer_max_streams`, and `Config.max_ack_delay` are gone: delete them
+  and the driver's parameters set those limits. Read what was adopted from the
+  new `Conn.peer` (a `Conn.PeerParameters`, null until the handshake delivers
+  it); a machine with no driver sets `Config.peer` instead, and passing both
+  with a driver is an assertion. `installSpaces` and `writeHandshake` return
+  `error.TransportParameter` when the parameters are missing at the 1-RTT
+  secrets, will not decode, or contradict the connection IDs of §7.3, and the
+  caller closes with TRANSPORT_PARAMETER_ERROR (0x08). A driver must now carry
+  your own parameters with `initial_source_connection_id` set (a server also
+  sets `original_destination_connection_id`), and the encoded
+  `initial_max_data` and `initial_max_streams_*` must equal `receive_limit` and
+  `max_streams_*`, which `installSpaces` asserts. An ACK's delay is now scaled
+  by the peer's `ack_delay_exponent`, not `Config.ack_delay_exponent`, which is
+  only the one you advertise.
 - HANDSHAKE_DONE no longer appears in `Opened.frames`: a client confirms the
   handshake on the frame and discards its Handshake keys (§4.1.2 and §4.9.2 of
   RFC 9001), while a server that receives one gets `error.ProtocolViolation`
