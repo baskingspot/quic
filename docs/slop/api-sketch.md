@@ -61,12 +61,31 @@ program asks for 256, and it costs exactly what it says.
 
 ## Concurrency
 
-`Connection` spawns one task with `Io.async` when it is accepted or connected.
-That task owns the socket: it reads datagrams, feeds the machine, arms the PTO
-and idle timers with `Io.sleep`, and parks on an `Io.Condition` when there is
-nothing to do. Each stream has its own `Io.Condition`; `Stream.read` waits on
-it, cancelable like every other `Io` wait, and `Stream.write` signals the task
-rather than touching the socket.
+`Connection` spawns **two** tasks with `Io.concurrent` when it is accepted or
+connected, both in one `Io.Group`, both cancelled and awaited by `deinit`. They
+take turns under one connection `Io.Mutex`:
+
+- the receiver blocks in `socket.receive`, walks the datagram into the machine,
+  and signals the per-stream conditions;
+- the sender parks in `Condition.waitTimeout` until the earliest of the PTO/loss
+  deadline and the idle timeout, then flushes what the machine owes.
+
+Each stream has its own `Io.Condition`; `Stream.read` waits on it, cancelable
+like every other `Io` wait. `Stream.write` signals the sender's condition rather
+than touching the socket.
+
+Two facts about `std.Io` forced this shape, and both are easy to walk into:
+
+- **`Io.async` may run the function inline.** `Threaded.zig` calls the function
+  at the call site when the busy count is at its limit or the future cannot be
+  allocated, and returns a null future. A task that only ends when cancelled
+  would therefore never return from `accept`. `Io.concurrent` instead fails with
+  `error.ConcurrencyUnavailable`, which is a caller's error and not a deadlock.
+- **One task cannot wait on a socket and a condition at once.**
+  `Condition.wait` is a futex wait and `Socket.receive` is an `Operation`;
+  `Io.Batch` takes operations and has no futex member. So "the writer signals
+  the demux task" only works if the task is parked on a condition, which is why
+  receiving and sending are separate tasks.
 
 Consequences a caller sees:
 
@@ -93,11 +112,9 @@ Consequences a caller sees:
 
 ## Staging
 
-1. `Sizing` + `Endpoint` + `Connection` + `Stream` with the signatures above,
-   `Endpoint.accept`/`Connection.openStream`/`acceptStream`/`Stream.read`/
-   `write`/`shutdown`/`close`, driving the existing machine. Migrate
-   `examples/hq_server.zig` and `examples/hq_client.zig`. `just interop-hq`,
-   `just interop-go`, and `just interop-go-xnet` must stay green.
+1. Done (`c2d3cf5`): `Sizing`, `Endpoint`, `Connection`, `Stream` with the
+   signatures above, two tasks as described, both hq examples migrated.
+   `just interop-hq`, `just interop-go`, and `just interop-go-xnet` green.
 2. `Reader`/`Writer` adapters over `std.Io.Reader`/`std.Io.Writer`.
 3. Delete what the shell no longer needs from `src/io.zig` (the current
    eight-buffer `Config`, the manual `flush`/`receive` pair).
