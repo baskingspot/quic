@@ -7,6 +7,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `tools/interop_go`: a quic-go (v0.65.0) hq-interop client, a QUIC stack that is
+  not ours, and `just interop-go`, which builds it with `go build`, runs it
+  against `hq_server`, and fails unless it prints the body. It skips with a
+  message when `go` is not on PATH, and the dev shell now provides it. Known
+  limit: it fails today, because `baskingspot/tls`'s server refuses the
+  X25519MLKEM768 key share quic-go leads with (`HybridServerUnsupported`).
 - A server sends HANDSHAKE_DONE (`Conn.writeConfirmation`, and `quic-io`'s
   `flush` calls it) once its handshake is confirmed, so a client such as quiche
   or ngtcp2 learns it too (RFC 9000 §13.3). Known limit: a lost HANDSHAKE_DONE
