@@ -11,9 +11,11 @@
 //! Run it with `just example`.
 
 const std = @import("std");
-const quic = @import("quic");
-
 const Io = std.Io;
+const print = std.debug.print;
+const assert = std.debug.assert;
+
+const quic = @import("quic");
 const Conn = quic.Conn;
 const Recovery = quic.Recovery;
 const frame = quic.frame;
@@ -121,14 +123,14 @@ fn encodeParameters(
 }
 
 fn now(io: Io) u64 {
-    const elapsed = clock_start.durationTo(Io.Timestamp.now(io, .awake));
+    const elapsed = clock_start.durationTo(.now(io, .awake));
     return @intCast(@max(elapsed.nanoseconds, 0));
 }
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
-    clock_start = Io.Timestamp.now(io, .awake);
+    clock_start = .now(io, .awake);
 
     // The client invents the server's name, and §7.2 asks for eight bytes: it is
     // also the seed of the Initial keys (RFC 9001 §5.2).
@@ -210,7 +212,7 @@ pub fn main(init: std.process.Init) !void {
     // pairs them with the right one. The IDs are copied out of the receive
     // buffer, which is about to be reused.
     var server_ids: [40]u8 = undefined;
-    const opening = try Conn.Opening.fromDatagram(wire[0..flight], &server_ids);
+    const opening: Conn.Opening = try .fromDatagram(wire[0..flight], &server_ids);
     var server_config = opening.serverConfig(&server_local_id, server.loss());
     server_config.tls = server_stub.driver();
     server_config.transport_parameters = server_parameters;
@@ -231,9 +233,9 @@ pub fn main(init: std.process.Init) !void {
     // The server reads the flight and installs the spaces its driver reported
     // secrets for; that is what makes its 1-RTT keys exist.
     const first_server_packet = try server.feed(wire[0..flight], now(io));
-    std.debug.assert(first_server_packet.space == .initial);
+    assert(first_server_packet.space == .initial);
     try server.conn.installSpaces();
-    std.debug.print("server: 1-RTT keys from the faked handshake: {}\n", .{server.conn.app != null});
+    print("server: 1-RTT keys from the faked handshake: {}\n", .{server.conn.app != null});
 
     // Its answer is also what names it: §7.2 makes the client adopt the Source
     // Connection ID of the server's first Initial, and a short header has no
@@ -249,11 +251,11 @@ pub fn main(init: std.process.Init) !void {
     client_stub.peer_parameters = server_parameters;
     client_stub.app_secrets = secrets;
     try client.conn.installSpaces();
-    std.debug.print("client: the server allows {d} bytes and {d} stream\n", .{
+    print("client: the server allows {d} bytes and {d} stream\n", .{
         client.conn.peer.?.max_data,
         client.conn.peer.?.max_streams.bidi,
     });
-    std.debug.print("client: sends to {d} bytes named by the server\n", .{
+    print("client: sends to {d} bytes named by the server\n", .{
         client.conn.destination_connection_id.len,
     });
 
@@ -275,7 +277,7 @@ pub fn main(init: std.process.Init) !void {
         .max_payload = 1200,
         .now = now(io),
     })) orelse return error.NothingToSend;
-    std.debug.print("client: packet {d}, {d} bytes on the wire, took {d} offers\n", .{
+    print("client: packet {d}, {d} bytes on the wire, took {d} offers\n", .{
         sent.number,
         sent.length,
         sent.consumed.taken,
@@ -290,7 +292,7 @@ pub fn main(init: std.process.Init) !void {
         var read: [1024]u8 = undefined;
         const count = try incoming.recv.readInto(&read);
         if (count == 0) continue;
-        std.debug.print("server: stream {d} had {d} bytes\n", .{ changed.stream_id, count });
+        print("server: stream {d} had {d} bytes\n", .{ changed.stream_id, count });
 
         // A bidirectional stream the peer opened is not writable until this
         // endpoint joins it, which is a different act from opening one: nothing
@@ -308,7 +310,7 @@ pub fn main(init: std.process.Init) !void {
             .now = now(io),
         })) orelse return error.NothingToSend;
         echoed = reply.length;
-        std.debug.print("server: echoed in packet {d}\n", .{reply.number});
+        print("server: echoed in packet {d}\n", .{reply.number});
     }
 
     // The client reads the echo the same way: the same report, on its side.
@@ -317,13 +319,13 @@ pub fn main(init: std.process.Init) !void {
         const echoed_back = client.conn.stream(changed.stream_id) orelse continue;
         var read_back: [1024]u8 = undefined;
         const count = try echoed_back.recv.readInto(&read_back);
-        std.debug.print("client: read back \"{s}\"\n", .{read_back[0..count]});
+        print("client: read back \"{s}\"\n", .{read_back[0..count]});
     }
 
     // Nothing here ever acknowledged a packet, so both ends still hold
     // everything in flight. A real loop asks `ackOwed`/`writeAck` and runs
     // `RecoveryDriver`; this one just shows the bill.
-    std.debug.print("client: {d} in flight, server: {d} in flight\n", .{
+    print("client: {d} in flight, server: {d} in flight\n", .{
         client.conn.app.?.recovery.inFlight().len,
         server.conn.app.?.recovery.inFlight().len,
     });

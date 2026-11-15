@@ -7,12 +7,13 @@
 //! application that proves a handshake carried bytes both ways.
 
 const std = @import("std");
+const Io = std.Io;
+const testing = std.testing;
+
+const driver = @import("quic-tls");
 const quic = @import("quic");
 const quic_io = @import("quic-io");
-const driver = @import("quic-tls");
 const tls = @import("tls");
-
-const Io = std.Io;
 
 /// The application protocol both ends name in the handshake.
 pub const alpn = "hq-interop";
@@ -48,7 +49,7 @@ pub const Tls = struct {
     pub fn start(self: *Tls, io: Io, config: driver.Config) driver.Error!quic.handshake.Driver {
         var random: [32]u8 = undefined;
         io.random(&random);
-        self.engine = try driver.Tls.init(.{
+        self.engine = try .init(.{
             .slots = &self.slots,
             .out = &self.out,
             .peer_bytes = .{
@@ -96,8 +97,6 @@ pub fn writeAll(stream: quic_io.Stream, io: Io, bytes: []const u8) quic_io.Strea
 // a real TLS 1.3 handshake: what `just interop-hq` runs as two processes, plus
 // what only a test can arrange.
 
-const testing = std.testing;
-
 /// File scope: an endpoint is tens of kilobytes and must not move.
 var test_client: Endpoint = undefined;
 var test_server: Endpoint = undefined;
@@ -128,8 +127,8 @@ const Pair = struct {
             }
             return error.NoFreePort;
         };
-        const chain = try tls.certificate_chain.CertificateChain.fromPem(cert_pem, &self.der, &self.chain_slots);
-        self.key = try tls.signature.PrivateKey.fromPemAuto(@embedFile("tls_server_key"));
+        const chain: tls.certificate_chain.CertificateChain = try .fromPem(cert_pem, &self.der, &self.chain_slots);
+        self.key = try .fromPemAuto(@embedFile("tls_server_key"));
         const server_driver = try server_tls.start(io, .{ .server = .{
             .credentials = .{ .chain = chain, .signer = self.key.signer() },
             .alpn = &.{alpn},
