@@ -1,0 +1,5 @@
+# The full gate runs the default build, which includes the TLS driver. The
+# second job builds with -Dno-tls, so the codec-only escape hatch cannot rot.
+jobs:
+  - recipe: ci
+  - recipe: test-no-tls

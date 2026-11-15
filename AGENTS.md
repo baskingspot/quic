@@ -10,10 +10,11 @@ QUIC in Zig: sans-I/O packet and frame codecs, transport parameters, and the los
 
 Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix develop` provides Zig, `ziglint`, and the base tools, and nothing comes from the system PATH. The justfile is the command interface: `just test`, `just lint`, `just fuzz`, `just ci`. Run `just fmt` before you commit.
 
-`just test` passes `-Dtls`, which fetches `baskingspot/tls` and builds the
-handshake seam checks in `tests/tls_seam.zig`. A bare `zig build test` skips
-them, and a clean build needs the dev shell's openssl and pkg-config because tls
-translates and links libcrypto.
+TLS is built by default: `zig build test` runs the `quic-tls` driver, loopback,
+and handshake seam suites (`tests/tls_seam.zig`) over `baskingspot/tls`, and a
+clean build needs the dev shell's openssl and pkg-config because tls translates
+and links libcrypto. `-Dno-tls` is the codec-only build, with no tls, no
+`quic-tls`, and no C toolchain; `just test-no-tls` runs it, and CI runs it once.
 
 ## Design
 
@@ -65,9 +66,12 @@ translates and links libcrypto.
   prototype and is deleted: keys, packet numbers, received ranges, and the ACK
   an Initial owes are `Conn`'s, in `Conn.Space`. Nothing may reintroduce a
   second packet-number space type beside it.
-- The TLS handshake is not in this repo. HTTP/3 and QPACK are not either.
-  This is RFC 9000: packets, frames, transport parameters, and the loss
-  recovery loop.
+- The TLS driver lives in `src/tls.zig` (module `quic-tls`) over
+  `baskingspot/tls`. `Conn` itself never imports crypto: it talks to the driver
+  through the seam in `src/handshake.zig`, and `-Dno-tls` is the codec-only
+  build. HTTP/3 and QPACK are not in this repo. This is RFC 9000 and the RFC
+  9001 packet protection around it: packets, frames, transport parameters, and
+  the loss recovery loop.
 - Error sets are explicit and per codec. A decoder distinguishes `Truncated`
   (the buffer ended inside a field) from a protocol violation (`NonMinimal`,
   `InvalidAckRange`), because the caller's response differs: one waits for

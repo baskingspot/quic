@@ -5,10 +5,15 @@
 default:
     @just --list
 
-[doc("Unit tests, including the TLS seam checks against baskingspot/tls, which is why the build needs -Dtls and the devshell's openssl")]
+[doc("Unit tests, including the TLS driver, loopback, and seam suites over baskingspot/tls, which is why the build needs the devshell's openssl")]
 [group("test")]
 test:
-    zig build test -Dtls --summary all
+    zig build test --summary all
+
+[doc("Unit tests of the codecs alone, built with -Dno-tls: no quic-tls module, no tls dependency, and no C toolchain in the build. CI runs this so the escape hatch cannot rot")]
+[group("test")]
+test-no-tls:
+    zig build test -Dno-tls --summary all
 
 [doc("Build and run the echo example: the machine called as an application would")]
 [group("test")]
@@ -60,7 +65,7 @@ interop:
 interop-hq:
     #!/usr/bin/env bash
     set -uo pipefail
-    zig build hq-bin -Dtls || exit 1
+    zig build hq-bin || exit 1
     expected="hello from baskingspot/quic"
     server=""
     trap '[ -n "$server" ] && kill "$server" 2>/dev/null' EXIT
@@ -114,7 +119,7 @@ _interop-go NAME:
         echo "{{ NAME }}: go comes from the dev shell: run this under nix develop."
         exit 0
     fi
-    zig build hq-bin -Dtls || exit 1
+    zig build hq-bin || exit 1
     (cd tools/{{ NAME }} && go build -o ../../zig-out/bin/{{ NAME }} .) || exit 1
     expected="hello from baskingspot/quic"
     server=""

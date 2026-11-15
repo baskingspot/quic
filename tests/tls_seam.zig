@@ -8,7 +8,7 @@
 //! the API this repository asked tls for.
 //!
 //! Developer-only, like the RFC 9001 vectors: the package a consumer fetches
-//! does not carry this file. `just test` passes `-Dtls` to build it.
+//! does not carry this file. `just test` builds it unless `-Dno-tls` is passed.
 
 const std = @import("std");
 const testing = std.testing;

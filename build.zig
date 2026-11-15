@@ -12,19 +12,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The TLS driver over baskingspot/tls lives behind an option, the way tls
-    // gates its own xev integration: a consumer that never asks for the driver
-    // never fetches the dependency. `just test` passes -Dtls, so the driver
-    // tests run in CI without making TLS part of every quic build.
-    const expose_tls = b.option(
+    // The TLS driver over baskingspot/tls is built by default: QUIC requires
+    // TLS 1.3, so a package that cannot connect is not much of a package.
+    // `-Dno-tls` is the escape hatch for a codec-only build, which fetches no
+    // tls and needs neither OpenSSL headers nor pkg-config, because tls
+    // translates and links libcrypto from source.
+    const no_tls = b.option(
         bool,
-        "tls",
-        "Expose the quic-tls driver and fetch the baskingspot/tls dependency",
+        "no-tls",
+        "Build the codecs only, with no quic-tls driver and no baskingspot/tls build, " ++
+            "so OpenSSL headers and pkg-config are not needed",
     ) orelse false;
-    const tls_dep: ?*std.Build.Dependency = if (expose_tls)
-        b.lazyDependency("tls", .{ .target = target, .optimize = optimize })
+    const tls_dep: ?*std.Build.Dependency = if (no_tls)
+        null
     else
-        null;
+        b.dependency("tls", .{ .target = target, .optimize = optimize });
 
     if (b.pkg_hash.len != 0) return;
 
@@ -58,13 +60,14 @@ pub fn build(b: *std.Build) void {
     const io_tests = b.addTest(.{ .root_module = io_mod });
     test_step.dependOn(&b.addRunArtifact(io_tests).step);
 
-    // What the seam asks of a TLS driver, checked against the package that has
-    // to provide it. These tests exist to fail when baskingspot/tls closes a
-    // gap: each one pins a place the two packages do not meet today, so the
-    // day it meets them the work resumes instead of being forgotten.
-    // The driver itself, and a second module because it imports tls: a
-    // consumer that fetches `quic` must not fetch tls, so `quic-tls` exists
-    // only behind `-Dtls`.
+    // The driver itself, and a second module because it imports tls: `quic`
+    // never imports crypto, so `quic-tls` is the one module that does. It
+    // exists unless `-Dno-tls` asks for the codecs alone.
+    //
+    // The seam tests below check what the seam asks of a TLS driver against the
+    // package that has to provide it. They exist to fail when baskingspot/tls
+    // closes a gap: each one pins a place the two packages do not meet today,
+    // so the day it meets them the work resumes instead of being forgotten.
     if (tls_dep) |dependency| {
         const driver_mod = b.addModule("quic-tls", .{
             .root_source_file = b.path("src/tls.zig"),

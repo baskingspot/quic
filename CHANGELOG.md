@@ -24,8 +24,7 @@ All notable changes to quic are recorded here. The format follows
   resend yet.
 - `examples/hq_server.zig` and `examples/hq_client.zig`: an hq-interop server
   and client that carry one `GET` and its response over a real TLS 1.3
-  handshake on loopback UDP. `just interop-hq` builds both (`zig build hq-bin
-  -Dtls`), runs them against the self-signed certificate in `tests/fixtures`,
+  handshake on loopback UDP. `just interop-hq` builds both (`zig build hq-bin`), runs them against the self-signed certificate in `tests/fixtures`,
   and fails unless the client prints the body. Both bound every wait and print
   `TIMEOUT` and exit 1 when the handshake stalls.
 - The `quic-io` module: the socket half of a connection, over `std.Io`. It
@@ -37,8 +36,7 @@ All notable changes to quic are recorded here. The format follows
 - `quic-io` has a loopback test with two real sockets: one seals an Initial,
   the other receives it and sends back the acknowledgment it owes.
 - The `quic-tls` module: a real TLS 1.3 driver for `Conn.tls`, over
-  `baskingspot/tls`'s step core. Build it with `-Dtls`; a consumer that fetches
-  `quic` alone never fetches tls. It carries transport parameters both ways
+  `baskingspot/tls`'s step core. It is built by default and `-Dno-tls` leaves it out. It carries transport parameters both ways
   (RFC 9001 §8.2), reports handshake and application secrets per level, ALPN,
   and a server's confirmation, and maps a peer's TLS alert to its CRYPTO_ERROR
   code (§20.1 of RFC 9000). `tests/tls_loopback.zig` runs a full handshake
@@ -311,6 +309,14 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- TLS is now built by default. `zig build` and `zig build test` include the
+  `quic-tls` driver, the loopback and seam suites, and the hq-interop examples,
+  and resolve the `baskingspot/tls` dependency, which needs OpenSSL headers and
+  pkg-config to build. `-Dno-tls` opts out and gives the codec-only build: no
+  tls, no `quic-tls`, no C toolchain. The `-Dtls` option is gone. A consumer
+  who wants no C toolchain must pass `-Dno-tls` to the `quic` dependency. QUIC
+  requires TLS 1.3, so a package that cannot connect was a footgun. `just
+  test-no-tls` runs the codec-only suites, and CI runs it as one extra job.
 - `quic-io` now mirrors `std.Io.net` (docs/slop/api-sketch.md), and the old
   shell is gone: `Connection.init`, `Connection.Config`, `Connection.Accepting`,
   `accept(accepting, now, timeout)`, `receive`, `flush`, and `established`.
@@ -321,7 +327,7 @@ All notable changes to quic are recorded here. The format follows
   .parameters })`. Both return a `Connection` once the handshake is done.
 - `quic-io` takes a ready `quic.handshake.Driver` instead of building one: the
   certificate, key, and ALPN go into the driver (`quic-tls`), so `quic-io` still
-  imports `quic` alone and needs no `-Dtls`. `parameters` is a
+  imports `quic` alone and so builds under `-Dno-tls`. `parameters` is a
   `TransportParameters` value, not bytes. The windows, the stream counts (all
   bidirectional when you set neither), `max_udp_payload_size`, and the
   connection IDs are filled in from the sizing and the handshake.

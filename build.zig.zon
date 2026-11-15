@@ -32,8 +32,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // The TLS 1.3 handshake the quic-tls driver runs over. Lazy because the
-        // package is only fetched when a build asks for that driver: `-Dtls`.
+        // The TLS 1.3 handshake the quic-tls driver runs over. Built by
+        // default. `-Dno-tls` still fetches it, because a dependency is fetched
+        // before any option is read, but never configures or compiles it.
         // v0.4.0 is the first release that builds on Zig 0.17 and the first
         // without the libxev dependency, whose build script does not compile on
         // 0.17: as a fetched dependency it reached the configurer even with
@@ -46,7 +47,6 @@
         .tls = .{
             .url = "git+https://github.com/baskingspot/tls#ba5aa4f107aa80e0d41d3d85f2a4f848f3368319",
             .hash = "tls-0.4.1-nf2MKCo_KgA_szb-WZrLl13t3BpJlIzJ0LtbBrx16PzZ",
-            .lazy = true,
         },
     },
     .paths = .{

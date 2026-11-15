@@ -32,10 +32,11 @@
               config.devShells."zig-0-17"
             ];
 
-            # Project-specific tools. The optional quic-tls module builds
+            # Project-specific tools. The quic-tls module builds
             # baskingspot/tls, which translates its libcrypto bindings at
-            # compile time and links libcrypto: `just test` passes -Dtls, and
-            # without these the translate step cannot find a header.
+            # compile time and links libcrypto: the default build needs them,
+            # and without these the translate step cannot find a header.
+            # Only `-Dno-tls` builds without them.
             packages = with pkgs; [
               openssl
               pkg-config
