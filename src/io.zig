@@ -516,6 +516,118 @@ pub const Stream = struct {
         core.wake.signal(io);
     }
 
+    /// A `std.Io.Reader` over `read`, as `Io.net.Stream.Reader` is over a
+    /// socket: hand `&reader.interface` to anything that takes a reader. The
+    /// peer's FIN is `error.EndOfStream`; a failed `read` is
+    /// `error.ReadFailed`, and `err` holds why.
+    pub const Reader = struct {
+        io: Io,
+        interface: Io.Reader,
+        stream: Stream,
+        err: ?Error,
+
+        pub const Error = ReadError;
+
+        /// The most slices one `read` fills: the caller's and the buffer.
+        const max_vectors = 8;
+
+        pub fn init(stream: Stream, io: Io, buffer: []u8) Reader {
+            return .{
+                .io = io,
+                .interface = .{
+                    .vtable = &.{
+                        .stream = streamImpl,
+                        .readVec = readVec,
+                    },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+                .stream = stream,
+                .err = null,
+            };
+        }
+
+        fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+            const dest = limit.slice(try io_w.writableSliceGreedy(1));
+            var data: [1][]u8 = .{dest};
+            const n = try readVec(io_r, &data);
+            io_w.advance(n);
+            return n;
+        }
+
+        fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+            const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
+            var vectors: [max_vectors][]u8 = undefined;
+            const dest_n, const data_size = try io_r.writableVector(&vectors, data);
+            const dest = vectors[0..dest_n];
+            // `read` returns 0 for no room as well as for the FIN, so an empty
+            // destination would read as the end of the stream.
+            assert(dest[0].len > 0);
+            const n = r.stream.read(r.io, dest) catch |err| {
+                r.err = err;
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            if (n > data_size) {
+                r.interface.end += n - data_size;
+                return data_size;
+            }
+            return n;
+        }
+    };
+
+    /// A `std.Io.Writer` over `write`, as `Io.net.Stream.Writer` is over a
+    /// socket. What it drains is queued for the connection's sender, which
+    /// carries it in STREAM frames; a failed `write` is `error.WriteFailed`,
+    /// and `err` holds why. The FIN is still `shutdown(.send)` or `close`.
+    pub const Writer = struct {
+        io: Io,
+        interface: Io.Writer,
+        stream: Stream,
+        err: ?Error = null,
+
+        pub const Error = WriteError;
+
+        pub fn init(stream: Stream, io: Io, buffer: []u8) Writer {
+            return .{
+                .io = io,
+                .stream = stream,
+                .interface = .{
+                    .vtable = &.{ .drain = drain },
+                    .buffer = buffer,
+                },
+            };
+        }
+
+        /// One `write` per call, of the buffer first and then of the first
+        /// slice of `data` with bytes in it: `write` takes one slice, and a
+        /// short drain is the interface's to repeat.
+        fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+            const w: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
+            assert(data.len > 0);
+            const buffered = io_w.buffered();
+            if (buffered.len > 0) return io_w.consume(try w.send(buffered));
+            for (data[0 .. data.len - 1]) |bytes| {
+                if (bytes.len > 0) return w.send(bytes);
+            }
+            const pattern = data[data.len - 1];
+            if (pattern.len == 0 or splat == 0) return 0;
+            // One copy of the pattern; the interface counts the rest.
+            return w.send(pattern);
+        }
+
+        fn send(w: *Writer, bytes: []const u8) Io.Writer.Error!usize {
+            assert(bytes.len > 0);
+            const n = w.stream.write(w.io, bytes) catch |err| {
+                w.err = err;
+                return error.WriteFailed;
+            };
+            assert(n > 0);
+            return n;
+        }
+    };
+
     /// What a read can return now, or null when it has to wait.
     fn readAvailable(recv: *quic.ReceiveStream, data: [][]u8) error{StreamReset}!?usize {
         switch (recv.state) {
@@ -546,8 +658,9 @@ pub const Stream = struct {
 // -- Tests -------------------------------------------------------------------
 //
 // What needs no handshake. The handshake, streams in both directions, a
-// canceled read, a stale handle, and `deinit` with the tasks running are in
-// examples/hq.zig, which has a real TLS driver.
+// canceled read, a stale handle, `deinit` with the tasks running, and
+// `Stream.Reader` and `Stream.Writer` are in examples/hq.zig, which has a real
+// TLS driver.
 
 test "SizingLimits, every dependent length follows from five numbers" {
     const S = Sizing(.{ .streams = 3, .stream_ring = 100, .sent_packets = 5, .crypto = 7, .datagram = 1300 });

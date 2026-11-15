@@ -2,10 +2,10 @@
 //! one response.
 //!
 //! Usage: `hq_server <cert.pem> <key.pem> <port>`. It binds 127.0.0.1:<port>,
-//! accepts one connection, reads `GET /<path>\r\n` off the first stream the
-//! client opens until the client's FIN, answers on the same stream with a fixed
-//! body and a FIN, waits for the client to close the connection, and exits. It
-//! never accepts a second connection, which is why every buffer is static.
+//! accepts one connection, reads the line `GET /<path>\r\n` off the first
+//! stream the client opens, answers on the same stream with a fixed body and a
+//! FIN, waits for the client to close the connection, and exits. It never
+//! accepts a second connection, which is why every buffer is static.
 //!
 //! The idle timeout bounds every wait: a handshake that goes nowhere, or a
 //! client that goes quiet, prints `hq_server: TIMEOUT` and exits 1.
@@ -18,6 +18,7 @@ const print = std.debug.print;
 const assert = std.debug.assert;
 const mem = std.mem;
 
+const quic_io = @import("quic-io");
 const tls = @import("tls");
 
 const hq = @import("hq.zig");
@@ -82,13 +83,19 @@ fn serve(io: Io) !void {
     const stream = try connection.acceptStream(io);
     defer stream.close(io);
 
-    const line = try hq.readAll(stream, io, &request);
+    var reader: quic_io.Stream.Reader = .init(stream, io, &request);
+    const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.EndOfStream, error.StreamTooLong => return error.BadRequest,
+    };
     if (!mem.startsWith(u8, line, "GET /") or !mem.endsWith(u8, line, "\r\n")) {
         return error.BadRequest;
     }
     print("hq_server: request {s}\n", .{line[0 .. line.len - 2]});
 
-    try hq.writeAll(stream, io, hq.body);
+    // Unbuffered: the body goes to the stream in one write, with no flush.
+    var writer: quic_io.Stream.Writer = .init(stream, io, &.{});
+    writer.interface.writeAll(hq.body) catch return writer.err.?;
     try stream.shutdown(io, .send);
 
     // The client closes once it has read the response. Closing first could

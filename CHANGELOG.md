@@ -7,6 +7,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `quic-io`'s `Stream.Reader` and `Stream.Writer`, as `std.Io.net` has them: a
+  QUIC stream can be handed to anything that takes a `std.Io.Reader` or a
+  `std.Io.Writer`. The peer's FIN reads as `error.EndOfStream`, and after
+  `error.ReadFailed` or `error.WriteFailed` the adapter's `err` names what the
+  stream reported, such as `error.StreamReset`. The hq examples now use them.
 - `tools/interop_go`: a quic-go (v0.65.0) hq-interop client, a QUIC stack that is
   not ours, and `just interop-go`, which builds it with `go build`, runs it
   against `hq_server`, and fails unless it prints the body. It skips with a

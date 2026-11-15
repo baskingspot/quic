@@ -4,8 +4,8 @@
 //! Usage: `hq_client <port> <path>`. It connects to 127.0.0.1:<port>, trusts the
 //! server's self-signed certificate (`insecure_no_chain_anchor`: this is a
 //! loopback demonstration, not a policy to copy), sends `GET <path>\r\n` on a
-//! new bidirectional stream with a FIN, reads the response until the server's
-//! FIN, prints it to stdout, closes with NO_ERROR, and exits.
+//! new bidirectional stream with a FIN, copies the response to stdout until the
+//! server's FIN, closes with NO_ERROR, and exits.
 //!
 //! The idle timeout bounds every wait: a handshake that goes nowhere prints
 //! `hq_client: TIMEOUT` and exits 1.
@@ -17,6 +17,7 @@ const Io = std.Io;
 const print = std.debug.print;
 
 const quic = @import("quic");
+const quic_io = @import("quic-io");
 const tls = @import("tls");
 
 const hq = @import("hq.zig");
@@ -76,13 +77,19 @@ fn fetch(io: Io, server: Io.net.IpAddress, driver: quic.handshake.Driver, path: 
     });
 
     const stream = try connection.openStream(io, .bidi);
-    try hq.writeAll(stream, io, try std.mem.print(&request, "GET {s}\r\n", .{path}));
+    var writer: quic_io.Stream.Writer = .init(stream, io, &request);
+    writer.interface.print("GET {s}\r\n", .{path}) catch return writer.err.?;
+    writer.interface.flush() catch return writer.err.?;
     try stream.shutdown(io, .send);
-    const body = try hq.readAll(stream, io, &response);
+
+    // Unbuffered: `streamRemaining` reads straight into stdout's buffer.
+    var reader: quic_io.Stream.Reader = .init(stream, io, &.{});
+    var stdout = Io.File.stdout().writerStreaming(io, &response);
+    _ = reader.interface.streamRemaining(&stdout.interface) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.WriteFailed => return stdout.err orelse err,
+    };
+    stdout.interface.flush() catch |err| return stdout.err orelse err;
     stream.close(io);
     connection.close(io);
-
-    const stdout = Io.File.stdout();
-    try stdout.writeStreamingAll(io, body);
-    if (body.len == 0 or body[body.len - 1] != '\n') try stdout.writeStreamingAll(io, "\n");
 }
