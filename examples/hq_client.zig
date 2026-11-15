@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const path = args[2];
     const io = init.io;
-    const server: Io.net.IpAddres = try .parseIp4("127.0.0.1", port);
+    const server: Io.net.IpAddress = try .parseIp4("127.0.0.1", port);
 
     var policy: tls.certificate.Policy = .init;
     policy.insecure_no_chain_anchor = true;
