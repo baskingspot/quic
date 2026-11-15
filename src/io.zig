@@ -246,22 +246,35 @@ pub fn Endpoint(comptime S: type) type {
         /// and return once its handshake is done (§7.2).
         ///
         /// A datagram that cannot start a connection is dropped and the wait
-        /// goes on: one under 1200 bytes (§14.1), or one whose first packet is
-        /// not a version 1 Initial with a destination connection ID. A
-        /// handshake that fails after that returns its error, and the endpoint
-        /// is spent: its driver was that handshake's. `deinit` it either way.
+        /// goes on, with the endpoint exactly as it was (§8.1): one under 1200
+        /// bytes (§14.1), one whose first packet is not a version 1 Initial
+        /// with a destination connection ID, and one whose first packet does
+        /// not open under the Initial keys. A handshake that fails after that
+        /// returns its error, and the endpoint is spent: its driver was that
+        /// handshake's. `deinit` it either way.
         pub fn accept(self: *Self, io: Io) AcceptError!Connection {
             assert(self.core.phase == .listening);
-            while (self.core.phase == .listening) {
-                const message = try self.core.socket.receive(io, &self.sizing.datagram_in);
-                if (message.data.len < Conn.min_initial_datagram) continue;
-                const opening = Conn.Opening.fromDatagram(message.data, &self.sizing.connection_ids) catch continue;
-                self.core.peer = message.from;
-                try self.begin(io, opening, message.data);
-            }
+            while (self.core.phase == .listening) try self.receiveFirst(io);
             errdefer self.core.stop(io);
             try self.core.awaitEstablished(io);
             return .{ .core = &self.core };
+        }
+
+        /// Take one datagram off the socket. Only one whose first packet opens
+        /// under the Initial keys begins the connection (§8.1); any other
+        /// returns with the endpoint untouched: `phase` is still `listening`,
+        /// `core.peer` is not set, and nothing was handed to the machine or the
+        /// driver. `sizing.connection_ids` and the datagram buffers are scratch
+        /// until `begin`, so a refused datagram leaves them written and
+        /// meaningless.
+        fn receiveFirst(self: *Self, io: Io) AcceptError!void {
+            assert(self.core.phase == .listening);
+            const sizing = &self.sizing;
+            const message = try self.core.socket.receive(io, &sizing.datagram_in);
+            if (message.data.len < Conn.min_initial_datagram) return;
+            const opening = Conn.Opening.fromDatagram(message.data, &sizing.connection_ids) catch return;
+            opening.authenticate(message.data, &sizing.scratch, &sizing.plaintext) catch return;
+            try self.begin(io, opening, message.data, message.from);
         }
 
         /// Connect to `config.peer` and return once the handshake is done. The
@@ -322,8 +335,19 @@ pub fn Endpoint(comptime S: type) type {
         }
 
         /// A server's machine, named by the client's first Initial (§7.2),
-        /// with parameters that echo it (§7.3).
-        fn begin(self: *Self, io: Io, opening: Conn.Opening, first: []u8) AcceptError!void {
+        /// with parameters that echo it (§7.3). `first` has already opened
+        /// (`Opening.authenticate`), and `from` sent it.
+        ///
+        /// The one step that can fail before the machine exists, `encode`, runs
+        /// before `peer` is set, so an error here leaves the endpoint
+        /// listening.
+        fn begin(
+            self: *Self,
+            io: Io,
+            opening: Conn.Opening,
+            first: []u8,
+            from: IpAddress,
+        ) AcceptError!void {
             const sizing = &self.sizing;
             io.random(&sizing.own_id);
             var parameters = self.parameters;
@@ -331,6 +355,7 @@ pub fn Endpoint(comptime S: type) type {
             parameters.initial_source_connection_id = &sizing.own_id;
             var config = self.machine(opening.serverConfig(&sizing.own_id, sizing.loss()));
             config.transport_parameters = try self.encode(parameters, .server);
+            self.core.peer = from;
             try self.core.begin(config, first);
         }
 
@@ -717,4 +742,81 @@ test "RFC 9000 §14.1, accept drops what cannot start a connection, and is cance
     try sender.send(io, &address, &junk);
     try testing.expectError(error.Canceled, accepting.cancel(io));
     try testing.expectEqual(Core.Phase.listening, test_endpoint.core.phase);
+}
+
+/// A version 1 Initial from a client that named the server `dcid`, sealed under
+/// the keys that name seeds (§5.2 of RFC 9001) and padded to 1200 bytes
+/// (§14.1). Its payload is a PING and padding: enough to open, and no CRYPTO.
+fn clientInitial(out: *[Conn.min_initial_datagram]u8, dcid: *const [8]u8) void {
+    out[0..5].* = .{ 0xc3, 0, 0, 0, 1 };
+    out[5] = dcid.len;
+    out[6..14].* = dcid.*;
+    out[14] = 8; // The client's own name, which the test never reads back.
+    out[15..23].* = @splat(0xc1);
+    out[23] = 0; // No token.
+    const pn_offset = 26;
+    const pn_len = 4;
+    const payload_len = out.len - pn_offset - pn_len - quic.protection.tag_length;
+    // The Length field is a two-byte varint counting what follows it.
+    const length: u16 = out.len - pn_offset;
+    out[24] = 0x40 | @as(u8, @intCast(length >> 8));
+    out[25] = @truncate(length);
+    out[pn_offset..][0..pn_len].* = @splat(0); // Packet number 0.
+    var payload: [payload_len]u8 = @splat(0);
+    payload[0] = 0x01; // PING; the rest is PADDING.
+    const secrets = quic.protection.initialSecrets(dcid);
+    const keys = quic.protection.deriveKeys(&secrets.client, .aes_128_gcm) catch unreachable;
+    const sealed = quic.protection.sealPacket(&keys, 0, pn_offset, pn_len, &payload, out) catch unreachable;
+    assert(sealed == out.len);
+}
+
+test "RFC 9000 §8.1, a first datagram that does not open leaves the endpoint as it was, and a genuine one then opens" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var address: IpAddress = undefined;
+    const socket = bound: {
+        var port: u16 = 47551;
+        while (port < 47601) : (port += 1) {
+            address = .{ .ip4 = .loopback(port) };
+            break :bound address.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch continue;
+        }
+        return error.NoFreePort;
+    };
+    const local: IpAddress = .{ .ip4 = .loopback(0) };
+    const sender = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer sender.close(io);
+
+    var stub: quic.handshake.Stub = .{};
+    test_endpoint.listen(.{ .io = io, .socket = socket, .driver = stub.driver() });
+    defer test_endpoint.deinit(io);
+    const nowhere: IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+
+    var genuine: [Conn.min_initial_datagram]u8 = undefined;
+    clientInitial(&genuine, &.{ 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1 });
+
+    // The header reads true and the tag does not verify: one flipped bit.
+    var bad_tag = genuine;
+    bad_tag[bad_tag.len - 1] ^= 0x01;
+    // The Length field claims 2800 bytes more than the datagram has.
+    var too_long = genuine;
+    too_long[24] = 0x40 | @as(u8, @intCast((genuine.len - 26 + 2800) >> 8));
+    too_long[25] = @truncate(genuine.len - 26 + 2800);
+    // Random ciphertext after a true header.
+    var noise = genuine;
+    io.random(noise[26..]);
+
+    for ([_]*const [Conn.min_initial_datagram]u8{ &bad_tag, &too_long, &noise }) |datagram| {
+        try sender.send(io, &address, datagram);
+        try test_endpoint.receiveFirst(io);
+        try testing.expectEqual(Core.Phase.listening, test_endpoint.core.phase);
+        try testing.expect(test_endpoint.core.peer.eql(&nowhere));
+    }
+
+    // The next datagram, from anyone, is a first attempt: this one is.
+    try sender.send(io, &address, &genuine);
+    try test_endpoint.receiveFirst(io);
+    try testing.expectEqual(Core.Phase.handshaking, test_endpoint.core.phase);
+    try testing.expect(test_endpoint.core.peer.eql(&sender.address));
 }

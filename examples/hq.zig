@@ -365,3 +365,119 @@ test "RFC 9000 §19.4, a RESET_STREAM fails a Stream.Reader, and err says so" {
     connection.close(io);
     try serving.await(io);
 }
+
+// -- Forged first datagrams ----------------------------------------------------
+//
+// §8.1: an endpoint has one connection to give, so what a stranger can do with
+// one datagram decides whether anyone else gets it.
+
+/// How long a test waits for a server task to have received a datagram that
+/// was already sent. It cannot be observed from here: a dropped datagram
+/// leaves no trace, which is the point.
+const settle_ms = 250;
+
+/// A Version 1 Initial whose header reads true and whose ciphertext is random
+/// (§17.2.2): the packet number and everything after it is noise, so no tag
+/// verifies. `claimed_extra` is how many bytes past the datagram's end the
+/// Length field claims, so 0 is a well-formed header and anything else is not.
+fn forgedInitial(io: Io, out: *[1200]u8, dcid_len: u8, claimed_extra: u14) void {
+    io.random(out);
+    out[0..5].* = .{ 0xc3, 0, 0, 0, 1 };
+    var at: usize = 5;
+    out[at] = dcid_len;
+    at += 1 + dcid_len;
+    out[at] = 8;
+    at += 1 + 8;
+    out[at] = 0; // No token.
+    at += 1;
+    const claimed: u14 = @intCast(out.len - at - 2 + claimed_extra);
+    out[at] = 0x40 | @as(u8, @intCast(claimed >> 8));
+    out[at + 1] = @truncate(claimed);
+}
+
+/// A bound UDP socket of someone who is not the client.
+fn bindStranger(io: Io) !Io.net.Socket {
+    const local: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    return local.bind(io, .{ .mode = .dgram });
+}
+
+/// The server has dropped everything so far: still listening, no peer.
+fn expectUncommitted(io: Io) !void {
+    try io.sleep(.fromMilliseconds(settle_ms), .awake);
+    const nowhere: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    try testing.expectEqual(.listening, test_server.core.phase);
+    try testing.expect(test_server.core.peer.eql(&nowhere));
+}
+
+/// The client's request and the server's answer, and the server's peer is the
+/// client rather than whoever spoke first.
+fn expectExchange(connection: quic_io.Connection, io: Io) !void {
+    const stream = try sendRequest(connection, io);
+    var response: [64]u8 = undefined;
+    try testing.expectEqualStrings(body, try readAll(stream, io, &response));
+    try testing.expect(test_server.core.peer.eql(&test_client.core.socket.address));
+    stream.close(io);
+    connection.close(io);
+}
+
+test "RFC 9000 §8.1, a forged Initial does not take the one connection, and the client after it does" {
+    var pair: Pair = undefined;
+    try pair.init();
+    defer pair.deinit(true);
+    const io = pair.io;
+
+    var serving = try io.concurrent(serveOne, .{io});
+    defer serving.cancel(io) catch {};
+
+    const stranger = try bindStranger(io);
+    defer stranger.close(io);
+    var datagram: [1200]u8 = undefined;
+    forgedInitial(io, &datagram, 8, 0);
+    try stranger.send(io, &pair.server_address, &datagram);
+    try expectUncommitted(io);
+
+    try expectExchange(try pair.connect(), io);
+    try serving.await(io);
+}
+
+test "RFC 9000 §8.1, a first datagram that is malformed does not take the one connection either" {
+    var pair: Pair = undefined;
+    try pair.init();
+    defer pair.deinit(true);
+    const io = pair.io;
+
+    var serving = try io.concurrent(serveOne, .{io});
+    defer serving.cancel(io) catch {};
+
+    const stranger = try bindStranger(io);
+    defer stranger.close(io);
+    var datagram: [1200]u8 = undefined;
+    // A Length field that reaches past the datagram (§17.2), a Destination
+    // Connection ID of no bytes (§7.2), and one longer than version 1 allows
+    // (§17.2).
+    const shapes = [_]struct { dcid_len: u8, claimed_extra: u14 }{
+        .{ .dcid_len = 8, .claimed_extra = 2800 },
+        .{ .dcid_len = 0, .claimed_extra = 0 },
+        .{ .dcid_len = 21, .claimed_extra = 0 },
+    };
+    for (shapes) |shape| {
+        forgedInitial(io, &datagram, shape.dcid_len, shape.claimed_extra);
+        try stranger.send(io, &pair.server_address, &datagram);
+    }
+    try expectUncommitted(io);
+
+    try expectExchange(try pair.connect(), io);
+    try serving.await(io);
+}
+
+test "RFC 9000 §8.1, a genuine first datagram opens on the first accept, from its own address" {
+    var pair: Pair = undefined;
+    try pair.init();
+    defer pair.deinit(true);
+    const io = pair.io;
+
+    var serving = try io.concurrent(serveOne, .{io});
+    defer serving.cancel(io) catch {};
+    try expectExchange(try pair.connect(), io);
+    try serving.await(io);
+}

@@ -7,6 +7,9 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.Opening.authenticate`: opens a first Initial's packet under the keys its
+  Destination Connection ID seeds, in a copy, before any `Conn` is built, so a
+  server can tell a packet that opens from a header that merely parses.
 - `quic-io`'s `Stream.Reader` and `Stream.Writer`, as `std.Io.net` has them: a
   QUIC stream can be handed to anything that takes a `std.Io.Reader` or a
   `std.Io.Writer`. The peer's FIN reads as `error.EndOfStream`, and after
@@ -500,6 +503,13 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- `quic-io`'s `Endpoint.accept` no longer gives its one connection to whoever
+  sends the first well-formed header (RFC 9000 §8.1). A first datagram whose
+  first packet does not open under the Initial keys (a bad tag, a Length past
+  the datagram) is dropped with the endpoint still listening and no peer set,
+  so the next datagram, from anyone, is a first attempt. The Initial keys are
+  derived from a public connection ID, so this is not address validation:
+  a forger who computes them still takes the connection until Retry lands.
 - `SendStream.onAck` with a length of zero, the acknowledgment of a FIN sent on
   its own (RFC 9000 §19.8), now moves Data Sent to Data Recvd once everything
   before it is acknowledged. It used to return early, so a stream finished after

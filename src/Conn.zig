@@ -443,6 +443,38 @@ pub const Opening = struct {
         return .{ .destination_connection_id = destination, .source_connection_id = source };
     }
 
+    /// Prove that `datagram`'s first packet opens under the Initial keys this
+    /// opening names, before anything is built from it.
+    ///
+    /// §8.1: a server commits state for a first Initial only once the packet
+    /// has shown it was made by someone who could read the Initial keys
+    /// (§5.2 of RFC 9001), which a header that parses does not show. A header
+    /// with a Length past the datagram, or ciphertext that fails its tag, is
+    /// the caller's cue to drop the datagram and stay as it was.
+    ///
+    /// Nothing here touches `Conn`, and the datagram is not modified:
+    /// `protection.openPacket` unprotects in place, so the packet is opened in
+    /// `copy`, which must hold the whole packet (`error.NoSpace` otherwise),
+    /// and the payload lands in `plaintext`, which nothing reads afterwards.
+    /// `datagram` is the one `fromDatagram` read this opening from.
+    pub fn authenticate(self: Opening, datagram: []const u8, copy: []u8, plaintext: []u8) Error!void {
+        const long = try packet.parseLong(datagram);
+        // Pairing the keys with another datagram is a packet that never opens.
+        std.debug.assert(long.kind == .initial);
+        std.debug.assert(long.version == .v1);
+        std.debug.assert(std.mem.eql(u8, long.destination_connection_id, self.destination_connection_id));
+
+        const length = @as(usize, long.body_offset) + long.length;
+        if (copy.len < length) return error.NoSpace;
+        const first = copy[0..length];
+        @memcpy(first, datagram[0..length]);
+
+        // The same keys `init` gives a server to receive with.
+        const secrets = protection.initialSecrets(self.destination_connection_id);
+        const keys = protection.deriveKeys(&secrets.client, .aes_128_gcm) catch unreachable;
+        _ = try protection.openPacket(&keys, first, long.body_offset, null, plaintext);
+    }
+
     /// The configuration a server starts from, with this endpoint's own
     /// connection ID.
     ///
@@ -4070,6 +4102,33 @@ test "RFC 9001 §5.2, two machines exchange an Initial and one acknowledges" {
     try testing.expectEqual(@as(usize, 1), report.ackedPackets().len);
     try testing.expectEqual(@as(u64, 0), report.ackedPackets()[0].packet_number);
     try testing.expectEqual(@as(usize, 0), client.initial.?.recovery.inFlight().len);
+}
+
+test "RFC 9000 §8.1, an opening is proven by opening its packet, and the datagram is left as it came" {
+    const named_server = [_]u8{ 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1 };
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(clientConfig(&named_server, &.{ 0xc1, 0xc2 }, client_loss.value()));
+    const payload = pings(4);
+    var datagram: [512]u8 = undefined;
+    const sent = try client.writeFrames(.initial, &payload, &datagram, .data(0));
+
+    var id_storage: [40]u8 = undefined;
+    const opening = try Opening.fromDatagram(datagram[0..sent], &id_storage);
+    var copy: [512]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    const before = datagram;
+    try opening.authenticate(datagram[0..sent], &copy, &plaintext);
+    try testing.expectEqualSlices(u8, &before, &datagram);
+
+    // A packet that does not fit the copy is refused, not truncated.
+    try testing.expectError(error.NoSpace, opening.authenticate(datagram[0..sent], copy[0 .. sent - 1], &plaintext));
+
+    // One flipped bit in the tag, and a Length field that reaches past the
+    // datagram: neither opens, and neither is the machine's to see.
+    var forged = datagram;
+    forged[sent - 1] ^= 0x01;
+    try testing.expectError(error.AuthenticationFailed, opening.authenticate(forged[0..sent], &copy, &plaintext));
+    try testing.expectError(error.LengthPastEnd, opening.authenticate(datagram[0 .. sent - 1], &copy, &plaintext));
 }
 
 test "RFC 9000 §7.2, a server is built from the datagram that called it" {
