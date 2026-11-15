@@ -45,9 +45,6 @@
             ];
             shellHook = ''
               export PKG_CONFIG_PATH="${lib.makeSearchPathOutput "dev" "lib/pkgconfig" [ pkgs.openssl ]}"
-              # A crashing test must not drop a 55 MB core file into the tree.
-              # One did, and it was committed and pushed before anyone noticed.
-              ulimit -c 0
             '';
           };
         };
