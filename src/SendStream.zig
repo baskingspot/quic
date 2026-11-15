@@ -194,16 +194,19 @@ pub fn onMaxStreamData(self: *SendStream, limit: u64) void {
 }
 
 /// §3.1: bytes the peer acknowledged, possibly out of order.
+///
+/// A zero-length acknowledgment is the FIN-only frame of §19.8 coming back: it
+/// moves no offset, but it can be the last thing outstanding, so it still gets
+/// the state check below.
 pub fn onAck(self: *SendStream, offset: u64, length: u32) Error!void {
-    if (length == 0) return;
     const stop = offset + length;
-    if (stop <= self.acked) return;
-
-    if (offset <= self.acked) {
-        self.acked = stop;
-        self.absorb();
-    } else {
-        try self.insertPending(offset, stop);
+    if (length > 0 and stop > self.acked) {
+        if (offset <= self.acked) {
+            self.acked = stop;
+            self.absorb();
+        } else {
+            try self.insertPending(offset, stop);
+        }
     }
 
     // §3.1: Data Sent moves to Data Recvd once everything is acknowledged.
@@ -588,4 +591,25 @@ test "RFC 9000 §3.1, an acknowledgment beyond the final size is still an acknow
     try stream.onAck(0, 2);
     try testing.expectEqual(State.data_recvd, stream.state);
     try testing.expectEqual(@as(u64, 2), stream.acked);
+}
+
+test "RFC 9000 §3.1, a FIN sent on its own is acknowledged on its own" {
+    // The data goes out and is acknowledged first; the application finishes
+    // later, so the FIN rides a zero-length frame (§19.8). Its acknowledgment
+    // carries no bytes and is still what ends the stream.
+    var buffer: [8]u8 = undefined;
+    var stream: SendStream = .init(0, &buffer, 1000);
+    try stream.write("ab");
+    _ = stream.nextSegment(8).?;
+    try stream.onAck(0, 2);
+    try testing.expectEqual(State.send, stream.state);
+
+    try stream.finish();
+    const fin = stream.nextSegment(8).?;
+    try testing.expect(fin.fin);
+    try testing.expectEqual(@as(usize, 0), fin.data.len);
+    try testing.expectEqual(State.data_sent, stream.state);
+
+    try stream.onAck(fin.offset, 0);
+    try testing.expectEqual(State.data_recvd, stream.state);
 }

@@ -457,6 +457,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- `SendStream.onAck` with a length of zero, the acknowledgment of a FIN sent on
+  its own (RFC 9000 §19.8), now moves Data Sent to Data Recvd once everything
+  before it is acknowledged. It used to return early, so a stream finished after
+  its data went out never reached a terminal state and `Conn.closeStream`
+  refused it forever.
 - `quic-io` opens every packet a datagram carries, not only the first. A
   client's first flight coalesces Initial and Handshake into one datagram
   (RFC 9000 §12.2), and the shell used to hand the machine the Initial alone.
