@@ -39,6 +39,8 @@
             packages = with pkgs; [
               openssl
               pkg-config
+              # The foreign peers in tools/interop_go*: quic-go and x/net/quic.
+              go
             ];
             shellHook = ''
               export PKG_CONFIG_PATH="${lib.makeSearchPathOutput "dev" "lib/pkgconfig" [ pkgs.openssl ]}"
