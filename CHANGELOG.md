@@ -311,6 +311,38 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `quic-io` now mirrors `std.Io.net` (docs/slop/api-sketch.md), and the old
+  shell is gone: `Connection.init`, `Connection.Config`, `Connection.Accepting`,
+  `accept(accepting, now, timeout)`, `receive`, `flush`, and `established`.
+  Declare one `quic_io.Endpoint(quic_io.Sizing(.{ ... }))` per connection, in
+  place (static or file scope: it holds every buffer and must not move). A
+  server calls `listen(.{ .io, .socket, .driver, .parameters })` and then
+  `accept(io)`; a client calls `connect(.{ .io, .socket, .peer, .driver,
+  .parameters })`. Both return a `Connection` once the handshake is done.
+- `quic-io` takes a ready `quic.handshake.Driver` instead of building one: the
+  certificate, key, and ALPN go into the driver (`quic-tls`), so `quic-io` still
+  imports `quic` alone and needs no `-Dtls`. `parameters` is a
+  `TransportParameters` value, not bytes. The windows, the stream counts (all
+  bidirectional when you set neither), `max_udp_payload_size`, and the
+  connection IDs are filled in from the sizing and the handshake.
+  `max_idle_timeout` is what bounds a stalled handshake. Without it, `accept`
+  and `connect` wait until canceled.
+- Streams are `Connection.openStream(io, .bidi | .uni)` and
+  `Connection.acceptStream(io)`, then `Stream.read(io, [][]u8)` (0 is the FIN),
+  `Stream.write(io, bytes)` (returns how much was queued, `error.NoSpace` once
+  the non-wrapping send buffer is spent), `Stream.shutdown(io, .send | .recv |
+  .both)` (FIN, STOP_SENDING, or RESET_STREAM then STOP_SENDING), and
+  `Stream.close(io)`. A handle used after `close` is `error.StreamClosed`, even
+  once its slot holds another stream. End the connection with
+  `Connection.close(io)` (NO_ERROR) or `closeWith(io, code)`, then
+  `Endpoint.deinit(io)`, which closes the socket the endpoint was given.
+- Every connection runs two tasks spawned with `Io.concurrent`, so `accept` and
+  `connect` return `error.ConcurrencyUnavailable` on an `Io` that cannot run
+  them, and every stream operation can return `error.Canceled`. Nothing in the
+  module steps, runs, or flushes on the caller's behalf any more. The tasks
+  resend lost STREAM, RESET_STREAM, STOP_SENDING, and HANDSHAKE_DONE frames,
+  replay CRYPTO data on loss and probe timeouts, and end the connection with
+  `error.IdleTimeout` (§10.1).
 - An Initial datagram is expanded to 1200 bytes (RFC 9000 §14.1), because a
   server drops a smaller one without answering. The padding is written into the
   `frames` scratch that `writeHandshake` takes, so that buffer must now hold a

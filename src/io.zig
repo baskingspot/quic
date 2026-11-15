@@ -1,30 +1,29 @@
-//! Sockets and nothing else: the I/O shell around `Conn`, over `std.Io`.
+//! `std.Io.net` with QUIC underneath: an `Endpoint` that accepts or connects,
+//! a `Connection` that multiplexes, and a `Stream` you read, write, shut down,
+//! and close. docs/slop/api-sketch.md is the contract.
 //!
-//! `Conn` takes bytes and a clock and hands back bytes; every buffer is the
-//! caller's and no call blocks. This file is the other half a program needs:
-//! a UDP socket, a receive that waits, and a flush that sends until nothing is
-//! owed. It owns no policy — no stream framing, no retry, no timers of its own
-//! — so the rules of the machine above it stay the rules here.
+//! `Io` owns concurrency, so nothing here is a loop, a pump, or a flush. A
+//! connection runs two tasks of its own (see `io/Core.zig` for why two, and why
+//! `Io.concurrent` rather than `Io.async`): one receives datagrams and feeds the
+//! machine, the other sends what is owed and fires the loss, probe, and idle
+//! timers. A `Stream` call takes the connection's mutex, does its part, and
+//! either returns or parks on its stream's `Io.Condition`, cancelable like any
+//! other `Io` wait.
 //!
-//! What it does own is one decision the machine cannot make: which address a
-//! datagram goes to. A client knows its peer before the first packet; a server
-//! takes it from the first datagram and then stops looking. A datagram from
-//! anywhere else is dropped, not followed: migration is only legal once the new
-//! path is validated (§9.3 of RFC 9000), and this layer does not validate
-//! paths. A server behind a NAT that rebinds its port therefore goes quiet
-//! rather than guessing.
+//! Nothing allocates and nothing is sized by the caller except `SizingLimits`.
+//! `Endpoint(Sizing(limits))` holds every buffer one connection needs, and is
+//! built in place because the machine inside refuses to move.
 //!
-//! Like `Conn`, a `Connection` must not move after `init`: the machine inside it
-//! records its own address and refuses a later move, so build one in place.
+//! The TLS handshake is not this module's: an endpoint is handed a ready
+//! `quic.handshake.Driver` (the certificate, the key, and ALPN are the
+//! driver's), so a program that speaks no TLS never compiles any.
 //!
-//! A server cannot build its `Conn` before it has met its client: the client's
-//! connection IDs seed the Initial keys (§5.2 of RFC 9001), and they arrive in
-//! the first Initial. So a server's `Connection` starts listening, with no
-//! `Conn` at all, and `accept` builds the machine in place from that first
-//! datagram, without moving anything.
-//!
-//! Entropy and the clock stay the caller's: `flush` takes `now`, and the socket
-//! cannot block longer than the timeout the caller passes to `receive`.
+//! What it does not do yet, by name: congestion control (it sends what the
+//! peer's flow control allows), Version Negotiation and Retry (a client drops
+//! both, a server answers neither), connection migration, PATH_CHALLENGE,
+//! NEW_TOKEN, and new connection IDs (all dropped), the anti-amplification limit,
+//! and more than one connection per endpoint, because a driver is one
+//! handshake's worth of state.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -33,589 +32,576 @@ const testing = std.testing;
 const quic = @import("quic");
 const Conn = quic.Conn;
 const Recovery = quic.Recovery;
-const frame = quic.frame;
+const StreamTable = quic.StreamTable;
 const TransportParameters = quic.TransportParameters;
+const frame = quic.frame;
+
+const Core = @import("io/Core.zig");
 
 const Io = std.Io;
 
-pub const Error = Conn.Error ||
-    TransportParameters.Error ||
-    Io.net.Socket.ReceiveTimeoutError ||
-    Io.net.Socket.SendError ||
-    error{
-        /// The connection is still listening: `accept` has not met its client, so
-        /// there is no machine to flush or to receive for.
-        NotOpen,
+pub const IpAddress = Io.net.IpAddress;
+pub const ShutdownHow = Io.net.ShutdownHow;
+pub const Direction = quic.stream_id.Direction;
+
+/// Why a connection ended, which every operation on it returns from then on:
+/// `error.ConnectionClosed` and `error.IdleTimeout`, the socket's errors, and
+/// the machine's transport errors by name (`error.HandshakeFailed`,
+/// `error.FlowControl`, `error.StreamLimit`, ...).
+pub const ConnectionError = Core.Failure;
+
+pub const AcceptError = ConnectionError || Io.ConcurrentError || TransportParameters.Error;
+pub const ConnectError = ConnectionError || Io.ConcurrentError || TransportParameters.Error;
+
+/// The four numbers a caller chooses. Every other length follows from them.
+pub const SizingLimits = struct {
+    /// Streams held at once, both directions and both initiators.
+    streams: u16 = 4,
+    /// Each stream's receive ring and send buffer, and so the per-stream window
+    /// this endpoint advertises (§4.1). The send buffer does not wrap: a stream
+    /// carries at most this many bytes out over its life.
+    stream_ring: u32 = 4096,
+    /// Sent packets tracked per packet number space for loss recovery.
+    sent_packets: u16 = 32,
+    /// CRYPTO reassembly and replay, per encryption level.
+    crypto: u32 = 4096,
+    /// One datagram, in and out, and the max_udp_payload_size advertised.
+    datagram: u16 = 1500,
+};
+
+/// The most frames one packet may carry that the machine hands back rather
+/// than acts on (PING, NEW_CONNECTION_ID, ...). A packet with more is closed
+/// with INTERNAL_ERROR, because the machine reports `error.NoSpace`.
+const frames_per_packet = 64;
+
+/// §17.2: a version 1 connection ID is at most 20 bytes.
+const max_connection_id = 20;
+
+/// This endpoint's own connection IDs, and the one a client invents for the
+/// server: §7.2 asks for at least 8 bytes there, and §5.1 for unpredictable
+/// ones everywhere.
+const own_id_len = 8;
+
+/// Room for this endpoint's encoded transport parameters.
+const parameter_capacity = 256;
+
+/// Every buffer one connection needs, sized from `limits`: the loss tables,
+/// the CRYPTO buffers, the stream slots and rings, the sent-frame records, and
+/// the datagram scratch.
+pub fn Sizing(comptime limits_given: SizingLimits) type {
+    comptime {
+        assert(limits_given.streams > 0);
+        assert(limits_given.stream_ring > 0);
+        assert(limits_given.sent_packets > 0);
+        assert(limits_given.crypto > 0);
+        // IPv6's minimum path, 1280 bytes less 48 of headers. It holds the
+        // padded Initial this shell writes (`Core.initial_payload_floor`).
+        assert(limits_given.datagram >= 1232);
+    }
+    const streams = limits_given.streams;
+    const ring = limits_given.stream_ring;
+    const sent = limits_given.sent_packets;
+    const datagram = limits_given.datagram;
+
+    return struct {
+        const Self = @This();
+
+        pub const limits = limits_given;
+        /// §4.1: the connection window, every ring full.
+        pub const receive_limit: u64 = @as(u64, streams) * ring;
+
+        loss_state: Recovery = .{},
+        spaces: [3]Recovery.Space = undefined,
+        sent: [3][sent]Recovery.SentPacket = undefined,
+        acked: [sent]Recovery.SentPacket = undefined,
+        lost: [sent]Recovery.SentPacket = undefined,
+        crypto_in: [3][limits_given.crypto]u8 = undefined,
+        crypto_sent: [3][limits_given.crypto]u8 = undefined,
+        connection_ids: [2 * max_connection_id]u8 = undefined,
+        adopted_id: [max_connection_id]u8 = undefined,
+        original_id: [own_id_len]u8 = undefined,
+        own_id: [own_id_len]u8 = undefined,
+        parameter_bytes: [parameter_capacity]u8 = undefined,
+        table: [streams]StreamTable.Slot = undefined,
+        streams: [streams]Conn.Stream = undefined,
+        send_bytes: [streams][ring]u8 = undefined,
+        recv_bytes: [streams][ring]u8 = undefined,
+        slots: [streams]Core.Slot = undefined,
+        /// One record per tracked 1-RTT packet, each with room for a frame per
+        /// stream, which is the most `Conn.writeStreams` packs.
+        records: [sent]Core.Record = undefined,
+        entries: [sent * streams]Core.Entry = undefined,
+        datagram_in: [datagram]u8 = undefined,
+        datagram_out: [datagram]u8 = undefined,
+        plaintext: [datagram]u8 = undefined,
+        scratch: [datagram]u8 = undefined,
+        frames: [frames_per_packet]frame.Frame = undefined,
+        stream_events: [streams]Conn.StreamEvent = undefined,
+        /// MAX_DATA, one MAX_STREAM_DATA per stream, two MAX_STREAMS.
+        control: [streams + 3]frame.Frame = undefined,
+        offers: [streams]Conn.Offer = undefined,
+        written: [streams]Conn.Written = undefined,
+
+        fn prepare(self: *Self) void {
+            self.loss_state = .{};
+            // `Conn.init` asserts no two buffers overlap, so each stream has
+            // its own pair.
+            for (&self.streams, &self.send_bytes, &self.recv_bytes) |*stream, *send, *recv| {
+                stream.* = .{ .send_buffer = send, .recv_buffer = recv, .recv_limit_bytes = ring };
+            }
+        }
+
+        fn loss(self: *Self) Conn.Loss {
+            return .{
+                .shared = &self.loss_state,
+                .spaces = &self.spaces,
+                .sent_initial = &self.sent[0],
+                .sent_handshake = &self.sent[1],
+                .sent_app = &self.sent[2],
+            };
+        }
+
+        fn coreStorage(self: *Self) Core.Storage {
+            return .{
+                .datagram_in = &self.datagram_in,
+                .datagram_out = &self.datagram_out,
+                .plaintext = &self.plaintext,
+                .scratch = &self.scratch,
+                .frames = &self.frames,
+                .stream_events = &self.stream_events,
+                .control = &self.control,
+                .offers = &self.offers,
+                .written = &self.written,
+                .slots = &self.slots,
+                .records = &self.records,
+                .entries = &self.entries,
+            };
+        }
+
+        /// The caller's transport parameters with every number this sizing
+        /// decides written over: the windows, the datagram size, and, when the
+        /// caller named neither stream count, every slot for the peer's
+        /// bidirectional streams.
+        fn advertised(given: TransportParameters) TransportParameters {
+            var parameters = given;
+            parameters.initial_max_data = receive_limit;
+            parameters.initial_max_stream_data_bidi_local = ring;
+            parameters.initial_max_stream_data_bidi_remote = ring;
+            parameters.initial_max_stream_data_uni = ring;
+            parameters.max_udp_payload_size = datagram;
+            if (given.initial_max_streams_bidi == null and given.initial_max_streams_uni == null) {
+                parameters.initial_max_streams_bidi = streams;
+            }
+            return parameters;
+        }
     };
+}
 
-/// One connection, its socket, and the buffers the machine writes into.
-pub const Connection = struct {
-    io: Io,
-    socket: Io.net.Socket,
-    /// Where packets go. A server sets it from the first datagram; a client is
-    /// given it.
-    peer: Io.net.IpAddress,
-    /// Valid only once `state` is `.open`. A client's is built by `init`; a
-    /// server's by `accept`, in this very field, because a `Conn` refuses to move.
-    conn: Conn = undefined,
-    state: State,
-    /// Where `accept` copies the client's two connection IDs. The `Conn` borrows
-    /// them for its whole life, so this stays the caller's and stays put.
-    connection_ids: []u8,
-    datagram: []u8,
-    /// Scratch for the frames a packet carries. Distinct from `datagram`: the
-    /// machine composes a frame here and then copies it into the packet it
-    /// seals, and the same bytes cannot be both.
-    write_frames: []u8,
-    plaintext: []u8,
-    frames: []frame.Frame,
-    stream_events: []Conn.StreamEvent,
-    recovery_events: *Recovery.Events,
-    /// The datagram being walked, one packet at a time. One datagram may carry
-    /// several packets (§12.2 of RFC 9000), and every one of them belongs to
-    /// the machine, not just the first.
-    walk: Conn.Datagram,
-    walking: bool = false,
-    /// When the datagram being walked arrived. Every packet in it shares one
-    /// arrival time, so an RTT sample does not drift down the datagram.
-    received_at: Conn.Duration = 0,
-    /// Whether `peer` is settled. A client is given it; a server takes it from
-    /// the first datagram and keeps it.
-    peer_settled: bool,
-    /// What this endpoint's own send loop still owes, per packet number space.
-    owed: [3]Conn.SpaceId = undefined,
+/// One QUIC endpoint over one UDP socket, holding one connection's storage:
+/// `Server` in `std.Io.net`, plus `connect` for the client side.
+///
+/// Built in place and never moved: `listen` or `connect` fills it, and the
+/// machine and both tasks point into it until `deinit`.
+pub fn Endpoint(comptime S: type) type {
+    return struct {
+        const Self = @This();
 
-    /// Whether the machine exists yet. Two states and one transition, `accept`:
-    /// a client is born open.
-    pub const State = enum { listening, open };
-
-    pub const Config = struct {
-        io: Io,
-        socket: Io.net.Socket,
-        peer: ?Io.net.IpAddress = null,
-        /// A client's configuration, and a server's when it already knows its
-        /// client's connection IDs. Null is a server that has not met its client:
-        /// `accept` builds the machine later, from `Accepting`.
-        conn: ?Conn.Config,
-        /// Where `accept` keeps the client's two connection IDs. A version 1
-        /// connection ID is at most 20 bytes, so 40 holds any pair; `accept`
-        /// returns `error.NoSpace` for a pair that does not fit. Unused, and may
-        /// be empty, when `conn` is given.
-        connection_ids: []u8 = &.{},
-        /// One datagram, in and out. The machine's `max_send_size` is the
-        /// caller's; this is the buffer it is written into.
-        datagram: []u8,
-        /// Scratch the machine writes a packet's frames into before sealing.
-        /// An Initial datagram is padded to 1200 bytes (RFC 9000 §14.1) and the
-        /// padding lives here, so this must hold a whole Initial payload.
-        write_frames: []u8,
-        plaintext: []u8,
-        frames: []frame.Frame,
-        stream_events: []Conn.StreamEvent,
-        recovery_events: *Recovery.Events,
-    };
-
-    /// What `accept` needs to build a server's machine once it has met its
-    /// client.
-    pub const Accepting = struct {
-        /// The server's configuration: its own `source_connection_id`, the loss
-        /// state, the driver, the streams, everything but the client's names.
-        /// `original_destination_connection_id`, `destination_connection_id`, and
-        /// `transport_parameters` are overwritten, so what they hold is ignored.
-        conn: Conn.Config,
-        /// The server's limits. §7.3: its transport parameters name the
-        /// connection ID the client first addressed and the server's own, and
-        /// the first is unknown until the Initial arrives, so `accept` fills in
-        /// `original_destination_connection_id` and `initial_source_connection_id`
-        /// and encodes the rest. They must agree with `conn`, as `Conn` asserts.
+        sizing: S,
+        core: Core,
+        driver: quic.handshake.Driver,
         parameters: TransportParameters,
-        /// Where the encoded parameters live; the `Conn` points at them for its
-        /// whole life. `error.NoSpace` when they do not fit.
-        parameter_storage: []u8,
+
+        pub const Listen = struct {
+            io: Io,
+            /// A bound UDP socket. The endpoint owns it: `deinit` closes it.
+            socket: Io.net.Socket,
+            /// The handshake, built by the caller with its certificate, key,
+            /// and ALPN. One connection's worth.
+            driver: quic.handshake.Driver,
+            /// This endpoint's limits. The windows, the stream counts when both
+            /// are null, and max_udp_payload_size come from the sizing; the
+            /// connection IDs from the handshake. max_idle_timeout also bounds
+            /// a handshake that goes nowhere, and without one `accept` waits
+            /// until it is canceled.
+            parameters: TransportParameters = .{},
+        };
+
+        pub const Connect = struct {
+            io: Io,
+            /// A bound UDP socket. The endpoint owns it: `deinit` closes it.
+            socket: Io.net.Socket,
+            peer: IpAddress,
+            driver: quic.handshake.Driver,
+            /// As in `Listen`.
+            parameters: TransportParameters = .{},
+        };
+
+        /// Start listening on `config.socket`. Nothing is read until `accept`.
+        pub fn listen(self: *Self, config: Listen) void {
+            const nowhere: IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+            self.prepare(config.io, config.socket, nowhere, config.driver, config.parameters);
+        }
+
+        /// Wait for a client's first Initial, build the connection from it,
+        /// and return once its handshake is done (§7.2).
+        ///
+        /// A datagram that cannot start a connection is dropped and the wait
+        /// goes on: one under 1200 bytes (§14.1), or one whose first packet is
+        /// not a version 1 Initial with a destination connection ID. A
+        /// handshake that fails after that returns its error, and the endpoint
+        /// is spent: its driver was that handshake's. `deinit` it either way.
+        pub fn accept(self: *Self, io: Io) AcceptError!Connection {
+            assert(self.core.phase == .listening);
+            while (self.core.phase == .listening) {
+                const message = try self.core.socket.receive(io, &self.sizing.datagram_in);
+                if (message.data.len < Conn.min_initial_datagram) continue;
+                const opening = Conn.Opening.fromDatagram(message.data, &self.sizing.connection_ids) catch continue;
+                self.core.peer = message.from;
+                try self.begin(io, opening, message.data);
+            }
+            errdefer self.core.stop(io);
+            try self.core.awaitEstablished(io);
+            return .{ .core = &self.core };
+        }
+
+        /// Connect to `config.peer` and return once the handshake is done. The
+        /// endpoint owns the socket from here, so `deinit` follows a failed
+        /// `connect` too.
+        pub fn connect(self: *Self, config: Connect) ConnectError!Connection {
+            const io = config.io;
+            self.prepare(io, config.socket, config.peer, config.driver, config.parameters);
+            const sizing = &self.sizing;
+            io.random(&sizing.original_id);
+            io.random(&sizing.own_id);
+
+            var parameters = self.parameters;
+            parameters.initial_source_connection_id = &sizing.own_id;
+            var config_conn = self.machine(Conn.clientConfig(&sizing.original_id, &sizing.own_id, sizing.loss()));
+            config_conn.connection_id_storage = &sizing.adopted_id;
+            config_conn.transport_parameters = try self.encode(parameters, .client);
+
+            try self.core.begin(config_conn, null);
+            errdefer self.core.stop(io);
+            try self.core.awaitEstablished(io);
+            return .{ .core = &self.core };
+        }
+
+        /// Cancel the connection's tasks, return only once neither runs, and
+        /// close the socket. No CONNECTION_CLOSE: that is `Connection.close`.
+        pub fn deinit(self: *Self, io: Io) void {
+            self.core.stop(io);
+            self.core.socket.close(io);
+            self.* = undefined;
+        }
+
+        fn prepare(
+            self: *Self,
+            io: Io,
+            socket: Io.net.Socket,
+            peer: IpAddress,
+            driver: quic.handshake.Driver,
+            parameters: TransportParameters,
+        ) void {
+            self.sizing.prepare();
+            self.driver = driver;
+            self.parameters = S.advertised(parameters);
+            // §4.6: credit the table cannot back turns a legal peer into a
+            // connection error, which `Conn.init` refuses too.
+            const bidi = self.parameters.initial_max_streams_bidi orelse 0;
+            const uni = self.parameters.initial_max_streams_uni orelse 0;
+            assert(bidi + uni <= S.limits.streams);
+            self.core.init(.{
+                .io = io,
+                .socket = socket,
+                .peer = peer,
+                .storage = self.sizing.coreStorage(),
+                .events = .init(&self.sizing.acked, &self.sizing.lost),
+                .loss = self.sizing.loss(),
+                .idle_timeout_ms = self.parameters.max_idle_timeout orelse 0,
+            });
+        }
+
+        /// A server's machine, named by the client's first Initial (§7.2),
+        /// with parameters that echo it (§7.3).
+        fn begin(self: *Self, io: Io, opening: Conn.Opening, first: []u8) AcceptError!void {
+            const sizing = &self.sizing;
+            io.random(&sizing.own_id);
+            var parameters = self.parameters;
+            parameters.original_destination_connection_id = opening.destination_connection_id;
+            parameters.initial_source_connection_id = &sizing.own_id;
+            var config = self.machine(opening.serverConfig(&sizing.own_id, sizing.loss()));
+            config.transport_parameters = try self.encode(parameters, .server);
+            try self.core.begin(config, first);
+        }
+
+        /// Fill in what every machine this endpoint builds shares.
+        fn machine(self: *Self, base: Conn.Config) Conn.Config {
+            const sizing = &self.sizing;
+            var config = base;
+            config.tls = self.driver;
+            config.crypto = .{
+                .initial = &sizing.crypto_in[0],
+                .handshake = &sizing.crypto_in[1],
+                .app = &sizing.crypto_in[2],
+            };
+            config.crypto_sent = .{
+                .initial = &sizing.crypto_sent[0],
+                .handshake = &sizing.crypto_sent[1],
+                .app = &sizing.crypto_sent[2],
+            };
+            config.stream_slots = &sizing.table;
+            config.streams = &sizing.streams;
+            config.receive_limit = S.receive_limit;
+            config.max_streams_bidi = self.parameters.initial_max_streams_bidi orelse 0;
+            config.max_streams_uni = self.parameters.initial_max_streams_uni orelse 0;
+            return config;
+        }
+
+        fn encode(
+            self: *Self,
+            parameters: TransportParameters,
+            role: TransportParameters.Role,
+        ) TransportParameters.Error![]const u8 {
+            var writer: quic.Writer = .init(&self.sizing.parameter_bytes);
+            try TransportParameters.encode(&writer, parameters, role);
+            return writer.written();
+        }
     };
+}
 
-    pub fn init(config: Config) Connection {
-        // A listener has no peer to be given, and nowhere to put the client's
-        // names without a buffer.
-        assert(config.conn != null or (config.peer == null and config.connection_ids.len > 0));
-        var self: Connection = .{
-            .io = config.io,
-            .socket = config.socket,
-            .peer = config.peer orelse .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
-            .state = if (config.conn == null) .listening else .open,
-            .connection_ids = config.connection_ids,
-            .datagram = config.datagram,
-            .write_frames = config.write_frames,
-            .plaintext = config.plaintext,
-            .frames = config.frames,
-            .stream_events = config.stream_events,
-            .recovery_events = config.recovery_events,
-            .walk = .init(config.datagram),
-            .peer_settled = config.peer != null,
-        };
-        if (config.conn) |conn| self.conn = .init(conn);
-        return self;
+/// One QUIC connection: a handle on its endpoint's machine and tasks, which is
+/// why it is a value and why it outlives no `Endpoint.deinit`.
+pub const Connection = struct {
+    core: *Core,
+
+    pub const AcceptStreamError = ConnectionError || Io.Cancelable;
+    pub const OpenStreamError = ConnectionError || Io.Cancelable;
+
+    /// Wait for the next stream the peer opens, lowest ID first.
+    ///
+    /// A peer that opens more than this endpoint advertised has broken §4.6,
+    /// and the connection ends with `error.StreamLimit`, which this returns.
+    pub fn acceptStream(self: Connection, io: Io) AcceptStreamError!Stream {
+        return self.stream(try self.core.acceptStream(io));
     }
 
-    /// Wait up to `timeout` for a client's first Initial, learn its connection
-    /// IDs from it, build the machine in place, and return the Initial's first
-    /// packet, as `receive` would.
-    ///
-    /// §7.2: the Destination Connection ID of the first Initial names this
-    /// endpoint and seeds the Initial keys, and its Source Connection ID is where
-    /// answers go. `Conn.Opening` copies both into `connection_ids`, and the
-    /// `Conn` is built from them; only then is the datagram walked, by the same
-    /// code `receive` uses, so the rest of its packets come from `receive`.
-    ///
-    /// Null is either the wait expiring, with `state` still `.listening`, or the
-    /// machine now existing while no packet of the datagram opened. The caller
-    /// tells them apart by `state`, and calls `accept` again only in the first.
-    /// `accept` on a connection that is open is a bug, not an error: a second
-    /// client is not this layer's to serve.
-    ///
-    /// A datagram that does not start a connection returns the error
-    /// `Conn.Opening.fromDatagram` gives and builds nothing: `error.NotInitial`,
-    /// `error.InvalidConnectionId`, `error.NoSpace`, and `error.UnsupportedVersion`.
-    /// After any of them `peer` is where the datagram came from and `datagram`
-    /// still holds it, so the caller can answer an unsupported version with a
-    /// Version Negotiation packet (§6 of RFC 9000, `quic.connection_setup`);
-    /// whether to is the caller's policy. `peer_settled` stays false, so the next `accept` takes
-    /// a fresh sender.
-    ///
-    /// `now` dates the datagram, as in `receive`.
-    pub fn accept(
-        self: *Connection,
-        accepting: Accepting,
-        now: Conn.Duration,
-        timeout: Io.Timeout,
-    ) Error!?Conn.Opened {
-        assert(self.state == .listening);
-        assert(!self.walking);
-        assert(accepting.conn.role == .server);
-
-        const message = self.socket.receiveTimeout(self.io, self.datagram, timeout) catch |err| switch (err) {
-            error.Timeout => return null,
-            else => return err,
-        };
-        self.peer = message.from;
-        const opening = try Conn.Opening.fromDatagram(message.data, self.connection_ids);
-
-        var conn = accepting.conn;
-        conn.original_destination_connection_id = opening.destination_connection_id;
-        conn.destination_connection_id = opening.source_connection_id;
-        var parameters = accepting.parameters;
-        parameters.original_destination_connection_id = opening.destination_connection_id;
-        parameters.initial_source_connection_id = conn.source_connection_id;
-        var writer: quic.Writer = .init(accepting.parameter_storage);
-        try TransportParameters.encode(&writer, parameters, .server);
-        conn.transport_parameters = writer.written();
-
-        // In place: the `Conn` is assigned into the field it will live in, and
-        // is first used, and so pinned, after that.
-        self.conn = .init(conn);
-        self.state = .open;
-        self.peer_settled = true;
-        return self.beginWalk(message.data, now);
+    /// Open a stream, waiting while the peer grants no credit for one (§4.6).
+    /// `error.StreamLimit` when every slot is held: close a stream first.
+    pub fn openStream(self: Connection, io: Io, direction: Direction) OpenStreamError!Stream {
+        return self.stream(try self.core.openStream(io, direction));
     }
 
-    /// Return the next packet the machine has, waiting up to `timeout` for a
-    /// datagram when the last one is used up.
-    ///
-    /// The caller loops until it gets null, and every packet reports its own
-    /// frames; that is the whole contract. A datagram that carries several
-    /// packets (§12.2) is handed over one at a time, and the wait only happens
-    /// when the previous datagram is exhausted, so a coalesced flight cannot
-    /// lose its tail.
-    ///
-    /// Null means the wait expired with nothing to do, which is the caller's
-    /// timer firing, not an error. A datagram whose every packet fails to open
-    /// also returns null: the machine counted them, and there is nothing to
-    /// report.
-    pub fn receive(self: *Connection, now: Conn.Duration, timeout: Io.Timeout) Error!?Conn.Opened {
-        if (self.state != .open) return error.NotOpen;
-        while (self.walking) {
-            if (try self.nextPacket()) |opened| return opened;
+    /// Send what the streams still owe, then CONNECTION_CLOSE with NO_ERROR
+    /// (§10.2), and stop the connection's tasks.
+    pub fn close(self: Connection, io: Io) void {
+        self.core.close(io, 0);
+    }
+
+    /// As `close`, with an application error `code` (§20.2).
+    pub fn closeWith(self: Connection, io: Io, code: u64) void {
+        self.core.close(io, code);
+    }
+
+    fn stream(self: Connection, held: Core.Held) Stream {
+        return .{ .core = self.core, .index = held.index, .generation = held.generation };
+    }
+};
+
+/// One QUIC stream: its slot and the generation that slot had when this handle
+/// was made, so a handle kept past `close` is `error.StreamClosed` and never
+/// someone else's stream.
+pub const Stream = struct {
+    core: *Core,
+    index: u16,
+    generation: u32,
+
+    pub const ReadError = ConnectionError || error{
+        /// The peer reset the stream (§3.2).
+        StreamReset,
+        /// This handle was closed.
+        StreamClosed,
+    } || Io.Cancelable;
+
+    pub const WriteError = ConnectionError || error{
+        /// The peer asked this endpoint to stop sending (§3.5).
+        StreamReset,
+        /// This handle was closed, or the send half shut down.
+        StreamClosed,
+    } || Io.Cancelable;
+
+    pub const ShutdownError = ConnectionError || error{StreamClosed} || Io.Cancelable;
+
+    /// Read what has arrived into `data`, in order, waiting while there is
+    /// none. 0 is the end of the stream: the peer's FIN, or `shutdown(.recv)`.
+    /// A stream that only sends is `error.WrongDirection`.
+    pub fn read(self: Stream, io: Io, data: [][]u8) ReadError!usize {
+        const core = self.core;
+        try core.mutex.lock(io);
+        defer core.mutex.unlock(io);
+        while (true) {
+            const entry = try core.held(self.index, self.generation);
+            if (!entry.canRecv()) return error.WrongDirection;
+            if (try readAvailable(&entry.recv, data)) |count| {
+                // A read is what opens the window (§4.2), so the sender may now
+                // owe the peer a MAX_STREAM_DATA.
+                if (count > 0) core.wake.signal(io);
+                return count;
+            }
+            try core.alive();
+            try core.storage.slots[self.index].changed.wait(io, &core.mutex);
         }
-        const message = self.socket.receiveTimeout(self.io, self.datagram, timeout) catch |err| switch (err) {
-            error.Timeout => return null,
-            else => return err,
-        };
-        // §9: the peer is where the first datagram came from, and where the
-        // answers go. A later datagram from somewhere else is not a migration
-        // to follow; it is the start of one this endpoint cannot validate, so
-        // the path stays where it is and the datagram is dropped.
-        if (!self.peer_settled) {
-            self.peer = message.from;
-            self.peer_settled = true;
-        } else if (!self.peer.eql(&message.from)) {
-            return null;
-        }
-        return self.beginWalk(message.data, now);
     }
 
-    /// Start walking a datagram that arrived at `now`, and return its first
-    /// packet. Shared by `receive` and `accept`, so a server's first Initial is
-    /// opened by the code every later packet is.
-    fn beginWalk(self: *Connection, data: []u8, now: Conn.Duration) Error!?Conn.Opened {
-        assert(self.state == .open);
-        self.received_at = now;
-        self.walk = .init(data);
-        self.walking = true;
-        return self.nextPacket();
+    /// Queue as much of `bytes` as the send buffer holds and wake the sender.
+    /// Returns how many were queued; `error.NoSpace` once the buffer is spent,
+    /// because it does not wrap (`SizingLimits.stream_ring`).
+    pub fn write(self: Stream, io: Io, bytes: []const u8) WriteError!usize {
+        const core = self.core;
+        try core.mutex.lock(io);
+        defer core.mutex.unlock(io);
+        const entry = try core.held(self.index, self.generation);
+        try core.alive();
+        if (!entry.canSend()) return error.WrongDirection;
+        const send = &entry.send;
+        if (send.stop_sending_code != null) return error.StreamReset;
+        if (send.reset_code != null or send.final_size != null) return error.StreamClosed;
+        assert(send.written <= send.buffer.len);
+        const room = send.buffer.len - @as(usize, @intCast(send.written));
+        if (room == 0) return error.NoSpace;
+        const count = @min(room, bytes.len);
+        send.write(bytes[0..count]) catch unreachable;
+        core.wake.signal(io);
+        return count;
     }
 
-    /// Open the next packet of the datagram being walked, or mark the walk
-    /// finished. `walk.next` leaves the cursor after the packet it returned, so
-    /// a second call reads the next one rather than the same one again.
-    fn nextPacket(self: *Connection) Error!?Conn.Opened {
-        const opened = try self.walk.next(
-            &self.conn,
-            self.plaintext,
-            self.frames,
-            self.stream_events,
-            self.recovery_events,
-            self.received_at,
-        );
-        if (opened == null) self.walking = false;
-        return opened;
-    }
-
-    /// Send everything the machine owes right now: handshake messages, a
-    /// server's HANDSHAKE_DONE once its handshake is confirmed, then an
-    /// acknowledgment in each space that has one pending.
+    /// End one half of the stream, or both, the way QUIC can:
     ///
-    /// HANDSHAKE_DONE goes before the acks because the client is waiting on it
-    /// (§13.3 of RFC 9000) and an ack-only packet is neither urgent nor
-    /// ack-eliciting. It is not retransmitted if lost; see `writeConfirmation`.
+    /// - `.send`: FIN after the bytes already written; reads go on.
+    /// - `.recv`: STOP_SENDING, and reads return 0 from here.
+    /// - `.both`: RESET_STREAM, then STOP_SENDING.
     ///
-    /// Returns how many datagrams went out. `error.NoSpace` from the machine
-    /// means the CRYPTO buffer is full, which is fatal by design; a socket that
-    /// refuses a datagram is not retried here, because the packet has already
-    /// been recorded in flight (§6 of RFC 9002) and loss recovery will bring it
-    /// back.
-    pub fn flush(self: *Connection, now: Conn.Duration) Error!usize {
-        if (self.state != .open) return error.NotOpen;
-        var sent: usize = 0;
-        while (try self.conn.writeHandshake(self.write_frames, self.datagram, now)) |length| {
-            try self.socket.send(self.io, &self.peer, self.datagram[0..length]);
-            sent += 1;
+    /// Both frames carry application error code 0. A half that is already
+    /// over, or that a unidirectional stream never had, is left alone.
+    pub fn shutdown(self: Stream, io: Io, how: ShutdownHow) ShutdownError!void {
+        const core = self.core;
+        try core.mutex.lock(io);
+        defer core.mutex.unlock(io);
+        _ = try core.held(self.index, self.generation);
+        try core.alive();
+        switch (how) {
+            .send => core.finishSending(self.index),
+            .recv => core.stopReceiving(self.index),
+            .both => {
+                core.resetSending(self.index);
+                core.stopReceiving(self.index);
+            },
         }
-        if (try self.conn.writeConfirmation(self.datagram, now)) |length| {
-            try self.socket.send(self.io, &self.peer, self.datagram[0..length]);
-            sent += 1;
-        }
-        for (self.conn.acksOwed(&self.owed)) |id| {
-            const length = try self.conn.writeAck(id, self.datagram, now);
-            if (length == 0) continue;
-            try self.socket.send(self.io, &self.peer, self.datagram[0..length]);
-            sent += 1;
-        }
-        return sent;
+        core.wake.signal(io);
     }
 
-    /// Whether the handshake is finished in both directions: our TLS handshake
-    /// completed and the peer has confirmed what it must.
-    ///
-    /// §4.1.2 of RFC 9001: a client finishes when a HANDSHAKE_DONE frame lands,
-    /// a server when its own handshake does. A server still listening has no
-    /// handshake, so it is not established.
-    pub fn established(self: *const Connection) bool {
-        if (self.state != .open) return false;
-        return self.conn.handshakeConfirmed() and (self.conn.app != null);
+    /// Close both directions and release the handle: a FIN after what was
+    /// written, STOP_SENDING if the peer could still send. The slot is reused
+    /// once both halves are over. A closed handle is a no-op here and
+    /// `error.StreamClosed` everywhere else.
+    pub fn close(self: Stream, io: Io) void {
+        const core = self.core;
+        core.mutex.lockUncancelable(io);
+        defer core.mutex.unlock(io);
+        _ = core.held(self.index, self.generation) catch return;
+        if (core.phase != .closed) {
+            core.finishSending(self.index);
+            core.stopReceiving(self.index);
+        }
+        core.release(self.index);
+        core.wake.signal(io);
+    }
+
+    /// What a read can return now, or null when it has to wait.
+    fn readAvailable(recv: *quic.ReceiveStream, data: [][]u8) error{StreamReset}!?usize {
+        switch (recv.state) {
+            .reset_recvd => {
+                _ = recv.readReset() catch unreachable;
+                return error.StreamReset;
+            },
+            .reset_read => return error.StreamReset,
+            .recv, .size_known, .data_recvd, .data_read => {},
+        }
+        var count: usize = 0;
+        var capacity: usize = 0;
+        for (data) |buffer| {
+            capacity += buffer.len;
+            // Only a reset refuses a read, and that is handled above.
+            const taken = recv.readInto(buffer) catch unreachable;
+            count += taken;
+            if (taken < buffer.len) break;
+        }
+        if (count > 0) return count;
+        if (recv.state == .data_read) return 0;
+        if (recv.stop_sending_code != null) return 0;
+        if (capacity == 0) return 0;
+        return null;
     }
 };
 
 // -- Tests -------------------------------------------------------------------
 //
-// Two real sockets on the loopback interface, driven the way a program drives
-// them: seal a packet with the machine, send it with the socket, wait for the
-// other side. No TLS, because Initial keys come from the connection ID (§5.2 of
-// RFC 9001), and these are tests of the socket layer, not of the handshake.
+// What needs no handshake. The handshake, streams in both directions, a
+// canceled read, a stale handle, and `deinit` with the tasks running are in
+// examples/hq.zig, which has a real TLS driver.
 
-const Loss = struct {
-    shared: Recovery = .{},
-    spaces: [3]Recovery.Space = undefined,
-    sent_initial: [16]Recovery.SentPacket = undefined,
-    sent_handshake: [16]Recovery.SentPacket = undefined,
-    sent_app: [16]Recovery.SentPacket = undefined,
+test "SizingLimits, every dependent length follows from five numbers" {
+    const S = Sizing(.{ .streams = 3, .stream_ring = 100, .sent_packets = 5, .crypto = 7, .datagram = 1300 });
+    const sizing: S = undefined;
+    try testing.expectEqual(@as(u64, 300), S.receive_limit);
+    try testing.expectEqual(3, sizing.streams.len);
+    try testing.expectEqual(100, sizing.recv_bytes[0].len);
+    try testing.expectEqual(100, sizing.send_bytes[2].len);
+    try testing.expectEqual(5, sizing.sent[2].len);
+    try testing.expectEqual(5, sizing.lost.len);
+    try testing.expectEqual(5, sizing.records.len);
+    try testing.expectEqual(15, sizing.entries.len);
+    try testing.expectEqual(7, sizing.crypto_sent[1].len);
+    try testing.expectEqual(1300, sizing.datagram_out.len);
+    try testing.expectEqual(6, sizing.control.len);
 
-    fn value(self: *Loss) Conn.Loss {
-        return .{
-            .shared = &self.shared,
-            .spaces = &self.spaces,
-            .sent_initial = &self.sent_initial,
-            .sent_handshake = &self.sent_handshake,
-            .sent_app = &self.sent_app,
-        };
-    }
-};
-
-/// A bound on every wait, so a regression fails the test instead of hanging CI.
-const test_timeout: Io.Timeout = .{ .duration = .{
-    .raw = .{ .nanoseconds = 2 * std.time.ns_per_s },
-    .clock = .awake,
-} };
-
-/// Bind 127.0.0.1 until a port is free. A test cannot ask for port 0 and learn
-/// the port back, so it walks a small range instead.
-fn bindLoopback(io: Io) !struct { socket: Io.net.Socket, address: Io.net.IpAddress } {
-    var port: u16 = 47301;
-    while (port < 47351) : (port += 1) {
-        const address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
-        const socket = Io.net.IpAddress.bind(&address, io, .{ .mode = .dgram, .protocol = .udp }) catch continue;
-        return .{ .socket = socket, .address = address };
-    }
-    return error.NoFreePort;
+    const advertised = S.advertised(.{ .max_idle_timeout = 30 });
+    try testing.expectEqual(@as(?u64, 300), advertised.initial_max_data);
+    try testing.expectEqual(@as(?u64, 100), advertised.initial_max_stream_data_bidi_remote);
+    try testing.expectEqual(@as(?u64, 3), advertised.initial_max_streams_bidi);
+    try testing.expectEqual(@as(?u64, 1300), advertised.max_udp_payload_size);
+    try testing.expectEqual(@as(?u64, 30), advertised.max_idle_timeout);
 }
 
-/// Two connections on real sockets, with every buffer they need. Built in place
-/// because a `Connection` must not move after `init`.
-const Harness = struct {
-    threaded: Io.Threaded = undefined,
-    io: Io = undefined,
-    server_socket: Io.net.Socket = undefined,
-    server_address: Io.net.IpAddress = undefined,
-    client_socket: Io.net.Socket = undefined,
-    client_address: Io.net.IpAddress = undefined,
-    dcid: [3]u8 = .{ 0x11, 0x22, 0x33 },
-    client_loss: Loss = .{},
-    server_loss: Loss = .{},
-    client_datagram: [1200]u8 = undefined,
-    client_write_frames: [1500]u8 = undefined,
-    client_plaintext: [1200]u8 = undefined,
-    client_recovery: [8]Recovery.SentPacket = undefined,
-    client_lost: [8]Recovery.SentPacket = undefined,
-    client_events: Recovery.Events = undefined,
-    client_parsed: [8]frame.Frame = undefined,
-    client_streams: [8]Conn.StreamEvent = undefined,
-    server_datagram: [1200]u8 = undefined,
-    server_write_frames: [1500]u8 = undefined,
-    server_plaintext: [1200]u8 = undefined,
-    server_recovery: [8]Recovery.SentPacket = undefined,
-    server_lost: [8]Recovery.SentPacket = undefined,
-    server_events: Recovery.Events = undefined,
-    server_parsed: [8]frame.Frame = undefined,
-    server_streams: [8]Conn.StreamEvent = undefined,
-    server_ids: [40]u8 = undefined,
-    server_parameters: [128]u8 = undefined,
-    client: Connection = undefined,
-    server: Connection = undefined,
+/// File scope: an endpoint is tens of kilobytes and must not move.
+var test_endpoint: Endpoint(Sizing(.{})) = undefined;
 
-    fn init(self: *Harness) !void {
-        self.threaded = .init(testing.allocator, .{});
-        self.io = self.threaded.io();
-        const server = try bindLoopback(self.io);
-        self.server_socket = server.socket;
-        self.server_address = server.address;
-        const client = try bindLoopback(self.io);
-        self.client_socket = client.socket;
-        self.client_address = client.address;
+test "RFC 9000 §14.1, accept drops what cannot start a connection, and is cancelable" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
-        self.client_events = .init(&self.client_recovery, &self.client_lost);
-        self.server_events = .init(&self.server_recovery, &self.server_lost);
+    var address: IpAddress = undefined;
+    const socket = bound: {
+        var port: u16 = 47501;
+        while (port < 47551) : (port += 1) {
+            address = .{ .ip4 = .loopback(port) };
+            break :bound address.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch continue;
+        }
+        return error.NoFreePort;
+    };
+    const local: IpAddress = .{ .ip4 = .loopback(0) };
+    const sender = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    defer sender.close(io);
 
-        self.client = .init(.{
-            .io = self.io,
-            .socket = self.client_socket,
-            .peer = self.server_address,
-            .conn = .{
-                .role = .client,
-                .loss = self.client_loss.value(),
-                .original_destination_connection_id = &self.dcid,
-                .destination_connection_id = &self.dcid,
-                .source_connection_id = &.{0x44},
-            },
-            .datagram = &self.client_datagram,
-            .write_frames = &self.client_write_frames,
-            .plaintext = &self.client_plaintext,
-            .frames = &self.client_parsed,
-            .stream_events = &self.client_streams,
-            .recovery_events = &self.client_events,
-        });
-        self.server = .init(.{
-            .io = self.io,
-            .socket = self.server_socket,
-            .peer = null,
-            .conn = .{
-                .role = .server,
-                .loss = self.server_loss.value(),
-                .original_destination_connection_id = &self.dcid,
-                .destination_connection_id = &.{0x44},
-                .source_connection_id = &self.dcid,
-            },
-            .datagram = &self.server_datagram,
-            .write_frames = &self.server_write_frames,
-            .plaintext = &self.server_plaintext,
-            .frames = &self.server_parsed,
-            .stream_events = &self.server_streams,
-            .recovery_events = &self.server_events,
-        });
-    }
+    var stub: quic.handshake.Stub = .{};
+    test_endpoint.listen(.{ .io = io, .socket = socket, .driver = stub.driver() });
+    defer test_endpoint.deinit(io);
 
-    /// Replace the server with one that has not met its client: no `Conn`, and
-    /// a buffer for the client's names.
-    fn listen(self: *Harness) void {
-        self.server = .init(.{
-            .io = self.io,
-            .socket = self.server_socket,
-            .conn = null,
-            .connection_ids = &self.server_ids,
-            .datagram = &self.server_datagram,
-            .write_frames = &self.server_write_frames,
-            .plaintext = &self.server_plaintext,
-            .frames = &self.server_parsed,
-            .stream_events = &self.server_streams,
-            .recovery_events = &self.server_events,
-        });
-    }
-
-    /// What a server accepts with: the name the client already addresses it by, so
-    /// the client needs no storage to adopt a new one.
-    fn accepting(self: *Harness) Connection.Accepting {
-        return .{
-            .conn = .{
-                .role = .server,
-                .loss = self.server_loss.value(),
-                .original_destination_connection_id = "",
-                .destination_connection_id = "",
-                .source_connection_id = &self.dcid,
-            },
-            .parameters = .{},
-            .parameter_storage = &self.server_parameters,
-        };
-    }
-
-    fn deinit(self: *Harness) void {
-        self.server_socket.close(self.io);
-        self.client_socket.close(self.io);
-        self.threaded.deinit();
-        self.* = undefined;
-    }
-
-    /// Seal one PING in an Initial at `out`, returning its length.
-    fn sealPing(self: *Harness, out: []u8) !u32 {
-        var payload: [8]u8 = undefined;
-        var writer: quic.Writer = .init(&payload);
-        try frame.write(&writer, .{ .ping = {} });
-        return self.client.conn.writeFrames(.initial, writer.written(), out, .data(0));
-    }
-};
-
-test "RFC 9001 §5.2, two sockets exchange an Initial and its acknowledgment" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-
-    // The client seals a PING in an Initial and sends it with the socket, the
-    // way an application would.
-    const sealed = try h.sealPing(&h.client_datagram);
-    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0..sealed]);
-
-    // The server waits for it, then answers with the acknowledgment the machine
-    // owes; `flush` is what turns that into a datagram.
-    const opened = (try h.server.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(Conn.SpaceId.initial, opened.space);
-    try testing.expectEqual(@as(usize, 1), opened.frames.len);
-    try testing.expectEqual(1, try h.server.flush(0));
-
-    // And the client learns its packet arrived.
-    _ = (try h.client.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), h.client_events.ackedPackets().len);
-}
-
-test "RFC 9000 §12.2, a coalesced datagram yields every packet it carries" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-
-    // Two Initials, back to back in one datagram. A client's first flight does
-    // exactly this with Initial and Handshake, which is why the shell may not
-    // stop at the first packet it opens.
-    const first = try h.sealPing(h.client_datagram[0..]);
-    const second = try h.sealPing(h.client_datagram[first..]);
-    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0 .. first + second]);
-
-    const one = (try h.server.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
-    const two = (try h.server.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), one.frames.len);
-    try testing.expectEqual(@as(usize, 1), two.frames.len);
-    try testing.expectEqual(one.packet_number + 1, two.packet_number);
-    try testing.expectEqual(first + second, one.packet_len + two.packet_len);
-}
-
-test "RFC 9000 §9.3, a datagram from another address is not a migration" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-
-    const sealed = try h.sealPing(h.client_datagram[0..]);
-    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0..sealed]);
-    _ = (try h.server.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
-
-    // The same connection ID from a different port: the server has validated
-    // no path there, so the datagram is dropped rather than followed.
-    const stranger = try bindLoopback(h.io);
-    defer stranger.socket.close(h.io);
-    const second = try h.sealPing(h.client_datagram[0..]);
-    try stranger.socket.send(h.io, &h.server_address, h.client_datagram[0..second]);
-
-    const nothing = try h.server.receive(0, test_timeout);
-    try testing.expect(nothing == null);
-    try testing.expect(h.server.peer_settled);
-    try testing.expect(h.server.peer.eql(&h.client_address));
-}
-
-test "RFC 9000 §7.2, accept builds the connection from the first Initial's connection IDs" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    h.listen();
-
-    // The client's IDs are the harness's: the server was built knowing neither.
-    const sealed = try h.sealPing(&h.client_datagram);
-    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0..sealed]);
-
-    const opened = (try h.server.accept(h.accepting(), 0, test_timeout)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(Conn.SpaceId.initial, opened.space);
-    try testing.expectEqual(Connection.State.open, h.server.state);
-    try testing.expectEqualSlices(u8, &h.dcid, h.server_ids[0..h.dcid.len]);
-    try testing.expectEqualSlices(u8, &.{0x44}, h.server.conn.destination_connection_id);
-    try testing.expect(h.server.peer.eql(&h.client_address));
-
-    // And the machine it built works: it owes an acknowledgment, which the
-    // client reads.
-    try testing.expectEqual(1, try h.server.flush(0));
-    _ = (try h.client.receive(0, test_timeout)) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), h.client_events.ackedPackets().len);
-}
-
-test "RFC 9000 §7.2, an unsupported version is refused before a connection exists" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    h.listen();
-
-    // §17.2: the version follows the first byte. Version 0x1a2a3a4a is one of
-    // the reserved ones that no endpoint implements (§15).
-    const sealed = try h.sealPing(&h.client_datagram);
-    @memcpy(h.client_datagram[1..5], &[_]u8{ 0x1a, 0x2a, 0x3a, 0x4a });
-    try h.client.socket.send(h.io, &h.server_address, h.client_datagram[0..sealed]);
-
-    try testing.expectError(error.UnsupportedVersion, h.server.accept(h.accepting(), 0, test_timeout));
-    try testing.expectEqual(Connection.State.listening, h.server.state);
-    try testing.expect(!h.server.peer_settled);
-    // The caller can still answer: the sender and the datagram are kept.
-    try testing.expect(h.server.peer.eql(&h.client_address));
-    try testing.expectError(error.NotOpen, h.server.flush(0));
-}
-
-test "RFC 9000 §7.2, a server that has not accepted has no connection to flush" {
-    var h: Harness = undefined;
-    try h.init();
-    defer h.deinit();
-    h.listen();
-
-    try testing.expectError(error.NotOpen, h.server.flush(0));
-    try testing.expectError(error.NotOpen, h.server.receive(0, test_timeout));
-    try testing.expect(!h.server.established());
+    var accepting = try io.concurrent(Endpoint(Sizing(.{})).accept, .{ &test_endpoint, io });
+    // A short datagram, then a full-size one that is not QUIC at all.
+    const junk: [1200]u8 = @splat(0x40);
+    try sender.send(io, &address, junk[0..20]);
+    try sender.send(io, &address, &junk);
+    try testing.expectError(error.Canceled, accepting.cancel(io));
+    try testing.expectEqual(Core.Phase.listening, test_endpoint.core.phase);
 }
