@@ -99,6 +99,10 @@ interop-hq:
 [group("test")]
 interop-go: (_interop-go "interop_go")
 
+[doc("The same GET against hq_server from a golang.org/x/net/quic client (tools/interop_go_xnet), the Go team's own QUIC stack. Needs go; skips with a message when it is absent")]
+[group("test")]
+interop-go-xnet: (_interop-go "interop_go_xnet")
+
 # Build the Go peer in tools/<NAME>, start hq_server on a free port, and fail
 # unless the peer prints the body hq_server answers with.
 [private]
@@ -107,7 +111,7 @@ _interop-go NAME:
     set -uo pipefail
     if ! command -v go >/dev/null 2>&1; then
         echo "{{ NAME }}: SKIP no go on PATH, so no foreign peer was reached."
-        echo "{{ NAME }}: run it in the dev shell: nix develop --command just interop-go"
+        echo "{{ NAME }}: go comes from the dev shell: run this under nix develop."
         exit 0
     fi
     zig build hq-bin -Dtls || exit 1

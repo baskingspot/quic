@@ -13,6 +13,10 @@ All notable changes to quic are recorded here. The format follows
   message when `go` is not on PATH, and the dev shell now provides it. Known
   limit: it fails today, because `baskingspot/tls`'s server refuses the
   X25519MLKEM768 key share quic-go leads with (`HybridServerUnsupported`).
+- `tools/interop_go_xnet`: a golang.org/x/net quic (v0.62.0) hq-interop client
+  and `just interop-go-xnet`, the same GET against `hq_server` from the Go
+  team's own QUIC stack. Known limit: it fails today for the same
+  `HybridServerUnsupported` reason as `just interop-go`.
 - A server sends HANDSHAKE_DONE (`Conn.writeConfirmation`, and `quic-io`'s
   `flush` calls it) once its handshake is confirmed, so a client such as quiche
   or ngtcp2 learns it too (RFC 9000 §13.3). Known limit: a lost HANDSHAKE_DONE
