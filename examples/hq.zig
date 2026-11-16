@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const assert = std.debug.assert;
 const testing = std.testing;
 
 const driver = @import("quic-tls");
@@ -104,82 +105,98 @@ var test_server: Endpoint = undefined;
 var client_tls: Tls = undefined;
 var server_tls: Tls = undefined;
 
-const Pair = struct {
-    threaded: Io.Threaded,
-    io: Io,
-    server_address: Io.net.IpAddress,
-    key: tls.signature.PrivateKey,
-    der: [cert_pem.len]u8 = undefined,
-    chain_slots: [1][]const u8 = undefined,
-    /// Whether `connect` got far enough that `test_client` and `client_tls`
-    /// are built, and so are `deinit`'s to tear down.
-    client_started: bool,
+/// A server listening and a client to connect, over the endpoints `client` and
+/// `server`, which are file-scope variables because an endpoint must not move.
+fn PairOf(comptime E: type, comptime client: *E, comptime server: *E) type {
+    return struct {
+        const Self = @This();
 
-    const cert_pem = @embedFile("tls_server_crt");
+        threaded: Io.Threaded,
+        io: Io,
+        server_address: Io.net.IpAddress,
+        key: tls.signature.PrivateKey,
+        der: [cert_pem.len]u8 = undefined,
+        chain_slots: [1][]const u8 = undefined,
+        /// Whether `connect` got far enough that `client` and `client_tls`
+        /// are built, and so are `deinit`'s to tear down.
+        client_started: bool,
 
-    /// Bind the server and start listening. The client's `connect` is the
-    /// test's to call.
-    ///
-    /// The kernel names the port, so no two tests, and no two processes, share
-    /// one. A fixed port is shared by all of them, and whatever reaches it (a
-    /// client of another process, a straggler for the last test's server)
-    /// arrives as this server's first datagram and takes its one connection
-    /// (§8.1).
-    fn init(self: *Pair) !void {
-        self.threaded = .init(testing.allocator, .{});
-        self.io = self.threaded.io();
-        self.client_started = false;
-        const io = self.io;
-        const any: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-        const socket = try any.bind(io, .{ .mode = .dgram });
-        self.server_address = socket.address;
-        const chain: tls.certificate_chain.CertificateChain = try .fromPem(cert_pem, &self.der, &self.chain_slots);
-        self.key = try .fromPemAuto(@embedFile("tls_server_key"));
-        const server_driver = try server_tls.start(io, .{ .server = .{
-            .credentials = .{ .chain = chain, .signer = self.key.signer() },
-            .alpn = &.{alpn},
-        } });
-        test_server.listen(.{ .io = io, .socket = socket, .driver = server_driver, .parameters = parameters });
-    }
+        const cert_pem = @embedFile("tls_server_crt");
 
-    fn connect(self: *Pair) !quic_io.Connection {
-        const io = self.io;
-        var policy: tls.certificate.Policy = .init;
-        policy.insecure_no_chain_anchor = true;
-        const local: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-        const socket = try local.bind(io, .{ .mode = .dgram });
-        const client_driver = client_tls.start(io, .{ .client = .{ .policy = policy, .alpn = &.{alpn} } }) catch |err| {
-            socket.close(io);
-            return err;
-        };
-        // From here the endpoint owns the socket, and `connect` failing still
-        // leaves it for `deinit`.
-        self.client_started = true;
-        return test_client.connect(.{
-            .io = io,
-            .socket = socket,
-            .peer = self.server_address,
-            .driver = client_driver,
-            .parameters = parameters,
-        });
-    }
-
-    /// `deinit` both endpoints, which must return with their tasks running.
-    /// The client only if `connect` started it: tearing down an endpoint that
-    /// was never built is a `Group.cancel` on whatever the last test left.
-    fn deinit(self: *Pair) void {
-        const io = self.io;
-        if (self.client_started) {
-            test_client.deinit(io);
-            client_tls.deinit();
+        /// Bind the server and start listening. The client's `connect` is the
+        /// test's to call.
+        ///
+        /// The kernel names the port, so no two tests, and no two processes,
+        /// share one. A fixed port is shared by all of them, and whatever
+        /// reaches it (a client of another process, a straggler for the last
+        /// test's server) arrives as this server's first datagram and takes its
+        /// one connection (§8.1).
+        fn init(self: *Self) !void {
+            self.threaded = .init(testing.allocator, .{});
+            self.io = self.threaded.io();
+            self.client_started = false;
+            const io = self.io;
+            const any: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+            const socket = try any.bind(io, .{ .mode = .dgram });
+            self.server_address = socket.address;
+            const chain: tls.certificate_chain.CertificateChain = try .fromPem(cert_pem, &self.der, &self.chain_slots);
+            self.key = try .fromPemAuto(@embedFile("tls_server_key"));
+            const server_driver = try server_tls.start(io, .{ .server = .{
+                .credentials = .{ .chain = chain, .signer = self.key.signer() },
+                .alpn = &.{alpn},
+            } });
+            server.listen(.{ .io = io, .socket = socket, .driver = server_driver, .parameters = parameters });
         }
-        test_server.deinit(io);
-        server_tls.deinit();
-        self.key.deinit();
-        self.threaded.deinit();
-        self.* = undefined;
-    }
-};
+
+        fn connect(self: *Self) !quic_io.Connection {
+            const local: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+            const socket = try local.bind(self.io, .{ .mode = .dgram });
+            return self.connectFrom(socket, self.server_address);
+        }
+
+        /// Connect from `socket`, which the client then owns, to `peer`: the
+        /// server, or something that forwards to it.
+        fn connectFrom(self: *Self, socket: Io.net.Socket, peer: Io.net.IpAddress) !quic_io.Connection {
+            const io = self.io;
+            var policy: tls.certificate.Policy = .init;
+            policy.insecure_no_chain_anchor = true;
+            const config: driver.Config = .{ .client = .{ .policy = policy, .alpn = &.{alpn} } };
+            const client_driver = client_tls.start(io, config) catch |err| {
+                socket.close(io);
+                return err;
+            };
+            // From here the endpoint owns the socket, and `connect` failing still
+            // leaves it for `deinit`.
+            self.client_started = true;
+            return client.connect(.{
+                .io = io,
+                .socket = socket,
+                .peer = peer,
+                .driver = client_driver,
+                .parameters = parameters,
+            });
+        }
+
+        /// `deinit` both endpoints, which must return with their tasks
+        /// running. The client only if `connect` started it: tearing down an
+        /// endpoint that was never built is a `Group.cancel` on whatever the
+        /// last test left.
+        fn deinit(self: *Self) void {
+            const io = self.io;
+            if (self.client_started) {
+                client.deinit(io);
+                client_tls.deinit();
+            }
+            server.deinit(io);
+            server_tls.deinit();
+            self.key.deinit();
+            self.threaded.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+const Pair = PairOf(Endpoint, &test_client, &test_server);
 
 /// The server half of an exchange: accept, read the request to its FIN,
 /// answer, and wait for the client to close.
@@ -494,4 +511,198 @@ test "RFC 9000 §8.1, a genuine first datagram opens on the first accept, from i
     defer serving.cancel(io) catch {};
     try expectExchange(try pair.connect(), io);
     try serving.await(io);
+}
+
+// -- Real loss -------------------------------------------------------------------
+//
+// The exchange above through a UDP relay this test owns, which drops datagrams
+// in both directions by their place in each direction's sequence. Never at
+// random, so a failure replays the same pattern.
+//
+// The timers are the shipped ones. `parameters` sets a 5 s idle timeout, and
+// the PTO starts from RFC 9002's 333 ms initial RTT (about 1 s) and falls to a
+// few milliseconds once loopback yields a sample. A loss repaired by a probe
+// costs about a second during the handshake and milliseconds after it, inside
+// the idle timeout, and a loss nothing repairs ends in `error.IdleTimeout`
+// within seconds instead of a hang.
+
+/// The loss tests' endpoints: a stream ring big enough that one response
+/// leaves in more full datagrams, back to back, than either pattern below lets
+/// through between two drops. Each pattern is then sure to drop response data.
+const LossSizing = quic_io.Sizing(.{ .stream_ring = 16384 });
+const LossEndpoint = quic_io.Endpoint(LossSizing);
+var loss_client: LossEndpoint = undefined;
+var loss_server: LossEndpoint = undefined;
+const LossPair = PairOf(LossEndpoint, &loss_client, &loss_server);
+
+/// What the server answers under loss: the whole stream ring, and no byte
+/// equal to its neighbor, so a range delivered twice or at the wrong offset
+/// does not compare equal.
+const loss_body: [LossSizing.limits.stream_ring]u8 = bytes: {
+    var bytes: [LossSizing.limits.stream_ring]u8 = undefined;
+    @setEvalBranchQuota(4 * bytes.len);
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(index % 251);
+    break :bytes bytes;
+};
+
+/// A short-header datagram this long is response data. A 1-RTT packet in this
+/// shell is never padded, and the ones without STREAM data (ACK, PING,
+/// HANDSHAKE_DONE, the MAX_* frames, RESET_STREAM, STOP_SENDING,
+/// CONNECTION_CLOSE) are tens of bytes.
+const bulk = 1000;
+
+/// What one direction of the relay passed on and dropped.
+const Tally = struct {
+    forwarded: u32 = 0,
+    dropped: u32 = 0,
+    /// Dropped datagrams that were one 1-RTT packet of at least `bulk` bytes.
+    dropped_bulk: u32 = 0,
+};
+
+/// A UDP relay between the client and the server: the client talks to
+/// `client_side`, the server hears from `server_side`, and datagram `n` of
+/// either direction, counting from 0, is dropped when `drop[n % drop.len]`.
+const Relay = struct {
+    client_side: Io.net.Socket,
+    server_side: Io.net.Socket,
+    drop: []const bool,
+    upstream: Tally = .{},
+    downstream: Tally = .{},
+    group: Io.Group = .init,
+
+    fn bind(io: Io, drop: []const bool) !Relay {
+        // A pattern that drops everything is a partition, not loss.
+        assert(std.mem.findScalar(bool, drop, false) != null);
+        const any: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const client_side = try any.bind(io, .{ .mode = .dgram });
+        errdefer client_side.close(io);
+        const server_side = try any.bind(io, .{ .mode = .dgram });
+        return .{ .client_side = client_side, .server_side = server_side, .drop = drop };
+    }
+
+    /// Forward both directions between `client` and `server` until `stop`.
+    fn run(self: *Relay, io: Io, client: Io.net.IpAddress, server: Io.net.IpAddress) Io.ConcurrentError!void {
+        const up = .{ self, io, self.client_side, self.server_side, client, server, &self.upstream };
+        try self.group.concurrent(io, forward, up);
+        errdefer self.group.cancel(io);
+        const down = .{ self, io, self.server_side, self.client_side, server, client, &self.downstream };
+        try self.group.concurrent(io, forward, down);
+    }
+
+    /// Stop both tasks, then close both sockets. The tallies stay readable.
+    fn stop(self: *Relay, io: Io) void {
+        self.group.cancel(io);
+        self.client_side.close(io);
+        self.server_side.close(io);
+    }
+
+    /// One direction: what `source` sends `from` leaves `to` for `destination`.
+    fn forward(
+        self: *Relay,
+        io: Io,
+        from: Io.net.Socket,
+        to: Io.net.Socket,
+        source: Io.net.IpAddress,
+        destination: Io.net.IpAddress,
+        tally: *Tally,
+    ) Io.Cancelable!void {
+        var buffer: [2048]u8 = undefined;
+        while (true) {
+            const message = from.receive(io, &buffer) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                // Lost on the way in: one more loss, which the test is about.
+                else => continue,
+            };
+            // A stranger's datagram is not the pair's to count.
+            if (!message.from.eql(&source)) continue;
+            const index = tally.forwarded + tally.dropped;
+            if (self.drop[index % self.drop.len]) {
+                tally.dropped += 1;
+                // §17.3.1: the header form bit is outside header protection.
+                if (message.data.len >= bulk and message.data[0] & 0x80 == 0) tally.dropped_bulk += 1;
+                continue;
+            }
+            tally.forwarded += 1;
+            to.send(io, &destination, message.data) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                // A refused send is one more loss, which is the test's point.
+                else => {},
+            };
+        }
+    }
+};
+
+/// The server half under loss: `serveOne`, answering with `loss_body`.
+///
+/// The client's CONNECTION_CLOSE is the one packet nobody sends twice (§10.2),
+/// so when the relay drops it this waits out the idle timeout. The test cancels
+/// it instead once the client has read the whole body: by then the server has
+/// done everything the exchange needs from it.
+fn serveBulk(io: Io) !void {
+    const connection = try loss_server.accept(io);
+    const stream = try connection.acceptStream(io);
+    defer stream.close(io);
+    var request: [64]u8 = undefined;
+    try testing.expectEqualStrings("GET /index.html\r\n", try readAll(stream, io, &request));
+    try writeAll(stream, io, &loss_body);
+    try stream.shutdown(io, .send);
+    if (connection.acceptStream(io)) |_| return error.UnexpectedStream else |err| switch (err) {
+        error.ConnectionClosed => {},
+        else => return err,
+    }
+}
+
+/// The hq exchange through `relay`: the request, the whole of `loss_body`
+/// back, intact and ended by the server's FIN, and the client's close.
+fn exchangeThrough(pair: *LossPair, relay: *Relay) !void {
+    const io = pair.io;
+    var serving = try io.concurrent(serveBulk, .{io});
+    defer serving.cancel(io) catch {};
+    const local: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const socket = try local.bind(io, .{ .mode = .dgram });
+    relay.run(io, socket.address, pair.server_address) catch |err| {
+        socket.close(io);
+        return err;
+    };
+    const connection = try pair.connectFrom(socket, relay.client_side.address);
+    const stream = try sendRequest(connection, io);
+    // One byte over, so a longer response is `error.TooLong`, not a match.
+    var response: [loss_body.len + 1]u8 = undefined;
+    try testing.expectEqualSlices(u8, &loss_body, try readAll(stream, io, &response));
+    // The server's peer is the relay, which is where all its packets went.
+    try testing.expect(loss_server.core.peer.eql(&relay.server_side.address));
+    stream.close(io);
+    connection.close(io);
+    serving.cancel(io) catch |err| switch (err) {
+        error.Canceled => {},
+        else => return err,
+    };
+}
+
+/// Run the exchange through a relay dropping by `drop`, and require that the
+/// drops hit both directions and that the body needed a resend.
+fn expectRecovery(drop: []const bool) !void {
+    var pair: LossPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var relay: Relay = try .bind(pair.io, drop);
+    {
+        defer relay.stop(pair.io);
+        try exchangeThrough(&pair, &relay);
+    }
+    try testing.expect(relay.upstream.dropped > 0);
+    try testing.expect(relay.downstream.dropped > 0);
+    // Response bytes the relay dropped, and a body that arrived whole anyway:
+    // this shell sends a STREAM range a second time only when the machine
+    // marks it lost (§13.3), and a probe is a PING, so those bytes reached the
+    // client in a retransmission.
+    try testing.expect(relay.downstream.dropped_bulk > 0);
+}
+
+test "RFC 9002 §6 and RFC 9000 §13.3, the exchange survives two datagrams of every five dropped each way" {
+    try expectRecovery(&.{ false, true, false, true, false });
+}
+
+test "RFC 9002 §6 and RFC 9000 §13.3, the exchange survives every seventh datagram dropped each way" {
+    try expectRecovery(&.{ false, false, false, false, false, false, true });
 }
