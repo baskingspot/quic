@@ -77,7 +77,9 @@ pub fn deadline(self: *const RecoveryDriver, options: Options) Deadline {
 /// Fire the deadline if `now` has reached it.
 ///
 /// `events` receives the loss set for a loss timeout, over storage the caller
-/// sized with `Recovery.Events.init`. Returns null when there is nothing to
+/// sized with `Recovery.Events.init`. A connection never sees this call, so its
+/// caller hands those packets to `Conn.onPacketsLost` to have what they carried
+/// sent again (§13.3 of RFC 9000). Returns null when there is nothing to
 /// do: no deadline, a deadline still in the future, or a deadline
 /// that passed while the state moved on (everything acknowledged, keys
 /// discarded), in which case the driver simply forgets it.

@@ -85,9 +85,9 @@ const own_id_len = 8;
 /// Room for this endpoint's encoded transport parameters.
 const parameter_capacity = 256;
 
-/// Every buffer one connection needs, sized from `limits`: the loss tables,
-/// the CRYPTO buffers, the stream slots and rings, the sent-frame records, and
-/// the datagram scratch.
+/// Every buffer one connection needs, sized from `limits`: the loss tables and
+/// the STREAM records beside them, the CRYPTO buffers, the stream slots and
+/// rings, the shell's own sent-frame records, and the datagram scratch.
 pub fn Sizing(comptime limits_given: SizingLimits) type {
     comptime {
         assert(limits_given.streams > 0);
@@ -113,6 +113,9 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         loss_state: Recovery = .{},
         spaces: [3]Recovery.Space = undefined,
         sent: [3][sent]Recovery.SentPacket = undefined,
+        /// The STREAM ranges each tracked 1-RTT packet carried, one per slot of
+        /// the 1-RTT sent table, which `Conn` resends from when one is lost.
+        sent_streams: [sent]Conn.SentStreams = undefined,
         acked: [sent]Recovery.SentPacket = undefined,
         lost: [sent]Recovery.SentPacket = undefined,
         crypto_in: [3][limits_given.crypto]u8 = undefined,
@@ -127,10 +130,9 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         send_bytes: [streams][ring]u8 = undefined,
         recv_bytes: [streams][ring]u8 = undefined,
         slots: [streams]Core.Slot = undefined,
-        /// One record per tracked 1-RTT packet, each with room for a frame per
-        /// stream, which is the most `Conn.writeStreams` packs.
+        /// One record per tracked 1-RTT packet, for the RESET_STREAM or
+        /// STOP_SENDING this shell composes itself.
         records: [sent]Core.Record = undefined,
-        entries: [sent * streams]Core.Entry = undefined,
         datagram_in: [datagram]u8 = undefined,
         datagram_out: [datagram]u8 = undefined,
         plaintext: [datagram]u8 = undefined,
@@ -158,6 +160,7 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
                 .sent_initial = &self.sent[0],
                 .sent_handshake = &self.sent[1],
                 .sent_app = &self.sent[2],
+                .sent_streams = &self.sent_streams,
             };
         }
 
@@ -174,7 +177,6 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
                 .written = &self.written,
                 .slots = &self.slots,
                 .records = &self.records,
-                .entries = &self.entries,
             };
         }
 
@@ -697,7 +699,7 @@ test "SizingLimits, every dependent length follows from five numbers" {
     try testing.expectEqual(5, sizing.sent[2].len);
     try testing.expectEqual(5, sizing.lost.len);
     try testing.expectEqual(5, sizing.records.len);
-    try testing.expectEqual(15, sizing.entries.len);
+    try testing.expectEqual(5, sizing.sent_streams.len);
     try testing.expectEqual(7, sizing.crypto_sent[1].len);
     try testing.expectEqual(1300, sizing.datagram_out.len);
     try testing.expectEqual(6, sizing.control.len);

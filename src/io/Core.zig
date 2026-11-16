@@ -76,20 +76,21 @@ pub const Slot = struct {
     owe_stop: bool = false,
 };
 
-/// One frame a 1-RTT packet carried that has to be sent again if the packet is
-/// lost (§13.3). ACKs, PADDING, PING, and the flow control frames are absent:
-/// the first three are never retransmitted and `Conn` recomputes the last.
+/// One frame this shell composed itself in a 1-RTT packet, which it has to send
+/// again if the packet is lost (§13.3). Only RESET_STREAM and STOP_SENDING: the
+/// machine records and resends the STREAM ranges, HANDSHAKE_DONE, and the flow
+/// control frames it writes, ACKs are never retransmitted, and PING and PADDING
+/// carry nothing to repair.
 pub const Entry = union(enum) {
-    stream: Conn.Written,
     reset_stream: u64,
     stop_sending: u64,
-    handshake_done,
 };
 
-/// The frames of one sent 1-RTT packet, by packet number. `len` zero is free.
+/// The owed frame one sent 1-RTT packet carried, by packet number. Each goes
+/// in a packet of its own, so a record holds one; `entry` null is free.
 pub const Record = struct {
     packet_number: u64 = 0,
-    len: u16 = 0,
+    entry: ?Entry = null,
 };
 
 /// The buffers the core works in, all the caller's (`Sizing`'s).
@@ -110,8 +111,6 @@ pub const Storage = struct {
     written: []Conn.Written,
     slots: []Slot,
     records: []Record,
-    /// `records.len` runs of `entries.len / records.len` entries each.
-    entries: []Entry,
 };
 
 /// §14.1: a datagram carrying an ack-eliciting Initial is at least 1200 bytes.
@@ -170,8 +169,6 @@ pub const Options = struct {
 pub fn init(self: *Core, options: Options) void {
     const storage = options.storage;
     assert(storage.records.len > 0);
-    assert(storage.entries.len % storage.records.len == 0);
-    assert(storage.entries.len / storage.records.len >= storage.slots.len);
     assert(storage.scratch.len >= initial_payload_floor);
     assert(storage.datagram_out.len > crypto_overhead);
     for (storage.slots) |*slot| slot.* = .{};
@@ -422,31 +419,29 @@ fn onPacket(self: *Core, opened: Conn.Opened, now: Conn.Duration) Failure!void {
     };
 }
 
-/// The sent 1-RTT packets an ACK cleared: their stream bytes and resets are
-/// acknowledged on the streams (§3.1). A handshake space keeps no records.
+/// The sent 1-RTT packets an ACK cleared: a reset they carried is acknowledged
+/// on its stream (§3.1). The machine already acknowledged the stream bytes, and
+/// a handshake space keeps no records.
 fn onAcked(self: *Core, id: Conn.SpaceId, packets: []const Recovery.SentPacket) Failure!void {
     if (id != .app) return;
     for (packets) |packet| {
         const index = self.findRecord(packet.packet_number) orelse continue;
-        for (self.entriesOf(index)) |entry| switch (entry) {
-            .stream => |written| {
-                const stream = self.conn.stream(written.stream_id) orelse continue;
-                if (stream.canSend()) try stream.send.onAck(written.offset, written.length);
-            },
-            .reset_stream => |id_reset| {
-                const stream = self.conn.stream(id_reset) orelse continue;
-                if (!stream.canSend() or stream.send.state != .reset_sent) continue;
+        switch (self.storage.records[index].entry.?) {
+            .reset_stream => |id_reset| reset: {
+                const stream = self.conn.stream(id_reset) orelse break :reset;
+                if (!stream.canSend() or stream.send.state != .reset_sent) break :reset;
                 // Reset Sent is the one state the acknowledgment is legal in.
                 stream.send.onResetAcked() catch unreachable;
             },
-            .stop_sending, .handshake_done => {},
-        };
-        self.storage.records[index].len = 0;
+            .stop_sending => {},
+        }
+        self.storage.records[index] = .{};
     }
 }
 
 /// Packets declared lost (§6.1 of RFC 9002): a handshake space replays its
-/// CRYPTO bytes, and a 1-RTT packet's frames go out again in a new one.
+/// CRYPTO bytes, and a 1-RTT packet's owed frame goes out again in a new one.
+/// The machine has already marked what it wrote as owed again.
 fn onLost(self: *Core, id: Conn.SpaceId, packets: []const Recovery.SentPacket, now: Conn.Duration) Failure!void {
     if (packets.len == 0) return;
     if (id != .app) return self.replayCrypto(id, now);
@@ -563,13 +558,11 @@ fn flushOwed(self: *Core) Failure!void {
     }
 }
 
-/// A server's HANDSHAKE_DONE, recorded so a lost one goes out again (§13.3),
-/// which `Conn.writeConfirmation` cannot do on its own.
+/// A server's HANDSHAKE_DONE. The machine says it is owed again when the
+/// packet carrying it is lost (§13.3).
 fn sendConfirmation(self: *Core, now: Conn.Duration) Failure!void {
-    if (!self.appHasRoom()) return;
-    const number = self.conn.app.?.next_packet_number;
+    if (!self.sentHasRoom(.app)) return;
     const length = (try self.conn.writeConfirmation(self.storage.datagram_out, now)) orelse return;
-    self.claimRecord(number, 1)[0] = .handshake_done;
     try self.transmit(length);
 }
 
@@ -596,23 +589,20 @@ fn sendOwed(self: *Core, owed: Entry, now: Conn.Duration) Failure!void {
     if (try self.rewrite(&writer, owed)) try self.sendApp(writer.written(), owed, now);
 }
 
-/// §4.2: the window updates the application's reads made due. They are not
-/// recorded: `Conn` recomputes what is owed, so a lost one is owed again.
+/// §4.2: the window updates the application's reads made due, and the ones
+/// whose newest copy was lost (§13.3). The machine keeps both.
 fn sendFlowControl(self: *Core, now: Conn.Duration) Failure!void {
-    if (!self.appHasRoom()) return;
-    const owed = self.conn.flowControlOwed(self.storage.control);
-    if (owed.len == 0) return;
-    var writer: quic.Writer = .init(self.storage.scratch);
-    for (owed) |value| try frame.write(&writer, value);
-    try self.sendApp(writer.written(), null, now);
-    self.conn.onFlowControlSent(owed);
+    if (!self.sentHasRoom(.app)) return;
+    const out = self.storage.datagram_out;
+    const length = (try self.conn.writeFlowControl(self.storage.control, self.storage.scratch, out, now)) orelse return;
+    try self.transmit(length);
 }
 
-/// Every stream with bytes or a FIN to send, packed by the machine until
-/// nothing is left that the peer's credit allows (§4.1).
+/// Every stream with bytes or a FIN to send, lost ranges first, packed by the
+/// machine until nothing is left that the peer's credit allows (§4.1, §13.3).
 fn sendStreams(self: *Core, now: Conn.Duration) Failure!void {
     const out = self.storage.datagram_out;
-    while (self.appHasRoom()) {
+    while (self.sentHasRoom(.app)) {
         var count: usize = 0;
         for (self.conn.streams) |*entry| {
             if (!entry.canSend()) continue;
@@ -621,7 +611,6 @@ fn sendStreams(self: *Core, now: Conn.Duration) Failure!void {
             count += 1;
         }
         if (count == 0) return;
-        const number = self.conn.app.?.next_packet_number;
         const packet = (try self.conn.writeStreams(.{
             .offers = self.storage.offers[0..count],
             .frames = self.storage.scratch,
@@ -630,19 +619,16 @@ fn sendStreams(self: *Core, now: Conn.Duration) Failure!void {
             .max_payload = @intCast(out.len),
             .now = now,
         })) orelse return;
-        for (self.claimRecord(number, packet.frames.len), packet.frames) |*entry, written| {
-            entry.* = .{ .stream = written };
-        }
         try self.transmit(packet.length);
     }
 }
 
 /// Seal `payload` in a 1-RTT packet, record `entry` against its number, and
 /// send it. The caller checked `appHasRoom`.
-fn sendApp(self: *Core, payload: []const u8, entry: ?Entry, now: Conn.Duration) Failure!void {
+fn sendApp(self: *Core, payload: []const u8, entry: Entry, now: Conn.Duration) Failure!void {
     const number = self.conn.app.?.next_packet_number;
     const length = try self.conn.writeFrames(.app, payload, self.storage.datagram_out, .data(now));
-    if (entry) |value| self.claimRecord(number, 1)[0] = value;
+    self.claimRecord(number, entry);
     try self.transmit(length);
 }
 
@@ -682,7 +668,12 @@ fn pollRecovery(self: *Core, now: Conn.Duration) Failure!void {
     // `recovery_spaces` is in `SpaceId` order, as `Conn.Loss.spaces` is.
     const id: Conn.SpaceId = @fromBackingInt(@intCast(fired.space));
     switch (fired.kind) {
-        .loss => try self.onLost(id, self.events.lostPackets(), now),
+        .loss => {
+            // A timer's losses are the caller's to hand over: the machine saw
+            // the ones an acknowledgment declared, not these (§13.3).
+            self.conn.onPacketsLost(id, self.events.lostPackets());
+            try self.onLost(id, self.events.lostPackets(), now);
+        },
         .probe => try self.probe(id, fired.probes, now),
     }
 }
@@ -694,7 +685,7 @@ fn probe(self: *Core, id: Conn.SpaceId, count: u8, now: Conn.Duration) Failure!v
     if (id != .app and self.conn.replayCrypto(id).len > 0) return self.replayCrypto(id, now);
     var sent: u8 = 0;
     while (sent < @max(count, 1)) : (sent += 1) {
-        if (!self.spaceHasRoom(id)) return;
+        if (!self.sentHasRoom(id)) return;
         var writer: quic.Writer = .init(self.storage.scratch);
         try frame.write(&writer, .ping);
         const length = try self.conn.writeFrames(id, self.padded(id, &writer), self.storage.datagram_out, .data(now));
@@ -709,7 +700,7 @@ fn replayCrypto(self: *Core, id: Conn.SpaceId, now: Conn.Duration) Failure!void 
     const chunk = self.storage.datagram_out.len - crypto_overhead;
     var offset: usize = 0;
     while (offset < bytes.len) : (offset += chunk) {
-        if (!self.spaceHasRoom(id)) return;
+        if (!self.sentHasRoom(id)) return;
         var writer: quic.Writer = .init(self.storage.scratch);
         try frame.write(&writer, .{ .crypto = .{
             .offset = offset,
@@ -727,51 +718,27 @@ fn padded(self: *Core, id: Conn.SpaceId, writer: *const quic.Writer) []const u8 
     return self.storage.scratch[0..initial_payload_floor];
 }
 
-/// Send a lost 1-RTT packet's frames again, together in one new packet, under
-/// the same record. The frames still worth sending fit, because they fit the
-/// packet that was lost.
+/// Send a lost 1-RTT packet's owed frame again, in one new packet, under the
+/// same record, if it still means something.
 fn resend(self: *Core, number: u64, now: Conn.Duration) Failure!void {
     const index = self.findRecord(number) orelse return;
-    const entries = self.entriesOf(index);
+    const entry = self.storage.records[index].entry.?;
+    self.storage.records[index] = .{};
     var writer: quic.Writer = .init(self.storage.scratch);
-    var kept: u16 = 0;
-    for (entries) |entry| {
-        if (!try self.rewrite(&writer, entry)) continue;
-        entries[kept] = entry;
-        kept += 1;
-    }
-    self.storage.records[index].len = 0;
-    if (kept == 0) return;
+    if (!try self.rewrite(&writer, entry)) return;
     // The lost packet left the sent table and its record is free again.
     assert(self.appHasRoom());
     const fresh = self.conn.app.?.next_packet_number;
     const length = try self.conn.writeFrames(.app, writer.written(), self.storage.datagram_out, .data(now));
-    self.storage.records[index] = .{ .packet_number = fresh, .len = kept };
+    self.storage.records[index] = .{ .packet_number = fresh, .entry = entry };
     try self.transmit(length);
 }
 
 /// Write `entry` again if it still means something, and say whether it did.
 fn rewrite(self: *Core, writer: *quic.Writer, entry: Entry) Failure!bool {
     switch (entry) {
-        .stream => |written| {
-            const stream = self.conn.stream(written.stream_id) orelse return false;
-            if (!stream.canSend() or stream.send.reset_code != null) return false;
-            if (written.offset + written.length <= stream.send.acked and !written.fin) return false;
-            try frame.write(writer, .{ .stream = .{
-                .id = written.stream_id,
-                .offset = written.offset,
-                .data = try stream.send.data(written.offset, written.length),
-                .fin = written.fin,
-                .length_present = true,
-            } });
-            return true;
-        },
         .reset_stream => |id| return writeReset(writer, self.conn.stream(id) orelse return false),
         .stop_sending => |id| return writeStop(writer, self.conn.stream(id) orelse return false),
-        .handshake_done => {
-            try frame.write(writer, .handshake_done);
-            return true;
-        },
     }
 }
 
@@ -891,49 +858,40 @@ fn nextTimeout(self: *Core) Io.Timeout {
     } };
 }
 
-/// Room for one more tracked 1-RTT packet and its record.
+/// Room for one more tracked 1-RTT packet carrying an owed frame: a sent-table
+/// slot and a free record of this shell's.
 fn appHasRoom(self: *Core) bool {
-    return self.spaceHasRoom(.app);
-}
-
-/// Room for one more tracked packet in `id`'s space: keys, a sent-table slot,
-/// and for 1-RTT a free record.
-fn spaceHasRoom(self: *Core, id: Conn.SpaceId) bool {
-    const space = self.conn.spaceFor(id) catch return false;
-    if (!space.recovery.hasRoom()) return false;
-    if (id != .app) return true;
+    if (!self.sentHasRoom(.app)) return false;
     for (self.storage.records) |record| {
-        if (record.len == 0) return true;
+        if (record.entry == null) return true;
     }
     return false;
 }
 
-/// Claim a free record for packet `number` and return its `count` entries to
-/// fill. Every tracked 1-RTT packet holds a sent-table slot, the table and the
-/// records are the same length, and `appHasRoom` checked both.
-fn claimRecord(self: *Core, number: u64, count: usize) []Entry {
-    assert(count > 0);
-    for (self.storage.records, 0..) |*slot, index| {
-        if (slot.len != 0) continue;
-        slot.* = .{ .packet_number = number, .len = @intCast(count) };
-        return self.entriesOf(index);
+/// Room for one more tracked packet in `id`'s space: keys and a sent-table
+/// slot. What the machine writes it records itself, in a table as long.
+fn sentHasRoom(self: *Core, id: Conn.SpaceId) bool {
+    const space = self.conn.spaceFor(id) catch return false;
+    return space.recovery.hasRoom();
+}
+
+/// Record `entry` against packet `number`. Every tracked 1-RTT packet holds a
+/// sent-table slot, the table and the records are the same length, and
+/// `appHasRoom` checked both.
+fn claimRecord(self: *Core, number: u64, entry: Entry) void {
+    for (self.storage.records) |*slot| {
+        if (slot.entry != null) continue;
+        slot.* = .{ .packet_number = number, .entry = entry };
+        return;
     }
     unreachable;
 }
 
 fn findRecord(self: *const Core, number: u64) ?usize {
     for (self.storage.records, 0..) |slot, index| {
-        if (slot.len != 0 and slot.packet_number == number) return index;
+        if (slot.entry != null and slot.packet_number == number) return index;
     }
     return null;
-}
-
-/// The entries a record holds, as many as it says.
-fn entriesOf(self: *const Core, index: usize) []Entry {
-    const per_record = self.storage.entries.len / self.storage.records.len;
-    const record_len = self.storage.records[index].len;
-    assert(record_len <= per_record);
-    return self.storage.entries[index * per_record ..][0..record_len];
 }
 
 fn indexOf(self: *const Core, entry: *const Conn.Stream) u16 {

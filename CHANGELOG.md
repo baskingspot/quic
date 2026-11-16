@@ -7,6 +7,22 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- Loss is repaired for more than CRYPTO (RFC 9000 §13.3). When a 1-RTT packet
+  is declared lost, its STREAM data goes again from the stream's own send
+  buffer at the same offsets (the next `Conn.writeStreams` sends it before new
+  bytes, and it spends no new connection credit), and a lost HANDSHAKE_DONE,
+  MAX_DATA, MAX_STREAM_DATA, or MAX_STREAMS is owed again with its current
+  value until a copy is acknowledged. ACK, PING, and PADDING are never resent,
+  and a space whose keys are gone resends nothing. What a caller does: give
+  `Conn.Loss` a `sent_streams` table of `Conn.SentStreams` (112 bytes each,
+  one per `sent_app` slot), and hand the packets a loss timer declares
+  (`RecoveryDriver.poll`) to `Conn.onPacketsLost`; losses an acknowledgment
+  declares are handled inside `feed`. A full `sent_streams` is `error.NoSpace`
+  from `writeStreams` before anything is sealed. `quic-io` does both, so its
+  connections now survive a lost packet of stream data or flow control.
+- `Conn.writeFlowControl` seals every frame `Conn.flowControlOwed` reports in
+  one 1-RTT packet and records which packet carried the newest of each, which
+  is what lets a loss of it be repaired.
 - `Conn.Opening.authenticate`: opens a first Initial's packet under the keys its
   Destination Connection ID seeds, in a copy, before any `Conn` is built, so a
   server can tell a packet that opens from a header that merely parses.
@@ -27,9 +43,8 @@ All notable changes to quic are recorded here. The format follows
   `HybridServerUnsupported` reason as `just interop-go`.
 - A server sends HANDSHAKE_DONE (`Conn.writeConfirmation`, and `quic-io`'s
   `flush` calls it) once its handshake is confirmed, so a client such as quiche
-  or ngtcp2 learns it too (RFC 9000 §13.3). Known limit: a lost HANDSHAKE_DONE
-  is not retransmitted, because the machine has no general queue of frames to
-  resend yet.
+  or ngtcp2 learns it too (RFC 9000 §13.3), and sends it again while the packet
+  carrying it keeps being lost.
 - `examples/hq_server.zig` and `examples/hq_client.zig`: an hq-interop server
   and client that carry one `GET` and its response over a real TLS 1.3
   handshake on loopback UDP. `just interop-hq` builds both (`zig build hq-bin`), runs them against the self-signed certificate in `tests/fixtures`,
@@ -317,6 +332,15 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `Conn.onFlowControlSent` is gone: `Conn.writeFlowControl` seals the owed
+  frames and records the raises itself, because only the machine knows which
+  packet number they went out under. `Conn.Loss` requires `sent_streams`.
+  `Conn.Packing.written` holds one record per STREAM frame rather than one per
+  offer: a packet carries at most `Conn.stream_frames_per_packet` (four), and
+  an offer with lost ranges takes one frame per range, so a shorter list stops
+  the packet early and `consumed` says where to resume. `quic-io`'s
+  `Core.Storage` loses `entries`; its records hold only the RESET_STREAM and
+  STOP_SENDING it composes itself.
 - TLS is now built by default. `zig build` and `zig build test` include the
   `quic-tls` driver, the loopback and seam suites, and the hq-interop examples,
   and resolve the `baskingspot/tls` dependency, which needs OpenSSL headers and
@@ -503,6 +527,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- A lost MAX_DATA, MAX_STREAM_DATA, or MAX_STREAMS was never sent again. The
+  limit rose when the frame left, so `Conn.flowControlOwed` had nothing left to
+  report, and a peer that never heard the raise stayed blocked until the
+  application read another half window. `quic-io` claimed the frame was owed
+  again; it was not.
 - `quic-io`'s `Endpoint.accept` no longer gives its one connection to whoever
   sends the first well-formed header (RFC 9000 §8.1). A first datagram whose
   first packet does not open under the Initial keys (a bad tag, a Length past

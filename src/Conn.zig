@@ -18,13 +18,19 @@
 //! `Opened.frames`, because a packet that does not say what it carries cannot be
 //! retransmitted by a caller that later learns it was lost.
 //!
-//! Loss recovery is the caller's too, and lives outside this type: the
-//! `Recovery`, its three sent tables, and the three `Recovery.Space` values are
-//! all in caller storage, and `Conn` keeps only pointers into them. `Conn.init`
-//! returns by value, so a `Recovery` field here would be left behind by the
-//! caller's first assignment and every space in the copy would point at the
-//! pre-move address. `Config.loss` is the caller's storage instead, which is also
-//! what lets a `RecoveryDriver` outlive a moved connection.
+//! Loss recovery's state is the caller's too, and lives outside this type: the
+//! `Recovery`, its three sent tables, the STREAM records beside the 1-RTT one,
+//! and the three `Recovery.Space` values are all in caller storage, and `Conn`
+//! keeps only pointers into them. `Conn.init` returns by value, so a `Recovery`
+//! field here would be left behind by the caller's first assignment and every
+//! space in the copy would point at the pre-move address. `Config.loss` is the
+//! caller's storage instead, which is also what lets a `RecoveryDriver` outlive
+//! a moved connection.
+//!
+//! What a lost packet carried is the machine's to send again (§13.3): STREAM
+//! ranges from the caller's own send buffers, CRYPTO from `replayCrypto`, and
+//! the control frames re-encoded from current state. The one thing the caller
+//! hands over is a loss its own timer declared, through `onPacketsLost`.
 
 const std = @import("std");
 const testing = std.testing;
@@ -185,6 +191,13 @@ pub const StreamLimits = struct {
 /// that is ack-eliciting or in flight (RFC 9002 §6.1), and a table that cannot
 /// hold one is a packet whose fate nobody reports: `error.NoSpace` at the write,
 /// never a silent gap.
+///
+/// `sent_streams` is the other half of a 1-RTT sent record: which STREAM ranges
+/// a packet carried, so a loss can mark them unsent again (§13.3). Size it like
+/// `sent_app`, one per packet; it is freed when the packet leaves `sent_app`, so
+/// the same length can never run out first. A shorter one bounds the packets of
+/// stream data in flight, and the next is `error.NoSpace` before anything is
+/// sealed.
 pub const Loss = struct {
     /// The connection-wide half of RFC 9002: the RTT estimator (§5) and the PTO
     /// backoff (§6.2.1). Both belong to the path, so an Initial key discard
@@ -200,6 +213,7 @@ pub const Loss = struct {
     sent_initial: []Recovery.SentPacket,
     sent_handshake: []Recovery.SentPacket,
     sent_app: []Recovery.SentPacket,
+    sent_streams: []SentStreams,
 
     /// The sent table for one space.
     pub fn table(self: *const Loss, id: SpaceId) []Recovery.SentPacket {
@@ -207,6 +221,69 @@ pub const Loss = struct {
             .initial => self.sent_initial,
             .handshake => self.sent_handshake,
             .app => self.sent_app,
+        };
+    }
+};
+
+/// The most STREAM frames one packet carries, which is what keeps a sent record
+/// a fixed size. `writeStreams` stops packing at this many and says where to
+/// resume, the same answer it gives when the room runs out.
+pub const stream_frames_per_packet = 4;
+
+/// The STREAM ranges one sent 1-RTT packet carried, by packet number: 112 bytes
+/// on a 64-bit target, in the caller's `Loss.sent_streams`.
+///
+/// Descriptors, never bytes. The bytes stay in the caller's send buffer, so a
+/// loss marks the ranges unsent in their streams (`SendStream.onLost`) and the
+/// next `writeStreams` sends them again at the same offsets (§13.3); an
+/// acknowledgment hands the same ranges to `SendStream.onAck`. CRYPTO keeps its
+/// own buffer (`replayCrypto`), and the control frames need no record at all:
+/// see `Latest`.
+pub const SentStreams = struct {
+    packet_number: u64 = 0,
+    /// How many of `frames` are this packet's. Zero is a free record: a packet
+    /// with no STREAM frame never takes one.
+    len: u8 = 0,
+    frames: [stream_frames_per_packet]Written = undefined,
+
+    pub fn written(self: *const SentStreams) []const Written {
+        std.debug.assert(self.len <= stream_frames_per_packet);
+        return self.frames[0..self.len];
+    }
+};
+
+/// Where the newest copy of one control frame is.
+///
+/// §13.3 resends MAX_DATA "if the packet containing the most recently sent
+/// MAX_DATA frame is declared lost", and says the same of MAX_STREAM_DATA and
+/// MAX_STREAMS; HANDSHAKE_DONE goes until it is acknowledged. So the packet
+/// number of the newest copy is all the state a resend needs: a loss of that
+/// packet makes the frame owed again, re-encoded from the current value, and a
+/// loss of an older one changes nothing, because a newer value already left.
+pub const Latest = union(enum) {
+    /// Nothing outstanding: never sent, or the newest copy was acknowledged.
+    idle,
+    /// The newest copy went out in this 1-RTT packet.
+    sent: u64,
+    /// The packet carrying the newest copy was declared lost.
+    lost,
+
+    fn onSent(self: *Latest, number: u64) void {
+        self.* = .{ .sent = number };
+    }
+
+    fn onAcked(self: *Latest, number: u64) void {
+        if (self.isIn(number)) self.* = .idle;
+    }
+
+    fn onLost(self: *Latest, number: u64) void {
+        if (self.isIn(number)) self.* = .lost;
+    }
+
+    fn isIn(self: Latest, number: u64) bool {
+        return switch (self) {
+            .sent => |sent| sent == number,
+            .idle, .lost => false,
         };
     }
 };
@@ -540,6 +617,8 @@ pub const Stream = struct {
     send: SendStream = undefined,
     recv: ReceiveStream = undefined,
     halves: Halves = .unused,
+    /// §13.3: the packet carrying this stream's newest MAX_STREAM_DATA.
+    max_stream_data: Latest = .idle,
 
     /// Which halves a slot holds. Exhaustive on purpose: `send` is only valid
     /// when this says so, and a boolean pair could disagree with the slot the
@@ -754,9 +833,15 @@ named: bool = false,
 /// frame arrives, which is the machine's fact alone. A server's is confirmed
 /// when its TLS handshake completes, which is the driver's.
 handshake_done: bool = false,
-/// §19.20: a server has sent its HANDSHAKE_DONE frame. It goes out once; see
-/// `writeConfirmation` for why a lost one is not sent again.
+/// §19.20: a server has sent its HANDSHAKE_DONE frame at least once.
 confirmation_sent: bool = false,
+/// §13.3: the packet carrying the newest HANDSHAKE_DONE. A loss of it makes the
+/// frame owed again, until one copy is acknowledged.
+confirmation: Latest = .idle,
+/// §13.3: the packets carrying the newest MAX_DATA, and the newest MAX_STREAMS
+/// of each direction.
+max_data_latest: Latest = .idle,
+max_streams_latest: struct { bidi: Latest = .idle, uni: Latest = .idle } = .{},
 /// §6.2 and §17.2.5.2: the client's memory of what the server has said, which
 /// is what decides whether a Version Negotiation or a Retry still counts. Absent
 /// on a server, which never has to remember either.
@@ -967,13 +1052,29 @@ fn discardIfPresent(self: *Conn, id: SpaceId) void {
 /// §13.3's CRYPTO send buffer goes with them: there is nothing left to replay,
 /// and a space that comes back — only a rebuilt Initial, after a Retry — starts
 /// its CRYPTO stream at offset zero rather than at a stale one.
+///
+/// The 1-RTT space's sent records go too. §6.4 of RFC 9002 removes the packets
+/// sent under discarded keys without declaring them lost, so whatever they
+/// carried is not owed again (§17.2.2.1): nothing can carry it.
 fn clear(self: *Conn, id: SpaceId) void {
     switch (id) {
         .initial => self.initial = null,
         .handshake => self.handshake = null,
-        .app => self.app = null,
+        .app => {
+            self.app = null;
+            self.forgetSent();
+        },
     }
     self.crypto_sent[@backingInt(id)].len = 0;
+}
+
+/// Drop every 1-RTT sent record: the STREAM ranges and the newest-copy stamps.
+fn forgetSent(self: *Conn) void {
+    for (self.loss.sent_streams) |*record| record.len = 0;
+    self.confirmation = .idle;
+    self.max_data_latest = .idle;
+    self.max_streams_latest = .{};
+    for (self.streams) |*entry| entry.max_stream_data = .idle;
 }
 
 /// Take the first packet of a datagram and return its frames.
@@ -1284,6 +1385,86 @@ fn onAck(
     var scaled = ack;
     scaled.delay = self.ackDelay(ack.delay);
     try space.recovery.onAckReceived(&scaled, now, self.recoveryOptions(), events);
+
+    // §13.3: what the acknowledged packets carried is delivered, and what the
+    // lost ones carried is owed again. Only 1-RTT packets have sent records;
+    // a handshake space's CRYPTO bytes are `replayCrypto`'s.
+    if (id != .app) return;
+    for (events.ackedPackets()) |sent| try self.onPacketAcked(sent.packet_number);
+    self.onPacketsLost(.app, events.lostPackets());
+}
+
+/// §13.3: a 1-RTT packet was acknowledged, so its STREAM ranges are delivered
+/// and any control frame whose newest copy it carried is no longer owed.
+fn onPacketAcked(self: *Conn, number: u64) Error!void {
+    self.confirmation.onAcked(number);
+    self.max_data_latest.onAcked(number);
+    self.max_streams_latest.bidi.onAcked(number);
+    self.max_streams_latest.uni.onAcked(number);
+    for (self.streams) |*entry| entry.max_stream_data.onAcked(number);
+
+    const record = self.sentRecord(number) orelse return;
+    defer record.len = 0;
+    for (record.written()) |written| {
+        // A closed stream was terminal, so everything on it was delivered.
+        const entry = self.stream(written.stream_id) orelse continue;
+        if (!entry.canSend()) continue;
+        try entry.send.onAck(written.offset, written.length);
+    }
+}
+
+/// §13.3: the 1-RTT packets in `packets` were declared lost, so what they
+/// carried is owed again: their STREAM ranges are unsent in their streams, and
+/// a HANDSHAKE_DONE, MAX_DATA, MAX_STREAM_DATA, or MAX_STREAMS whose newest
+/// copy was in one of them is owed with the current value.
+///
+/// The machine calls this itself for the losses an acknowledgment declares,
+/// inside `feed`. A loss timer is the caller's (`RecoveryDriver.poll`), so the
+/// caller hands those packets over here; that is the one call a resend needs
+/// from it. Calling twice for the same packets is harmless: the first call
+/// consumes the records.
+///
+/// Nothing is owed again for the other spaces, by design. Their CRYPTO bytes are
+/// in `replayCrypto`, an ACK is never retransmitted (§13.3), and PING and
+/// PADDING carry no information to repair. A space whose keys are gone owes
+/// nothing at all (§17.2.2.1): its records went with the keys.
+pub fn onPacketsLost(self: *Conn, id: SpaceId, packets: []const Recovery.SentPacket) void {
+    self.pin();
+    if (id != .app) return;
+    if (self.app == null) return;
+    for (packets) |sent| self.onPacketLost(sent.packet_number);
+}
+
+fn onPacketLost(self: *Conn, number: u64) void {
+    self.confirmation.onLost(number);
+    self.max_data_latest.onLost(number);
+    self.max_streams_latest.bidi.onLost(number);
+    self.max_streams_latest.uni.onLost(number);
+    for (self.streams) |*entry| entry.max_stream_data.onLost(number);
+
+    const record = self.sentRecord(number) orelse return;
+    defer record.len = 0;
+    for (record.written()) |written| {
+        const entry = self.stream(written.stream_id) orelse continue;
+        if (!entry.canSend()) continue;
+        entry.send.onLost(written.offset, written.length, written.fin);
+    }
+}
+
+/// The STREAM record of 1-RTT packet `number`, or null when it carried none.
+fn sentRecord(self: *Conn, number: u64) ?*SentStreams {
+    for (self.loss.sent_streams) |*record| {
+        if (record.len != 0 and record.packet_number == number) return record;
+    }
+    return null;
+}
+
+/// A free STREAM record, or null when every one holds a packet in flight.
+fn freeRecord(self: *Conn) ?*SentStreams {
+    for (self.loss.sent_streams) |*record| {
+        if (record.len == 0) return record;
+    }
+    return null;
 }
 
 /// §19.3: the wire's ACK Delay is microseconds scaled down by the sender's
@@ -1712,10 +1893,11 @@ pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8, now: Duration) Error
 /// What a loss in `id`'s space needs to be re-sent: the CRYPTO bytes this
 /// endpoint has sent there, from offset zero (§13.3).
 ///
-/// The machine cannot know which of them were acknowledged — an ACK names packet
-/// numbers, and mapping those back to frames is the packet-to-frame table this
-/// design deliberately does not keep — so a replay is the whole flight, and the
-/// peer discards the parts it already has by offset (§19.6).
+/// The machine does not know which of them were acknowledged — an ACK names
+/// packet numbers, and the per-packet records in `Loss.sent_streams` describe
+/// STREAM ranges only — so a replay is the whole flight, and the peer discards
+/// the parts it already has by offset (§19.6). For a handshake that is cheap,
+/// and it is what a rebuilt space after a Retry needs anyway.
 ///
 /// Idempotent on purpose: the answer is what has been sent in the space, so a
 /// caller that calls twice gets the same bytes and does not have to remember
@@ -1851,6 +2033,7 @@ fn lossTablesValid(loss: Loss) bool {
     if (loss.sent_initial.len == 0) return false;
     if (loss.sent_handshake.len == 0) return false;
     if (loss.sent_app.len == 0) return false;
+    if (loss.sent_streams.len == 0) return false;
 
     // Two spaces over one table would overwrite each other's records, and a
     // record holds the packet number its own space uses: a caller that handed
@@ -1873,14 +2056,17 @@ fn placeRecovery(loss: Loss, id: SpaceId) *Recovery.Space {
     return place;
 }
 
-/// Place all three spaces and return the Initial one.
+/// Place all three spaces, free every STREAM record, and return the Initial
+/// space.
 ///
 /// `init` is the first caller, and it places Handshake and 1-RTT too even
 /// though their keys do not exist yet: a `RecoveryDriver` is built over the
 /// whole array, and a slot that was never written is an uninitialized read
 /// waiting for the first timer query. Keys arriving later replace the loss
-/// state where it stands.
+/// state where it stands. The records are the same: a stale one would name a
+/// packet this connection never sent.
 fn placeAllRecovery(loss: Loss) *Recovery.Space {
+    for (loss.sent_streams) |*record| record.len = 0;
     var initial: *Recovery.Space = undefined;
     for (std.enums.values(SpaceId)) |id| {
         const placed = placeRecovery(loss, id);
@@ -1954,6 +2140,7 @@ pub fn openStream(self: *Conn, id: u64) Error!*Stream {
 
     if (stream_id.direction(id) == .bidi) {
         entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.recv_limit_bytes);
+        entry.max_stream_data = .idle;
         entry.halves = .both;
         _ = try self.stream_table.open(id, &entry.send, &entry.recv);
     } else {
@@ -2022,6 +2209,7 @@ fn streamFor(self: *Conn, id: u64) Error!*Stream {
     const index = self.freeStream() orelse return error.StreamLimit;
     const entry = &self.streams[index];
     entry.recv = ReceiveStream.init(id, entry.recv_buffer, entry.recv_limit_bytes);
+    entry.max_stream_data = .idle;
     entry.halves = .recv_only;
     _ = try self.stream_table.open(id, null, &entry.recv);
     return entry;
@@ -2377,9 +2565,9 @@ pub const Consumed = struct {
 pub const Packet = struct {
     /// How many bytes of `out` are the packet.
     length: u32,
-    /// The packet number these frames went out under. The machine is the only
-    /// party that knows it, and a resend queue needs the pairing to answer
-    /// "which frames were in packet 5" when that packet is declared lost.
+    /// The packet number these frames went out under. The machine keeps the
+    /// pairing itself, in `Loss.sent_streams`, and acts on it when the packet
+    /// is acknowledged or declared lost; the caller has it for its own books.
     number: u64,
     /// One record per STREAM frame, in wire order, borrowed from the caller's
     /// storage.
@@ -2399,13 +2587,16 @@ pub const Packet = struct {
 pub const Packing = struct {
     /// The streams to fill from, in the caller's order. This is scheduling, and
     /// the machine does not do it: which stream deserves the next byte is the
-    /// caller's policy, like congestion control and retransmission.
+    /// caller's policy, like congestion control. Within one offer, the
+    /// stream's lost ranges go before its new bytes (§13.3).
     offers: []const Offer,
     /// The caller's scratch for the encoded frames, as in `writeHandshake`.
     frames: []u8,
     /// Where the packet is sealed.
     out: []u8,
-    /// One record per offer, so it must be at least as long as `offers`.
+    /// One record per STREAM frame. A packet carries at most this many, and
+    /// never more than `stream_frames_per_packet`; an offer with lost runs
+    /// waiting takes one frame per run.
     written: []Written,
     /// The payload bytes the caller will allow here: its congestion window and
     /// its MTU decision, neither of which the machine owns. The packet is also
@@ -2428,6 +2619,11 @@ pub const Packing = struct {
 /// Every refusal is decided before a stream's cursor moves, because a segment
 /// that was taken and not written is data the peer will never be sent.
 ///
+/// Retransmission is part of packing, not a second path. A stream whose packet
+/// was declared lost has those ranges unsent again, and its offer sends them
+/// first, at their own offsets (§13.3); the packet's STREAM ranges are recorded
+/// in `Loss.sent_streams` so its own loss or acknowledgment reaches them.
+///
 /// `Packet.remaining` is the other half of that report: how much of the payload
 /// room this packet was given it did not use. The budget comes from the caller's
 /// congestion controller, which the machine does not own, so a caller writing
@@ -2440,7 +2636,7 @@ pub fn writeStreams(self: *Conn, packing: Packing) Error!?Packet {
     // acknowledgment.
     const space = try self.spaceFor(.app);
     if (packing.offers.len == 0) return null;
-    std.debug.assert(packing.written.len >= packing.offers.len);
+    std.debug.assert(packing.written.len > 0);
 
     // Every offer is checked before any segment is taken, so an error cannot
     // leave one stream's cursor ahead of a packet that never left.
@@ -2449,81 +2645,131 @@ pub fn writeStreams(self: *Conn, packing: Packing) Error!?Packet {
         if (!entry.canSend()) return error.NotOpen;
     }
 
-    // §4.1 and §4.2: three numbers bound this packet — the peer's
-    // connection-wide allowance, the caller's budget, and what the output buffer
-    // can carry after the header, the packet number, and the tag.
-    const allowed: u64 = @min(packing.max_payload, self.send_window.available());
+    // Two numbers bound the packet as a whole: the caller's budget and what the
+    // output buffer can carry after the header, the packet number, and the tag.
+    // The peer's connection-wide credit (§4.1) bounds only new bytes, in
+    // `Packer.bound`, because a retransmission spent its credit the first time.
     const room: u32 = @intCast(@min(
-        allowed,
+        @as(u64, packing.max_payload),
         @min(@as(u64, packing.frames.len), appPayloadRoom(self, packing.out)),
     ));
     if (room == 0) return null;
+    // Both tables before any cursor moves (RFC 9002 A.5 records every packet
+    // sent): a packet whose STREAM ranges cannot be recorded is one whose loss
+    // could never be repaired.
     if (!space.recovery.hasRoom()) return error.NoSpace;
+    const record = self.freeRecord() orelse return error.NoSpace;
 
     const number = space.next_packet_number;
-    var writer: Writer = .init(packing.frames);
-    var count: usize = 0;
-    var taken: u32 = 0;
-    var partial: u32 = 0;
-
+    var packer: Packer = .{
+        .writer = .init(packing.frames),
+        .room = room,
+        .credit = self.send_window.available(),
+        .frames_max = @min(stream_frames_per_packet, packing.written.len),
+    };
     for (packing.offers) |offer| {
-        const entry = self.stream(offer.stream_id) orelse unreachable;
-        const offered = entry.send.peekSegment(offer.length) orelse {
-            // Nothing sendable: the offer is finished with, so the caller moves
-            // past it instead of offering it again forever.
-            taken += 1;
-            continue;
-        };
+        try self.packOffer(&packer, offer, packing.written);
+        if (packer.stopped) break;
+    }
+
+    // Nothing went in: no packet, no packet number, and no stream moved.
+    if (packer.count == 0) return null;
+
+    const length = try self.writeFrames(.app, packer.writer.written(), packing.out, .data(packing.now));
+    const frames = packing.written[0..packer.count];
+    record.* = .{ .packet_number = number, .len = @intCast(frames.len) };
+    @memcpy(record.frames[0..frames.len], frames);
+    return .{
+        .length = length,
+        .number = number,
+        .frames = frames,
+        .consumed = .{ .taken = packer.taken, .partial = packer.partial },
+        // §19.8 frames reserve their widest header before the data is measured,
+        // so a packet that stopped on an offer has bytes in hand that no next
+        // frame could use. That is a full packet, not room for the caller.
+        .remaining = if (packer.stopped) 0 else @intCast(packer.bound(false) -| packer.writer.pos),
+    };
+}
+
+/// One packing call in progress: the frames written so far, and how far into
+/// the caller's list it got.
+const Packer = struct {
+    writer: Writer,
+    /// The payload room the budget and the output buffer allow.
+    room: u32,
+    /// §4.1: the peer's connection-wide credit when the packet started.
+    credit: u64,
+    /// The fewer of `stream_frames_per_packet` and the caller's `written`.
+    frames_max: usize,
+    /// Retransmitted bytes in this packet, which spend no credit.
+    resent: u64 = 0,
+    count: usize = 0,
+    taken: u32 = 0,
+    partial: u32 = 0,
+    /// The packet stopped inside the list, at `offers[taken]`.
+    stopped: bool = false,
+
+    /// How far the payload may reach for a frame of this kind. New bytes are
+    /// held to the peer's credit, frames and all, as they always were; the bytes
+    /// a retransmission carries were counted once already, so they widen it.
+    fn bound(self: *const Packer, retransmit: bool) u64 {
+        if (retransmit) return self.room;
+        return @min(self.room, self.credit + self.resent);
+    }
+
+    fn stop(self: *Packer, given: u32) void {
+        self.stopped = true;
+        self.partial = given;
+    }
+};
+
+/// Pack as much of one offer as fits: its lost runs first, then new bytes
+/// (§13.3), as one STREAM frame each, up to `offer.length` bytes in all.
+fn packOffer(self: *Conn, packer: *Packer, offer: Offer, written: []Written) Error!void {
+    const entry = self.stream(offer.stream_id) orelse unreachable;
+    var given: u32 = 0;
+    while (given < offer.length) {
+        // Nothing sendable is finished with too, so an idle stream cannot hold
+        // up the list behind it.
+        const offered = entry.send.peekSegment(offer.length - given) orelse break;
+        if (packer.count == packer.frames_max) return packer.stop(given);
 
         const overhead = streamFrameOverhead(offer.stream_id, offered.offset);
-        const left = room - writer.pos;
-        if (left <= overhead) break;
-        const capacity = left - overhead;
+        const reach = packer.bound(offered.retransmit);
+        if (reach <= packer.writer.pos + overhead) return packer.stop(given);
+        const capacity = reach - packer.writer.pos - overhead;
         const length: u32 = @intCast(@min(@as(u64, offered.data.len), capacity));
 
         // §19.8: FIN rides only the frame that reaches the final size, which is
         // why trimming an offer can drop the flag and `nextSegment` decides.
         const segment = entry.send.nextSegment(length) orelse unreachable;
+        std.debug.assert(segment.retransmit == offered.retransmit);
         // The overhead above is an upper bound on the frame's own bytes, and the
         // data was clamped to what is left after it, so this cannot run out.
-        frame.write(&writer, .{ .stream = .{
+        frame.write(&packer.writer, .{ .stream = .{
             .id = offer.stream_id,
             .offset = segment.offset,
             .data = segment.data,
             .fin = segment.fin,
             .length_present = true,
         } }) catch unreachable;
-        try self.send_window.onSent(segment.data.len);
+        if (segment.retransmit) {
+            packer.resent += segment.data.len;
+        } else {
+            try self.send_window.onSent(segment.data.len);
+        }
 
-        packing.written[count] = .{
+        written[packer.count] = .{
             .stream_id = offer.stream_id,
             .offset = segment.offset,
             .length = @intCast(segment.data.len),
             .fin = segment.fin,
         };
-        count += 1;
-
-        if (segment.data.len != offered.data.len) {
-            partial = @intCast(segment.data.len);
-            break;
-        }
-        taken += 1;
+        packer.count += 1;
+        given += @intCast(segment.data.len);
+        if (segment.data.len != offered.data.len) return packer.stop(given);
     }
-
-    // Nothing went in: no packet, no packet number, and no stream moved.
-    if (count == 0) return null;
-
-    const length = try self.writeFrames(.app, writer.written(), packing.out, .data(packing.now));
-    return .{
-        .length = length,
-        .number = number,
-        .frames = packing.written[0..count],
-        .consumed = .{ .taken = taken, .partial = partial },
-        // §19.8 frames reserve their widest header before the data is measured,
-        // so a packet that stopped on an offer has bytes in hand that no next
-        // frame could use. That is a full packet, not room for the caller.
-        .remaining = if (taken == packing.offers.len) room - writer.pos else 0,
-    };
+    packer.taken += 1;
 }
 
 /// The most a STREAM frame for `id` at `offset` costs before its data: the type
@@ -2549,20 +2795,24 @@ pub fn onMaxData(self: *Conn, limit: u64) void {
     self.send_window.onMaxData(limit);
 }
 
-/// §4.2: the MAX_DATA and every MAX_STREAM_DATA the application's reads have
-/// made due, in that order, written into `out` and returned as a prefix of it.
+/// §4.2: the MAX_DATA, every MAX_STREAM_DATA, and the MAX_STREAMS that are due,
+/// in that order, written into `out` and returned as a prefix of it.
 ///
-/// Reading a receive ring is the caller's act, so consumption is the only thing
-/// that opens a window, and this is where the machine notices it. No limit
-/// moves here: a frame that never leaves is a window the peer does not have, so
-/// `onFlowControlSent` records the raises after the caller puts them on the
-/// wire. Until then the same frames come back, which is what makes a caller
-/// that ran out of packet room simply try again.
+/// Two things make one due. Reading a receive ring is the caller's act, so
+/// consumption is what opens a window, and this is where the machine notices
+/// it. And §13.3: when the packet carrying the newest copy of one of these
+/// frames is declared lost, it is due again with the current value, because a
+/// limit the peer never heard is credit it does not have.
+///
+/// No limit moves here: a frame that never leaves is a window the peer does not
+/// have, so `writeFlowControl` records the raises once the packet is sealed.
+/// Until then the same frames come back, which is what makes a caller that ran
+/// out of packet room simply try again.
 pub fn flowControlOwed(self: *Conn, out: []frame.Frame) []frame.Frame {
     self.pin();
     var count: usize = 0;
 
-    if (self.receive_window.nextLimit(self.consumedBytes())) |limit| {
+    if (self.maxDataOwed()) |limit| {
         if (count == out.len) return out[0..count];
         out[count] = .{ .max_data = limit };
         count += 1;
@@ -2570,55 +2820,112 @@ pub fn flowControlOwed(self: *Conn, out: []frame.Frame) []frame.Frame {
 
     // §4.2: one frame per stream, in stream ID order, so two calls that see the
     // same state build the same list in the same places.
-    for (self.stream_table.iterator()) |slot| {
-        const recv = slot.recv orelse continue;
-        const limit = recv.nextMaxStreamData() orelse continue;
+    for (self.stream_table.iterator()) |*slot| {
+        if (slot.recv == null) continue;
+        const entry = streamOf(slot);
+        const limit = maxStreamDataOwed(entry) orelse continue;
         if (count == out.len) break;
-        out[count] = .{ .max_stream_data = .{ .stream_id = recv.id, .maximum = limit } };
+        out[count] = .{ .max_stream_data = .{ .stream_id = entry.recv.id, .maximum = limit } };
         count += 1;
     }
 
-    // §4.6: freed streams are credit the peer may have again. Only what has
-    // risen is sent, and the two directions are separate counters, so one frame
-    // per direction at most.
-    if (self.streams_allowed.bidi > self.streams_advertised.bidi) {
+    // §4.6: freed streams are credit the peer may have again. The two
+    // directions are separate counters, so one frame per direction at most.
+    for ([_]frame.Direction{ .bidi, .uni }) |direction| {
+        const maximum = self.maxStreamsOwed(direction) orelse continue;
         if (count == out.len) return out[0..count];
-        out[count] = .{ .max_streams = .{
-            .direction = .bidi,
-            .maximum = self.streams_allowed.bidi,
-        } };
-        count += 1;
-    }
-    if (self.streams_allowed.uni > self.streams_advertised.uni) {
-        if (count == out.len) return out[0..count];
-        out[count] = .{ .max_streams = .{
-            .direction = .uni,
-            .maximum = self.streams_allowed.uni,
-        } };
+        out[count] = .{ .max_streams = .{ .direction = direction, .maximum = maximum } };
         count += 1;
     }
     return out[0..count];
 }
 
-/// §4.2: record that `frames` went on the wire, so their limits apply. A limit
-/// only ever rises here, the same rule a receiver applies to a MAX frame it
-/// reads.
-pub fn onFlowControlSent(self: *Conn, frames: []const frame.Frame) void {
-    self.pin();
+/// The MAX_DATA limit owed: a raise the reads made due, or the current limit
+/// again when the newest MAX_DATA was lost (§13.3).
+fn maxDataOwed(self: *Conn) ?u64 {
+    if (self.receive_window.nextLimit(self.consumedBytes())) |limit| return limit;
+    if (self.max_data_latest == .lost) return self.receive_window.limit;
+    return null;
+}
+
+/// The same for one stream's MAX_STREAM_DATA. A lost one is said again only
+/// while the peer can still use it: §13.3 stops at Size Known, and so does
+/// `nextMaxStreamData`.
+fn maxStreamDataOwed(entry: *const Stream) ?u64 {
+    std.debug.assert(entry.canRecv());
+    if (entry.recv.nextMaxStreamData()) |limit| return limit;
+    if (entry.max_stream_data == .lost and entry.recv.state == .recv) return entry.recv.limit;
+    return null;
+}
+
+/// The same for MAX_STREAMS in one direction: what freed slots allow, or what
+/// was last advertised, again, when that frame was lost.
+fn maxStreamsOwed(self: *const Conn, direction: frame.Direction) ?u64 {
+    const allowed, const advertised, const latest = switch (direction) {
+        .bidi => .{ self.streams_allowed.bidi, self.streams_advertised.bidi, self.max_streams_latest.bidi },
+        .uni => .{ self.streams_allowed.uni, self.streams_advertised.uni, self.max_streams_latest.uni },
+    };
+    if (allowed > advertised) return allowed;
+    if (latest == .lost) return advertised;
+    return null;
+}
+
+/// Seal one 1-RTT packet carrying every flow-control frame `flowControlOwed`
+/// reports, or null when none is.
+///
+/// `control` is the caller's list storage for those frames (one MAX_DATA, one
+/// MAX_STREAM_DATA per stream, two MAX_STREAMS covers everything), `frames` its
+/// scratch for their encoding, and `out` the datagram. Only once the packet is
+/// sealed do the limits rise (§4.2), and the packet number is kept against each
+/// frame, so a loss of this packet makes them owed again (§13.3).
+pub fn writeFlowControl(
+    self: *Conn,
+    control: []frame.Frame,
+    frames: []u8,
+    out: []u8,
+    now: Duration,
+) Error!?u32 {
+    if (self.state != .open) return error.Closed;
+    const space = try self.spaceFor(.app);
+    const owed = self.flowControlOwed(control);
+    if (owed.len == 0) return null;
+
+    var writer: Writer = .init(frames);
+    for (owed) |value| try frame.write(&writer, value);
+    const number = space.next_packet_number;
+    const length = try self.writeFrames(.app, writer.written(), out, .data(now));
+    self.onFlowControlSent(number, owed);
+    return length;
+}
+
+/// §4.2: `frames` went out in 1-RTT packet `number`, so their limits apply and
+/// the packet is the newest copy of each (§13.3). A limit only ever rises here,
+/// the same rule a receiver applies to a MAX frame it reads.
+fn onFlowControlSent(self: *Conn, number: u64, frames: []const frame.Frame) void {
     for (frames) |value| {
         switch (value) {
-            .max_data => |limit| self.receive_window.raise(limit),
+            .max_data => |limit| {
+                self.receive_window.raise(limit);
+                self.max_data_latest.onSent(number);
+            },
             .max_stream_data => |data| {
                 const entry = self.stream(data.stream_id) orelse continue;
                 if (data.maximum > entry.recv.limit) entry.recv.limit = data.maximum;
+                entry.max_stream_data.onSent(number);
             },
             // The same rule as MAX_DATA: a limit only ever rises, so a repeated
             // or reordered frame cannot walk the credit back.
             .max_streams => |limits| switch (limits.direction) {
-                .bidi => self.streams_advertised.bidi = @max(self.streams_advertised.bidi, limits.maximum),
-                .uni => self.streams_advertised.uni = @max(self.streams_advertised.uni, limits.maximum),
+                .bidi => {
+                    self.streams_advertised.bidi = @max(self.streams_advertised.bidi, limits.maximum);
+                    self.max_streams_latest.bidi.onSent(number);
+                },
+                .uni => {
+                    self.streams_advertised.uni = @max(self.streams_advertised.uni, limits.maximum);
+                    self.max_streams_latest.uni.onSent(number);
+                },
             },
-            else => {},
+            else => unreachable,
         }
     }
 }
@@ -2788,6 +3095,11 @@ pub const Write = struct {
 /// loss timer later work on (§6.1 of RFC 9002). A full table is `error.NoSpace`
 /// before anything is sealed, so the machine is left as it was found and the
 /// caller's buffer holds no half packet.
+///
+/// The machine does not parse what it seals, so frames written here are the
+/// caller's to send again if the packet is lost. What the machine writes itself
+/// — `writeStreams`, `writeConfirmation`, `writeFlowControl`, `writeHandshake` —
+/// it resends itself.
 pub fn writeFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8, write: Write) Error!u32 {
     self.pin();
     // §10.2.1: a closing endpoint sends nothing but CONNECTION_CLOSE, and this
@@ -2915,27 +3227,29 @@ pub fn writeAck(self: *Conn, id: SpaceId, out: []u8, now: Duration) Error!u32 {
 /// after `handshakeConfirmed`, and not yet sent. A client never sends it, and
 /// neither does a closing or draining endpoint (§10.2).
 ///
-/// KNOWN LIMIT, for the reader and the next session: a lost HANDSHAKE_DONE is
-/// not retransmitted. §13.3 says to resend its frame in a new packet, but this
-/// machine keeps no queue of control frames to resend (only CRYPTO bytes, in
-/// `crypto_sent`, and stream data), so a loss report for this packet is
-/// dropped like any other frame's. A client that never receives it stays
-/// unconfirmed. Fixing that needs the general retransmission queue first.
+/// §13.3: "The HANDSHAKE_DONE frame MUST be retransmitted until it is
+/// acknowledged." The machine keeps the number of the packet carrying the
+/// newest copy, so a loss of that packet makes this return a packet once more,
+/// and a loss of an older copy, or a second report of the same loss, does not.
 ///
 /// The packet is ack-eliciting and in flight, so loss recovery times it and
-/// the peer acknowledges it. `confirmation_sent` is set only after the seal
-/// succeeds, so a full sent table or a short buffer leaves the frame owed.
+/// the peer acknowledges it. The frame stops being owed only after the seal
+/// succeeds, so a full sent table or a short buffer leaves it owed.
 pub fn writeConfirmation(self: *Conn, out: []u8, now: Duration) Error!?u32 {
     if (self.state != .open) return null;
-    if (self.role != .server or self.confirmation_sent) return null;
-    if (self.app == null or !self.handshakeConfirmed()) return null;
+    if (self.role != .server) return null;
+    if (self.confirmation_sent and self.confirmation != .lost) return null;
+    const space = self.spaceMaybe(.app) orelse return null;
+    if (!self.handshakeConfirmed()) return null;
 
     var payload: [1]u8 = undefined;
     var writer: Writer = .init(&payload);
     try frame.write(&writer, .{ .handshake_done = {} });
 
+    const number = space.next_packet_number;
     const total = try self.writeFrames(.app, writer.written(), out, .data(now));
     self.confirmation_sent = true;
+    self.confirmation.onSent(number);
     return total;
 }
 
@@ -3571,12 +3885,14 @@ test "RFC 9000 §4.6, a finished stream returns its credit as MAX_STREAMS" {
     try testing.expectEqual(@as(usize, 1), server.flowControlOwed(&owed).len);
     try testing.expectEqual(@as(u64, 1), server.streams_advertised.bidi);
 
-    server.onFlowControlSent(due);
+    var control_bytes: [64]u8 = undefined;
+    _ = (try server.writeFlowControl(&owed, &control_bytes, &datagram, 0)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u64, 2), server.streams_advertised.bidi);
     try testing.expectEqual(@as(usize, 0), server.flowControlOwed(&owed).len);
 
     // A frame that names a lower count cannot walk the credit back.
-    server.onFlowControlSent(&.{.{ .max_streams = .{ .direction = .bidi, .maximum = 1 } }});
+    server.onFlowControlSent(1, &.{.{ .max_streams = .{ .direction = .bidi, .maximum = 1 } }});
     try testing.expectEqual(@as(u64, 2), server.streams_advertised.bidi);
 }
 
@@ -4027,6 +4343,7 @@ const LossTables = struct {
     sent_initial: [16]Recovery.SentPacket = undefined,
     sent_handshake: [16]Recovery.SentPacket = undefined,
     sent_app: [16]Recovery.SentPacket = undefined,
+    sent_streams: [16]SentStreams = @splat(.{}),
 
     /// The handles for `Conn.Config.loss`, pointing at this local's storage.
     fn value(self: *LossTables) Conn.Loss {
@@ -4036,6 +4353,7 @@ const LossTables = struct {
             .sent_initial = &self.sent_initial,
             .sent_handshake = &self.sent_handshake,
             .sent_app = &self.sent_app,
+            .sent_streams = &self.sent_streams,
         };
     }
 };
@@ -6695,13 +7013,14 @@ test "RFC 9000 §4.2, reading a ring is what makes a window raise due" {
     try testing.expectEqual(@as(u64, 64), server.receive_window.limit);
     try testing.expectEqual(@as(u64, 64), entry.recv.limit);
 
-    server.onFlowControlSent(due);
+    _ = (try server.writeFlowControl(&owed, &payload, &datagram, 0)) orelse
+        return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u64, 124), server.receive_window.limit);
     try testing.expectEqual(@as(u64, 124), entry.recv.limit);
     try testing.expectEqual(@as(usize, 0), server.flowControlOwed(&owed).len);
 
     // §4.2: a late or damaged frame cannot lower a limit.
-    server.onFlowControlSent(&.{.{ .max_data = 8 }});
+    server.onFlowControlSent(1, &.{.{ .max_data = 8 }});
     try testing.expectEqual(@as(u64, 124), server.receive_window.limit);
 }
 
@@ -7667,6 +7986,7 @@ test "a loss configuration with an empty table is refused" {
     };
 
     var spaces: [3]Recovery.Space = undefined;
+    var records: [4]SentStreams = @splat(.{});
     for (cases) |case| {
         const loss: Loss = .{
             .shared = &shared,
@@ -7674,10 +7994,23 @@ test "a loss configuration with an empty table is refused" {
             .sent_initial = case.sent_initial,
             .sent_handshake = case.sent_handshake,
             .sent_app = case.sent_app,
+            .sent_streams = &records,
         };
         try testing.expectEqual(case.valid, lossTablesValid(loss));
         try testing.expectEqual(case.sent_app.len, loss.table(.app).len);
     }
+
+    // No STREAM records is a 1-RTT space that could never send stream data
+    // whose loss it could repair (§13.3).
+    const no_records: Loss = .{
+        .shared = &shared,
+        .spaces = &spaces,
+        .sent_initial = &first,
+        .sent_handshake = &second,
+        .sent_app = &third,
+        .sent_streams = records[0..0],
+    };
+    try testing.expect(!lossTablesValid(no_records));
 }
 
 test "RFC 9000 §19.3.1, an acknowledgment of a packet never sent is a connection error" {
@@ -8068,4 +8401,416 @@ fn installPaired(
     const server_keys = protection.deriveKeys(&server_secret, .aes_128_gcm) catch unreachable;
     plantSpace(client, id, client_keys, server_keys);
     plantSpace(server, id, server_keys, client_keys);
+}
+
+/// Declare `sender`'s oldest unacknowledged 1-RTT packet lost the way the wire
+/// does (RFC 9002 §6.1.1): three later packets leave, `receiver` hears only the
+/// last, and its acknowledgment puts the oldest past the packet threshold.
+fn loseOldest(sender: *Conn, receiver: *Conn, report: *Recovery.Events) !void {
+    var datagram: [256]u8 = undefined;
+    var plaintext: [512]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var stream_events: [4]StreamEvent = undefined;
+    _ = try sender.writeFrames(.app, &pings(1), &datagram, .data(0));
+    _ = try sender.writeFrames(.app, &pings(1), &datagram, .data(0));
+    const last = try sender.writeFrames(.app, &pings(1), &datagram, .data(0));
+    _ = try receiver.feed(datagram[0..last], &plaintext, &frames, &stream_events, report, 0);
+    const ack = try receiver.writeAck(.app, &datagram, 0);
+    _ = try sender.feed(datagram[0..ack], &plaintext, &frames, &stream_events, report, 0);
+}
+
+/// A client with one stream to send on and a server to read it, both with
+/// 1-RTT keys: the shape every §13.3 STREAM test starts from. Built in place,
+/// because a `Conn` pins its address on first use.
+const ResendFixture = struct {
+    send_buffer: [64]u8 = undefined,
+    client_ring: [64]u8 = undefined,
+    server_ring: [64]u8 = undefined,
+    client_slots: [1]StreamTable.Slot = undefined,
+    client_streams: [1]Conn.Stream = undefined,
+    server_slots: [1]StreamTable.Slot = undefined,
+    server_streams: [1]Conn.Stream = undefined,
+    client_loss: LossTables = .{},
+    server_loss: LossTables = .{},
+    client: Conn = undefined,
+    server: Conn = undefined,
+    acked: [16]Recovery.SentPacket = undefined,
+    lost: [16]Recovery.SentPacket = undefined,
+    report: Recovery.Events = undefined,
+    written: [stream_frames_per_packet]Written = undefined,
+    frame_bytes: [256]u8 = undefined,
+    datagram: [512]u8 = undefined,
+    offers: [1]Offer = .{.{ .stream_id = 0, .length = 64 }},
+
+    /// `records` is how many STREAM records the client gets, out of 16.
+    fn init(self: *ResendFixture, records: usize) void {
+        const dcid = [_]u8{0xe1};
+        self.client_streams = .{.{
+            .send_buffer = &self.send_buffer,
+            .recv_buffer = &self.client_ring,
+            .recv_limit_bytes = 64,
+        }};
+        self.server_streams = .{.{ .recv_buffer = &self.server_ring, .recv_limit_bytes = 64 }};
+        self.report = .init(&self.acked, &self.lost);
+        var client_loss = self.client_loss.value();
+        client_loss.sent_streams = client_loss.sent_streams[0..records];
+        self.client = .init(.{
+            .role = .client,
+            .loss = client_loss,
+            .original_destination_connection_id = &dcid,
+            .destination_connection_id = &dcid,
+            .source_connection_id = &.{0xe2},
+            .stream_slots = &self.client_slots,
+            .streams = &self.client_streams,
+            .peer = .{ .max_data = 64, .stream_data = .{ .bidi_remote = 64 }, .max_streams = .{ .bidi = 1 } },
+        });
+        self.server = .init(.{
+            .role = .server,
+            .loss = self.server_loss.value(),
+            .original_destination_connection_id = &dcid,
+            .destination_connection_id = &.{0xe2},
+            .source_connection_id = &dcid,
+            .stream_slots = &self.server_slots,
+            .streams = &self.server_streams,
+            .receive_limit = 64,
+            .max_streams_bidi = 1,
+        });
+        installApp(&self.client, &self.server, @splat(0xe3), @splat(0xe4));
+    }
+
+    fn packing(self: *ResendFixture, max_payload: u32) Packing {
+        return .{
+            .offers = &self.offers,
+            .frames = &self.frame_bytes,
+            .out = &self.datagram,
+            .written = &self.written,
+            .max_payload = max_payload,
+            .now = 0,
+        };
+    }
+};
+
+test "RFC 9000 §13.3, lost STREAM data is sent again at the same offset" {
+    var f: ResendFixture = .{};
+    f.init(16);
+    const entry = try f.client.openStream(0);
+    try entry.send.write("hello");
+    try entry.send.finish();
+    const first = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 0), first.number);
+    try testing.expectEqual(SendStream.State.data_sent, entry.send.state);
+
+    // The packet never arrives, and the acknowledgment of a later one says so.
+    try loseOldest(&f.client, &f.server, &f.report);
+    try testing.expectEqual(@as(u64, 0), f.report.lostPackets()[0].packet_number);
+
+    // §13.3: the bytes go again in a new STREAM frame, at the offset they had,
+    // with the FIN they had. Nothing was copied: they are still the caller's.
+    const again = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    try testing.expect(again.number > first.number);
+    try testing.expectEqual(@as(usize, 1), again.frames.len);
+    try testing.expectEqual(Written{ .stream_id = 0, .offset = 0, .length = 5, .fin = true }, again.frames[0]);
+    // A retransmission spends no new credit (§4.1): the five bytes were counted
+    // once, when they first left.
+    try testing.expectEqual(@as(u64, 5), f.client.send_window.sent);
+
+    // The peer reads them where they belong, and nothing is owed a third time.
+    var plaintext: [1400]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var stream_events: [4]StreamEvent = undefined;
+    _ = try f.server.feed(f.datagram[0..again.length], &plaintext, &frames, &stream_events, &f.report, 0);
+    var read: [16]u8 = undefined;
+    const count = try f.server.stream(0).?.recv.readInto(&read);
+    try testing.expectEqualStrings("hello", read[0..count]);
+    try testing.expect((try f.client.writeStreams(f.packing(512))) == null);
+
+    // The retransmission's acknowledgment is what ends the stream (§3.1): the
+    // machine hands the recorded range back to the stream it came from.
+    const ack = try f.server.writeAck(.app, &f.datagram, 0);
+    _ = try f.client.feed(f.datagram[0..ack], &plaintext, &frames, &stream_events, &f.report, 0);
+    try testing.expectEqual(SendStream.State.data_recvd, entry.send.state);
+}
+
+test "RFC 9000 §13.3, a retransmission needs no credit the peer has not given" {
+    var f: ResendFixture = .{};
+    f.init(16);
+    const entry = try f.client.openStream(0);
+    // The peer's whole connection window, in one packet.
+    try entry.send.write(&@as([40]u8, @splat('q')));
+    _ = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    f.client.send_window.limit = 40;
+    try testing.expectEqual(@as(u64, 0), f.client.send_window.available());
+
+    try loseOldest(&f.client, &f.server, &f.report);
+    // §4.1 counts the highest offset sent, which a retransmission does not move,
+    // so a window with nothing left still carries the lost bytes again.
+    const again = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Written{ .stream_id = 0, .offset = 0, .length = 40, .fin = false }, again.frames[0]);
+    try testing.expectEqual(@as(u64, 40), f.client.send_window.sent);
+}
+
+test "RFC 9000 §13.3, a loss the caller's timer declares is handed over once" {
+    var f: ResendFixture = .{};
+    f.init(16);
+    const entry = try f.client.openStream(0);
+    try entry.send.write("timer");
+    const first = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+
+    // RFC 9002 §6.1.2: a later packet is acknowledged, so the first is lost once
+    // its time threshold passes, which is the caller's timer to notice.
+    var plaintext: [1400]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var stream_events: [4]StreamEvent = undefined;
+    const ms = Recovery.ms;
+    const later = try f.client.writeFrames(.app, &pings(1), &f.datagram, .data(0));
+    _ = try f.server.feed(f.datagram[0..later], &plaintext, &frames, &stream_events, &f.report, 0);
+    const ack = try f.server.writeAck(.app, &f.datagram, 0);
+    _ = try f.client.feed(f.datagram[0..ack], &plaintext, &frames, &stream_events, &f.report, ms(100));
+    try testing.expectEqual(@as(usize, 0), f.report.lostPackets().len);
+
+    var spaces = [_]*Recovery.Space{ f.client.initial.?.recovery, f.client.app.?.recovery };
+    var driver: RecoveryDriver = .init(&f.client_loss.shared, &spaces);
+    const due = driver.deadline(.{});
+    try testing.expectEqual(Recovery.TimerKind.loss, due.kind);
+    const fired = (try driver.poll(due.at, .{}, .client, &f.report)).?;
+    try testing.expectEqual(Recovery.TimeoutKind.loss, fired.kind);
+    try testing.expectEqual(first.number, f.report.lostPackets()[0].packet_number);
+
+    // The machine never saw that loss, so the caller hands it over. Twice is
+    // the same as once: the first call consumed the record.
+    f.client.onPacketsLost(.app, f.report.lostPackets());
+    f.client.onPacketsLost(.app, f.report.lostPackets());
+    const again = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Written{ .stream_id = 0, .offset = 0, .length = 5, .fin = false }, again.frames[0]);
+    try testing.expect((try f.client.writeStreams(f.packing(512))) == null);
+}
+
+test "RFC 9002 A.5, the STREAM record table is NoSpace before anything is sealed" {
+    // Two records against a sent table of sixteen: the third packet of stream
+    // data has nowhere to say what it carried.
+    var f: ResendFixture = .{};
+    f.init(2);
+    const entry = try f.client.openStream(0);
+    try entry.send.write("abcdefghij");
+    f.offers[0].length = 3;
+    _ = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    _ = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+
+    // A packet whose ranges cannot be recorded is one whose loss could never be
+    // repaired, so it is refused by name, and nothing moved: no packet number,
+    // no stream cursor, no credit.
+    try testing.expectError(error.NoSpace, f.client.writeStreams(f.packing(512)));
+    try testing.expectEqual(@as(u64, 2), f.client.app.?.next_packet_number);
+    try testing.expectEqual(@as(u64, 6), entry.send.sent);
+    try testing.expectEqual(@as(u64, 6), f.client.send_window.sent);
+    try testing.expectEqual(@as(usize, 2), f.client.app.?.recovery.inFlight().len);
+
+    // An acknowledgment frees the records with the packets, and the stream goes
+    // on from where it stopped.
+    var plaintext: [1400]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var stream_events: [4]StreamEvent = undefined;
+    const ping = try f.client.writeFrames(.app, &pings(1), &f.datagram, .data(0));
+    _ = try f.server.feed(f.datagram[0..ping], &plaintext, &frames, &stream_events, &f.report, 0);
+    f.server.app.?.record(0);
+    f.server.app.?.record(1);
+    const ack = try f.server.writeAck(.app, &f.datagram, 0);
+    _ = try f.client.feed(f.datagram[0..ack], &plaintext, &frames, &stream_events, &f.report, 0);
+    const next = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 6), next.frames[0].offset);
+}
+
+test "RFC 9000 §17.2.2.1, a loss in a discarded space owes nothing" {
+    var f: ResendFixture = .{};
+    f.init(16);
+    const entry = try f.client.openStream(0);
+    try entry.send.write("gone");
+    _ = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    const sent = f.client.app.?.recovery.inFlight()[0];
+
+    // RFC 9002 §6.4: the packets go with the keys, and so do their records. A
+    // report of one of them afterwards finds nothing to resend.
+    try f.client.discard(.app);
+    for (f.client_loss.sent_streams) |record| try testing.expectEqual(@as(u8, 0), record.len);
+    f.client.onPacketsLost(.app, &.{sent});
+    try testing.expectEqual(@as(usize, 0), entry.send.lost_len);
+    try testing.expectEqual(@as(?SendStream.Segment, null), entry.send.peekSegment(64));
+
+    // The handshake spaces the same way: their CRYPTO bytes are gone with the
+    // keys, so a loss there has nothing to replay.
+    var crypto_sent: [16]u8 = undefined;
+    f.client.crypto_sent[@backingInt(SpaceId.initial)] = .{ .bytes = &crypto_sent, .len = 5 };
+    try f.client.discard(.initial);
+    f.client.onPacketsLost(.initial, &.{sent});
+    try testing.expectEqual(@as(usize, 0), f.client.replayCrypto(.initial).len);
+}
+
+test "RFC 9000 §13.3, an ACK is never retransmitted" {
+    var f: ResendFixture = .{};
+    f.init(16);
+    var plaintext: [1400]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var stream_events: [4]StreamEvent = undefined;
+    const ping = try f.client.writeFrames(.app, &pings(1), &f.datagram, .data(0));
+    _ = try f.server.feed(f.datagram[0..ping], &plaintext, &frames, &stream_events, &f.report, 0);
+
+    // §13.2.1 and RFC 9002 §7.1: a packet carrying only an ACK is not
+    // ack-eliciting and not in flight, so it is never recorded.
+    const number = f.server.app.?.next_packet_number;
+    _ = try f.server.writeAck(.app, &f.datagram, 0);
+    try testing.expectEqual(@as(usize, 0), f.server.app.?.recovery.inFlight().len);
+    try testing.expect(!f.server.ackOwed(.app));
+
+    // A caller that reports it lost anyway owes nothing: the next ACK carries
+    // the newest ranges when something new arrives, never the old frame.
+    f.server.onPacketsLost(.app, &.{.{
+        .packet_number = number,
+        .time_sent = 0,
+        .ack_eliciting = false,
+        .in_flight = false,
+        .sent_bytes = 0,
+    }});
+    try testing.expect(!f.server.ackOwed(.app));
+    var owed: [4]frame.Frame = undefined;
+    try testing.expectEqual(@as(usize, 0), f.server.flowControlOwed(&owed).len);
+    try testing.expectEqual(@as(?u32, null), try f.server.writeConfirmation(&f.datagram, 0));
+}
+
+test "RFC 9000 §13.3, a lost MAX_DATA and MAX_STREAM_DATA go again with the current limits" {
+    var f: ResendFixture = .{};
+    f.init(16);
+    var plaintext: [1400]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var stream_events: [4]StreamEvent = undefined;
+    var owed: [4]frame.Frame = undefined;
+    var control_bytes: [64]u8 = undefined;
+
+    // The peer sends 40 of the 64 bytes and the application reads them, which
+    // leaves under half of either window and makes both raises due (§4.2).
+    const entry = try f.client.openStream(0);
+    try entry.send.write(&@as([40]u8, @splat('m')));
+    const data = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    _ = try f.server.feed(f.datagram[0..data.length], &plaintext, &frames, &stream_events, &f.report, 0);
+    var read: [64]u8 = undefined;
+    _ = try f.server.stream(0).?.recv.readInto(&read);
+
+    const first = f.server.app.?.next_packet_number;
+    _ = (try f.server.writeFlowControl(&owed, &control_bytes, &f.datagram, 0)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 104), f.server.receive_window.limit);
+    try testing.expectEqual(@as(usize, 0), f.server.flowControlOwed(&owed).len);
+
+    // §13.3: "An updated value is sent in a MAX_DATA frame if the packet
+    // containing the most recently sent MAX_DATA frame is declared lost". The
+    // limit already rose, so the value is the current one, not a new raise.
+    try loseOldest(&f.server, &f.client, &f.report);
+    try testing.expectEqual(first, f.report.lostPackets()[0].packet_number);
+    const due = f.server.flowControlOwed(&owed);
+    try testing.expectEqual(@as(usize, 2), due.len);
+    try testing.expectEqual(@as(u64, 104), due[0].max_data);
+    try testing.expectEqual(@as(u64, 0), due[1].max_stream_data.stream_id);
+    try testing.expectEqual(@as(u64, 104), due[1].max_stream_data.maximum);
+
+    const second = (try f.server.writeFlowControl(&owed, &control_bytes, &f.datagram, 0)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 0), f.server.flowControlOwed(&owed).len);
+    _ = try f.client.feed(f.datagram[0..second], &plaintext, &frames, &stream_events, &f.report, 0);
+    try testing.expectEqual(@as(u64, 104), f.client.send_window.limit);
+
+    // A report of the older copy changes nothing: a newer one is in flight.
+    f.server.onPacketsLost(.app, &.{.{
+        .packet_number = first,
+        .time_sent = 0,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .sent_bytes = 0,
+    }});
+    try testing.expectEqual(@as(usize, 0), f.server.flowControlOwed(&owed).len);
+}
+
+test "RFC 9000 §13.3, a lost MAX_STREAMS goes again with the count advertised" {
+    var f: ResendFixture = .{};
+    f.init(16);
+    var plaintext: [1400]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var stream_events: [4]StreamEvent = undefined;
+    var owed: [4]frame.Frame = undefined;
+    var control_bytes: [64]u8 = undefined;
+
+    // The peer opens stream 0 and finishes it, the application reads it, and
+    // the slot comes free: one more bidirectional stream is owed (§4.6).
+    const entry = try f.client.openStream(0);
+    try entry.send.write("x");
+    try entry.send.finish();
+    const data = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    _ = try f.server.feed(f.datagram[0..data.length], &plaintext, &frames, &stream_events, &f.report, 0);
+    var read: [4]u8 = undefined;
+    _ = try f.server.stream(0).?.recv.readInto(&read);
+    _ = try f.server.stream(0).?.recv.readInto(&read);
+    try f.server.closeStream(0);
+
+    _ = (try f.server.writeFlowControl(&owed, &control_bytes, &f.datagram, 0)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 2), f.server.streams_advertised.bidi);
+
+    try loseOldest(&f.server, &f.client, &f.report);
+    const due = f.server.flowControlOwed(&owed);
+    try testing.expectEqual(@as(usize, 1), due.len);
+    try testing.expectEqual(frame.MaxStreams{ .direction = .bidi, .maximum = 2 }, due[0].max_streams);
+}
+
+test "a sent STREAM record is one fixed size per packet" {
+    // Four descriptors of 24 bytes and a packet number: the caller's cost per
+    // slot of `sent_app`, stated so a change to it is a decision.
+    try testing.expect(@sizeOf(Written) <= 24);
+    try testing.expect(@sizeOf(SentStreams) <= 112);
+}
+
+test "RFC 9000 §13.3, a lost HANDSHAKE_DONE is sent once more, not twice" {
+    const dcid = [_]u8{0xe5};
+    // The server reads the client's acknowledgment, so its driver has to hand
+    // over parameters that agree with the connection (§7.3).
+    var stub: seam.Stub = .{
+        .confirmed = true,
+        .peer_parameters = identityParameters(.client, &dcid, &.{0xe6}),
+    };
+    var acked: [16]Recovery.SentPacket = undefined;
+    var lost: [16]Recovery.SentPacket = undefined;
+    var report: Recovery.Events = .init(&acked, &lost);
+    var client_loss: LossTables = .{};
+    var client: Conn = .init(.{
+        .role = .client,
+        .loss = client_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &dcid,
+        .source_connection_id = &.{0xe6},
+    });
+    var server_loss: LossTables = .{};
+    var server: Conn = .init(.{
+        .role = .server,
+        .loss = server_loss.value(),
+        .original_destination_connection_id = &dcid,
+        .destination_connection_id = &.{0xe6},
+        .source_connection_id = &dcid,
+        .tls = stub.driver(),
+        .transport_parameters = identityParameters(.server, &dcid, &dcid),
+    });
+    installApp(&client, &server, @splat(0xe7), @splat(0xe8));
+
+    var datagram: [512]u8 = undefined;
+    _ = (try server.writeConfirmation(&datagram, 0)) orelse return error.TestUnexpectedResult;
+    try loseOldest(&server, &client, &report);
+    try testing.expectEqual(@as(u64, 0), report.lostPackets()[0].packet_number);
+    try testing.expect(!client.handshakeConfirmed());
+
+    // §13.3: "The HANDSHAKE_DONE frame MUST be retransmitted until it is
+    // acknowledged." Once for the one loss, and then it is in flight again.
+    const again = (try server.writeConfirmation(&datagram, 0)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(?u32, null), try server.writeConfirmation(&datagram, 0));
+
+    var plaintext: [1400]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var stream_events: [4]StreamEvent = undefined;
+    _ = try client.feed(datagram[0..again], &plaintext, &frames, &stream_events, &report, 0);
+    try testing.expect(client.handshakeConfirmed());
 }

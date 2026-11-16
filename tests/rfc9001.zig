@@ -216,6 +216,7 @@ test "RFC 9001 A.2, the machine reproduces the client Initial byte for byte" {
     var sent_initial: [4]quic.Recovery.SentPacket = undefined;
     var sent_handshake: [4]quic.Recovery.SentPacket = undefined;
     var sent_app: [4]quic.Recovery.SentPacket = undefined;
+    var sent_streams: [4]quic.Conn.SentStreams = undefined;
     var conn: quic.Conn = .init(.{
         .loss = .{
             .shared = &loss,
@@ -223,6 +224,7 @@ test "RFC 9001 A.2, the machine reproduces the client Initial byte for byte" {
             .sent_initial = &sent_initial,
             .sent_handshake = &sent_handshake,
             .sent_app = &sent_app,
+            .sent_streams = &sent_streams,
         },
         .role = .client,
         .original_destination_connection_id = &data.dcid,

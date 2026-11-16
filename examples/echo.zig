@@ -37,6 +37,9 @@ const Endpoint = struct {
     sent_initial: [tables_max]Recovery.SentPacket = undefined,
     sent_handshake: [tables_max]Recovery.SentPacket = undefined,
     sent_app: [tables_max]Recovery.SentPacket = undefined,
+    /// The STREAM ranges each 1-RTT packet carried, one per `sent_app` slot, so
+    /// a lost one is sent again from the stream's own buffer.
+    sent_streams: [tables_max]Conn.SentStreams = undefined,
     acked: [tables_max]Recovery.SentPacket = undefined,
     lost: [tables_max]Recovery.SentPacket = undefined,
     events: Recovery.Events = undefined,
@@ -70,6 +73,7 @@ const Endpoint = struct {
             .sent_initial = &self.sent_initial,
             .sent_handshake = &self.sent_handshake,
             .sent_app = &self.sent_app,
+            .sent_streams = &self.sent_streams,
         };
     }
 

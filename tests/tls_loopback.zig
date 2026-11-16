@@ -260,6 +260,7 @@ const Loss = struct {
     sent_initial: [16]quic.Recovery.SentPacket = undefined,
     sent_handshake: [16]quic.Recovery.SentPacket = undefined,
     sent_app: [16]quic.Recovery.SentPacket = undefined,
+    sent_streams: [16]Conn.SentStreams = undefined,
 
     fn value(self: *Loss) Conn.Loss {
         return .{
@@ -268,6 +269,7 @@ const Loss = struct {
             .sent_initial = &self.sent_initial,
             .sent_handshake = &self.sent_handshake,
             .sent_app = &self.sent_app,
+            .sent_streams = &self.sent_streams,
         };
     }
 };
