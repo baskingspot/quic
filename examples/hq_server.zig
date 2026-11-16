@@ -19,19 +19,17 @@ const assert = std.debug.assert;
 const mem = std.mem;
 
 const quic_io = @import("quic-io");
-const tls = @import("tls");
 
 const hq = @import("hq.zig");
 
-/// Static, because the machine and the driver point into them for the life of
-/// the process.
+/// Static, because the machine and the driver point into it for the life of the
+/// process.
 var endpoint: hq.Endpoint = undefined;
-var handshake: hq.Tls = undefined;
-var cert_pem: [4096]u8 = undefined;
-var key_pem: [1024]u8 = undefined;
-var cert_der: [4096]u8 = undefined;
-var chain_slots: [1][]const u8 = undefined;
 var request: [256]u8 = undefined;
+
+/// A file larger than this is not a certificate or a key: reading stops with
+/// `error.StreamTooLong`, not with a cut-off chain.
+const max_pem = 64 * 1024;
 
 const usage = "usage: hq_server <cert.pem> <key.pem> <port>\n";
 
@@ -48,25 +46,21 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const io = init.io;
 
-    const cert = try Io.Dir.cwd().readFile(io, args[1], &cert_pem);
-    const key_bytes = try Io.Dir.cwd().readFile(io, args[2], &key_pem);
-    // A file that fills its buffer may have been cut off, and a cut chain fails
-    // later with a message about the chain, not the buffer.
-    assert(cert.len < cert_pem.len);
-    assert(key_bytes.len < key_pem.len);
-    const chain: tls.certificate_chain.CertificateChain = try .fromPem(cert, &cert_der, &chain_slots);
-    var key: tls.signature.PrivateKey = try .fromPemAuto(key_bytes);
-    defer key.deinit();
+    const certificate = try Io.Dir.cwd().readFileAlloc(io, args[1], arena, .limited(max_pem));
+    const key = try Io.Dir.cwd().readFileAlloc(io, args[2], arena, .limited(max_pem));
 
     const address: Io.net.IpAddress = try .parseIp4("127.0.0.1", port);
     const socket = try address.bind(io, .{ .mode = .dgram });
-    const driver = try handshake.start(io, .{ .server = .{
-        .credentials = .{ .chain = chain, .signer = key.signer() },
-        .alpn = &.{hq.alpn},
-    } });
-    defer handshake.deinit();
-    endpoint.listen(.{ .io = io, .socket = socket, .driver = driver, .parameters = hq.parameters });
+    // The endpoint owns the socket from `listen` on, failed or not.
     defer endpoint.deinit(io);
+    try endpoint.listen(.{
+        .io = io,
+        .socket = socket,
+        .certificate = certificate,
+        .key = key,
+        .alpn = &.{hq.alpn},
+        .parameters = hq.parameters,
+    });
 
     serve(io) catch |err| switch (err) {
         error.IdleTimeout => {

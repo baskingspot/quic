@@ -2,8 +2,8 @@
 //! one response.
 //!
 //! Usage: `hq_client <port> <path>`. It connects to 127.0.0.1:<port>, trusts the
-//! server's self-signed certificate (`insecure_no_chain_anchor`: this is a
-//! loopback demonstration, not a policy to copy), sends `GET <path>\r\n` on a
+//! server's self-signed certificate (`.trust = .insecure`: this is a loopback
+//! demonstration, not a policy to copy), sends `GET <path>\r\n` on a
 //! new bidirectional stream with a FIN, copies the response to stdout until the
 //! server's FIN, closes with NO_ERROR, and exits.
 //!
@@ -16,16 +16,13 @@ const std = @import("std");
 const Io = std.Io;
 const print = std.debug.print;
 
-const quic = @import("quic");
 const quic_io = @import("quic-io");
-const tls = @import("tls");
 
 const hq = @import("hq.zig");
 
-/// Static, because the machine and the driver point into them for the life of
-/// the process.
+/// Static, because the machine and the driver point into it for the life of the
+/// process.
 var endpoint: hq.Endpoint = undefined;
-var handshake: hq.Tls = undefined;
 var request: [256]u8 = undefined;
 var response: [1024]u8 = undefined;
 
@@ -46,12 +43,7 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const server: Io.net.IpAddress = try .parseIp4("127.0.0.1", port);
 
-    var policy: tls.certificate.Policy = .init;
-    policy.insecure_no_chain_anchor = true;
-    const driver = try handshake.start(io, .{ .client = .{ .policy = policy, .alpn = &.{hq.alpn} } });
-    defer handshake.deinit();
-
-    fetch(io, server, driver, path) catch |err| switch (err) {
+    fetch(io, server, path) catch |err| switch (err) {
         error.IdleTimeout => {
             print("hq_client: TIMEOUT\n", .{});
             return 1;
@@ -61,7 +53,7 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
-fn fetch(io: Io, server: Io.net.IpAddress, driver: quic.handshake.Driver, path: []const u8) !void {
+fn fetch(io: Io, server: Io.net.IpAddress, path: []const u8) !void {
     // Port 0 asks for any free one: the server learns where to answer from the
     // first datagram.
     const local: Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
@@ -72,7 +64,8 @@ fn fetch(io: Io, server: Io.net.IpAddress, driver: quic.handshake.Driver, path: 
         .io = io,
         .socket = socket,
         .peer = server,
-        .driver = driver,
+        .alpn = &.{hq.alpn},
+        .trust = .insecure,
         .parameters = hq.parameters,
     });
 

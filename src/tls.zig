@@ -33,7 +33,8 @@
 //!
 //! Sans-I/O like the rest of the package: the caller owns every buffer, there
 //! is no allocator, and the only entropy is the platform CSPRNG for the two
-//! messages' random fields and the ephemeral keypairs.
+//! messages' random fields and the ephemeral keypairs. `Storage(limits)` owns
+//! those buffers, sized from four numbers (`Limits`), and the engine with them.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -71,10 +72,10 @@ pub const Config = union(Role) {
         alpn: []const []const u8 = &.{},
         /// Answers a CertificateRequest. Null means this client never
         /// authenticates, and a server that asks ends the handshake.
-        credentials: ?core.Credentials = null,
+        credentials: ?Credentials = null,
     },
     server: struct {
-        credentials: core.Credentials,
+        credentials: Credentials,
         alpn: []const []const u8 = &.{},
         /// Asks the client for a certificate under this policy. Null means the
         /// server never asks.
@@ -82,10 +83,11 @@ pub const Config = union(Role) {
     },
 };
 
-/// Every buffer the driver writes into, owned by the caller. Sizes are the
-/// caller's to pick; a buffer too small for the job is `error.NoSpace` at the
-/// moment of use, never a truncation.
-pub const Storage = struct {
+/// Every buffer the driver writes into, as slices. `Storage(limits)` owns them
+/// and works the sizes out; this is what `Tls.init` takes for a caller that
+/// sizes each one itself. A buffer too small for the job is `error.NoSpace` at
+/// the moment of use, never a truncation.
+pub const Buffers = struct {
     /// The core's queue of handshake outputs: one per message and per level
     /// transition, so it needs room for the largest flight plus the
     /// transitions (four messages and three transitions at a time).
@@ -123,12 +125,239 @@ pub const Inbound = struct {
 
 pub const Error = seam.Error || core.Error;
 
+pub const Credentials = core.Credentials;
+
+/// Why `Storage.credentials` refused a certificate or key.
+pub const LoadError = error{
+    /// The chain is longer than `Limits.chain`, or has more than
+    /// `max_certificates` certificates.
+    NoSpace,
+    /// No certificate in the PEM, or one that does not decode.
+    InvalidCertificate,
+    /// The PEM holds no private key this backend can sign with.
+    InvalidKey,
+};
+
+/// How a client decides whether to believe the server's certificate. There is
+/// no default, so no caller compiles a client that verifies nothing by
+/// omission.
+pub const Trust = union(enum) {
+    /// Accept a chain that leads to no trust anchor. The server must still
+    /// prove it holds the leaf's key, so this authenticates nothing about who
+    /// it is: for self-signed demo and test certificates only.
+    insecure,
+    /// Verify the chain under this policy: anchors, host name, and time.
+    verify: tls.certificate.Policy,
+
+    pub fn policy(self: Trust) tls.certificate.Policy {
+        return switch (self) {
+            .insecure => policy: {
+                var insecure: tls.certificate.Policy = .init;
+                insecure.insecure_no_chain_anchor = true;
+                break :policy insecure;
+            },
+            .verify => |verify| verify,
+        };
+    }
+};
+
+/// The four numbers a caller chooses. Every buffer the driver needs follows
+/// from them (`Storage`). Each is a bound on something the peer, or the
+/// caller's own certificate, decides, so each is checked where it is used: a
+/// handshake that exceeds one fails with `error.NoSpace`, never a truncation.
+pub const Limits = struct {
+    /// The longest certificate chain, in DER bytes summed over its
+    /// certificates: this endpoint's own as a server (and as a client that
+    /// authenticates), and the longest it will take from a peer. The PEM
+    /// file's length is a safe over-estimate. The framing TLS adds, up to
+    /// `max_certificates` certificates of it, is allowed for on top.
+    chain: u32 = 4096,
+    /// The longest ALPN protocol name, in bytes, offered or selected.
+    alpn: u8 = 32,
+    /// The longest transport parameters, in bytes, this endpoint sends or
+    /// accepts from the peer. They ride inside the hellos, so this also sizes
+    /// the largest hello.
+    parameters: u32 = 512,
+    /// The longest message the peer may send after the handshake, in bytes: a
+    /// client's NewSessionTicket is the one that is not small.
+    post_handshake: u32 = 512,
+};
+
+/// The core's queue of outputs: a server's flight is four messages and three
+/// level transitions, and the queue is drained between flights. The core
+/// offers no bound of its own to derive this from, so it is twice what the
+/// longest flight queues.
+const output_slots = 16;
+
+/// Certificates in a chain whose framing `Limits.chain` allows for. A chain of
+/// more is `error.NoSpace` when loaded.
+const max_certificates = 8;
+
+/// Signature schemes a CertificateRequest may list; the core builds it from
+/// the crypto backend's list, which is smaller. Pinned by a test against the
+/// core's own `flightBufferLen`.
+const max_signature_schemes = 16;
+
+/// The largest key share in a ClientHello: an RFC 10024 hybrid, which is what
+/// tls's `hybrid_kex.max_client_share_len` bounds (it does not export it).
+const hybrid_share_len = 1665;
+
+/// What a ClientHello carries beside the key share and the transport
+/// parameters: the classical shares (194 bytes), a server name (up to 253),
+/// the supported groups and signature schemes, and the ALPN list.
+const hello_slack = 1024;
+
+/// §4.1.3 of RFC 8446's ServerHello, at its longest: the 76 bytes of header,
+/// session id echo (32), and extension lengths, the supported_versions
+/// extension (6), and a key_share with a P-384 public key (97, the largest
+/// classical share) in 105.
+const server_hello_len = 76 + 6 + 105;
+
+/// The largest ClientHello either side handles, which the server holds whole
+/// until it answers.
+fn helloLen(comptime limits: Limits) usize {
+    return hybrid_share_len + hello_slack + limits.parameters;
+}
+
+/// The largest flight of handshake messages at one level, mirroring the
+/// bound `core.Server.flightBufferLen` demands of a server's buffer: the
+/// EncryptedExtensions, a CertificateRequest, the Certificate, a
+/// CertificateVerify sized for an RSA-4096 signature, and the Finished.
+fn flightLen(comptime limits: Limits) usize {
+    const encrypted_extensions = 4 + 2 + 4 + 2 + 1 + limits.alpn;
+    const certificate_request = 4 + 1 + 2 + 2 + 2 + 2 + 2 * max_signature_schemes;
+    const certificate = 4 + 1 + 3 + (3 + 2) * max_certificates + limits.chain;
+    const certificate_verify = 4 + 2 + 1 + 2 + 512;
+    const finished = 36;
+    return encrypted_extensions + certificate_request + certificate + certificate_verify + finished;
+}
+
+/// A TLS driver and every buffer it writes into, computed from `limits` and
+/// owned in place. A caller writes
+///
+///     var storage: Storage(.{}) = undefined;
+///     storage.init();
+///     defer storage.deinit();
+///     const handshake = try storage.start(config, random);
+///
+/// and hands `handshake` to a machine. Built in place and never moved: the
+/// engine, and the machine holding its driver, point into this struct.
+///
+/// A caller reads `engine` (the handshake's outcome: `selectedAlpn`,
+/// `peerTransportParameters`, `done`). Every other field is the engine's
+/// backing, or what the loaded credentials point into, and is not the
+/// caller's.
+pub fn Storage(comptime limits: Limits) type {
+    comptime {
+        assert(limits.chain > 0);
+        assert(limits.alpn > 0);
+        assert(limits.parameters > 0);
+        // A handshake message has a four-byte header.
+        assert(limits.post_handshake >= 4);
+    }
+    // A server composes its whole flight in `out`; a client composes its
+    // ClientHello there.
+    const out_len = @max(flightLen(limits), helloLen(limits));
+
+    return struct {
+        const Self = @This();
+
+        engine: Tls,
+        slots: [output_slots]tls.level.Output,
+        out: [out_len]u8,
+        peer_initial: [helloLen(limits)]u8,
+        peer_handshake: [flightLen(limits)]u8,
+        peer_app: [limits.post_handshake]u8,
+        peer_shares: [core.peer_share_storage_len]u8,
+        extension_slots: [1]tls.extension_type.ExtraExtension,
+        our_parameters: [limits.parameters]u8,
+        peer_parameters: [limits.parameters]u8,
+        selected_alpn: [limits.alpn]u8,
+        server_hello: [server_hello_len]u8,
+        chain_der: [limits.chain]u8,
+        chain_slots: [max_certificates][]const u8,
+        /// Loaded by `credentials`, freed by `deinit`.
+        key: ?tls.signature.PrivateKey,
+        running: bool,
+
+        /// Put the storage in its empty state: no key loaded, no engine
+        /// running. `deinit` is safe from here on.
+        pub fn init(self: *Self) void {
+            self.key = null;
+            self.running = false;
+        }
+
+        /// Decode a PEM certificate chain and private key into this storage,
+        /// for a `Config.server`. The PEM bytes are not kept; the key is, until
+        /// `deinit`.
+        pub fn credentials(self: *Self, certificate_pem: []const u8, key_pem: []const u8) LoadError!Credentials {
+            assert(self.key == null);
+            const chain = tls.certificate_chain.CertificateChain.fromPem(
+                certificate_pem,
+                &self.chain_der,
+                &self.chain_slots,
+            ) catch |err| return switch (err) {
+                error.CertificateBufferTooShort, error.CertificateChainTooLong => error.NoSpace,
+                error.NoCertificate,
+                error.MissingCertificateEnd,
+                error.InvalidCertificateEncoding,
+                => error.InvalidCertificate,
+            };
+            self.key = tls.signature.PrivateKey.fromPemAuto(key_pem) catch return error.InvalidKey;
+            return .{ .chain = chain, .signer = self.key.?.signer() };
+        }
+
+        /// Build the engine and return its driver. `config` is borrowed for the
+        /// driver's lifetime: its ALPN names, server name, and credentials must
+        /// outlive it. A protocol name longer than `Limits.alpn`, or a server's
+        /// flight that does not fit, is `error.NoSpace` here, before any
+        /// handshake byte moves. `random` is the platform's entropy, never a
+        /// constant: it is the Hello random, and a repeat is forbidden (RFC 8446
+        /// §4.1.2).
+        pub fn start(self: *Self, config: Config, random: [32]u8) Error!seam.Driver {
+            assert(!self.running);
+            const names = switch (config) {
+                inline else => |role| role.alpn,
+            };
+            for (names) |name| {
+                if (name.len > limits.alpn) return error.NoSpace;
+            }
+            self.engine = try .init(.{
+                .slots = &self.slots,
+                .out = &self.out,
+                .peer_bytes = .{
+                    .initial = &self.peer_initial,
+                    .handshake = &self.peer_handshake,
+                    .app = &self.peer_app,
+                },
+                .peer_shares = &self.peer_shares,
+                .extension_slots = &self.extension_slots,
+                .our_parameters = &self.our_parameters,
+                .peer_parameters = &self.peer_parameters,
+                .alpn = &self.selected_alpn,
+                .server_hello = &self.server_hello,
+            }, config, random);
+            self.running = true;
+            return self.engine.driver();
+        }
+
+        /// Zero the secrets and free the key. Safe after `init`, whether or not
+        /// `start` or `credentials` ran.
+        pub fn deinit(self: *Self) void {
+            if (self.running) self.engine.deinit();
+            if (self.key) |*key| key.deinit();
+            self.key = null;
+            self.running = false;
+        }
+    };
+}
+
 pub const Tls = struct {
     role: Role,
     engine: Engine,
     keypairs: tls.KeyPairs,
     /// The server's certificates and signer. Null for a client.
-    credentials: ?core.Credentials,
+    credentials: ?Credentials,
     in: [3]Stream,
     out: []u8,
     our_parameters: []u8,
@@ -207,7 +436,7 @@ pub const Tls = struct {
         .{ .extension_type = transport_parameters_type, .data = &.{} },
     };
 
-    pub fn init(storage: Storage, config: Config, random: [32]u8) Error!Tls {
+    pub fn init(storage: Buffers, config: Config, random: [32]u8) Error!Tls {
         var self: Tls = .{
             .role = undefined,
             .engine = undefined,
@@ -603,8 +832,11 @@ pub const Tls = struct {
         else
             crypto_error + internal_error;
         // A caller-owned buffer that is too small is the caller's error, and
-        // the machine names it; everything else is a failed handshake.
-        return if (err == error.NoSpace) error.NoSpace else error.HandshakeFailed;
+        // the machine names it, whether this driver found it (`NoSpace`) or
+        // tls's encoder did (`BufferTooShort`); everything else is a failed
+        // handshake.
+        const too_small = err == error.NoSpace or err == error.BufferTooShort;
+        return if (too_small) error.NoSpace else error.HandshakeFailed;
     }
 };
 
@@ -685,7 +917,7 @@ const test_storage = struct {
     var alpn: [64]u8 = undefined;
     var server_hello: [256]u8 = undefined;
 
-    fn storage() Storage {
+    fn storage() Buffers {
         return .{
             .slots = &slots,
             .out = &out,
@@ -752,4 +984,151 @@ test "RFC 8446 §B.4, the server prefers the suite it can protect with" {
     // Only a suite this package cannot protect with: refused by name.
     const ccm = [_]u8{ 0x13, 0x04 };
     try testing.expect(preferredSuite(&ccm) == null);
+}
+
+// -- Storage -----------------------------------------------------------------
+//
+// What `Storage(limits)` derives, and what it does at the edge of its limits.
+// The certificate and key are the loopback fixtures, the way
+// tests/tls_loopback.zig gets them.
+
+const fixture = struct {
+    const certificate = @embedFile("tls_server_crt");
+    const key = @embedFile("tls_server_key");
+    /// The fixture's one certificate, DER, which is the smallest `Limits.chain`
+    /// that holds it.
+    const certificate_der = 411;
+};
+
+/// Move handshake bytes between two drivers, flight by flight, until neither
+/// has more to say.
+fn exchange(client: seam.Driver, server: seam.Driver) seam.Error!void {
+    while (try carry(client, server) or try carry(server, client)) {}
+}
+
+/// Everything `from` has queued, fed to `to`. Whether there was any.
+fn carry(from: seam.Driver, to: seam.Driver) seam.Error!bool {
+    var moved = false;
+    while (try from.next()) |message| {
+        try to.feed(message.level, message.bytes);
+        moved = true;
+    }
+    return moved;
+}
+
+test "RFC 9001 §4, a Storage of the smallest limits that hold the fixture completes a handshake" {
+    const smallest: Limits = .{
+        .chain = fixture.certificate_der,
+        .alpn = 2,
+        .parameters = 64,
+        .post_handshake = 4,
+    };
+    const insecure: Trust = .insecure;
+    var client: Storage(smallest) = undefined;
+    var server: Storage(smallest) = undefined;
+    client.init();
+    defer client.deinit();
+    server.init();
+    defer server.deinit();
+
+    const credentials = try server.credentials(fixture.certificate, fixture.key);
+    const server_driver = try server.start(.{ .server = .{
+        .credentials = credentials,
+        .alpn = &.{"h3"},
+    } }, @splat(0x22));
+    // A server name at the longest §3 of RFC 6066 allows, and parameters at
+    // the limit: the ClientHello is as large as these limits let it be.
+    const name: [tls.client_hello.max_server_name_len]u8 = @splat('a');
+    const client_driver = try client.start(.{ .client = .{
+        .policy = insecure.policy(),
+        .server_name = &name,
+        .alpn = &.{"h3"},
+    } }, @splat(0x11));
+
+    const client_parameters: [smallest.parameters]u8 = @splat(0xc1);
+    const server_parameters: [smallest.parameters]u8 = @splat(0x5e);
+    try client_driver.setTransportParameters(&client_parameters);
+    try server_driver.setTransportParameters(&server_parameters);
+    try exchange(client_driver, server_driver);
+
+    try testing.expect(client.engine.done());
+    try testing.expect(server.engine.done());
+    try testing.expectEqualStrings("h3", client.engine.selectedAlpn().?);
+    try testing.expectEqualStrings("h3", server.engine.selectedAlpn().?);
+    try testing.expectEqualSlices(u8, &client_parameters, server.engine.peerTransportParameters().?);
+    try testing.expectEqualSlices(u8, &server_parameters, client.engine.peerTransportParameters().?);
+    try testing.expect(try client_driver.secrets(.app) != null);
+    try testing.expect(try server_driver.secrets(.app) != null);
+}
+
+test "RFC 8446 §4, a handshake past its Storage limits fails with NoSpace, never a truncation" {
+    const limits: Limits = .{ .chain = fixture.certificate_der, .alpn = 2, .parameters = 64 };
+
+    // A chain one byte longer than the limit.
+    var short_chain: Storage(.{ .chain = fixture.certificate_der - 1 }) = undefined;
+    short_chain.init();
+    defer short_chain.deinit();
+    try testing.expectError(
+        error.NoSpace,
+        short_chain.credentials(fixture.certificate, fixture.key),
+    );
+
+    // A protocol name longer than the limit, before any byte moves.
+    var narrow: Storage(limits) = undefined;
+    narrow.init();
+    defer narrow.deinit();
+    try testing.expectError(
+        error.NoSpace,
+        narrow.start(.{ .client = .{ .policy = .init, .alpn = &.{"hq-interop"} } }, @splat(0)),
+    );
+
+    // Our own parameters, one byte over.
+    const client_driver = try narrow.start(.{ .client = .{ .policy = .init, .alpn = &.{"h3"} } }, @splat(0));
+    const over: [limits.parameters + 1]u8 = @splat(0);
+    try testing.expectError(error.NoSpace, client_driver.setTransportParameters(&over));
+
+    // The peer's parameters, one byte over: the client's `parameters` is 64,
+    // and the server's, 128, lets it send 65.
+    var wide: Storage(.{ .chain = fixture.certificate_der, .alpn = 2, .parameters = 128 }) = undefined;
+    wide.init();
+    defer wide.deinit();
+    const credentials = try wide.credentials(fixture.certificate, fixture.key);
+    const server_driver = try wide.start(.{ .server = .{
+        .credentials = credentials,
+        .alpn = &.{"h3"},
+    } }, @splat(0x22));
+    try server_driver.setTransportParameters(&over);
+    try client_driver.setTransportParameters("client");
+    try testing.expectError(error.NoSpace, exchange(client_driver, server_driver));
+    // Nothing of them was kept.
+    try testing.expectEqual(null, narrow.engine.peerTransportParameters());
+}
+
+// RFC 8446 §4.3.2, §4.4: the flight a `Storage` allows for is the flight the
+// core demands a server's buffer hold, at the limits' extremes, so a later tls
+// that grows a message fails here and not in the field.
+test "the flight Storage allows for bounds the core's flightBufferLen" {
+    const limits: Limits = .{ .chain = 1000, .alpn = 7 };
+    var der: [limits.chain]u8 = undefined;
+    var certificates: [max_certificates][]const u8 = undefined;
+    const each = limits.chain / max_certificates;
+    for (&certificates, 0..) |*certificate, index| certificate.* = der[index * each ..][0..each];
+    const credentials: Credentials = .{ .chain = .init(&certificates), .signer = undefined };
+
+    var slots: [output_slots]tls.level.Output = undefined;
+    var server: core.Server = .init(&slots);
+    defer server.deinit();
+    server.requireClientCertificate(.init);
+    const required = server.flightBufferLen(credentials, "1234567");
+    try testing.expect(flightLen(limits) >= required);
+}
+
+// RFC 8446 §4.1.3: a ServerHello that echoes the longest session id and answers
+// with the largest classical key share fits the buffer set aside for it.
+test "server_hello_len holds the longest ServerHello this driver composes" {
+    var out: [server_hello_len]u8 = undefined;
+    const share: tls.server_hello.KeyShare = .{ .secp384r1 = (try tls.p384.KeyPair.generate()).public_key };
+    const session_id: [32]u8 = @splat(0);
+    const hello = try tls.server_hello.encodeWithKeyShare(&out, test_random, &session_id, .aes_128_gcm_sha256, &share);
+    try testing.expectEqual(server_hello_len, hello.len);
 }

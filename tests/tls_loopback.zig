@@ -70,7 +70,7 @@ test "RFC 9001 §4, a client and a server complete a TLS handshake through Conn"
     const credentials: core.Credentials = .{ .chain = chain, .signer = key.signer() };
 
     // -- Two drivers, each with its own storage -----------------------------
-    const client_storage: driver.Storage = .{
+    const client_storage: driver.Buffers = .{
         .slots = &client_slots,
         .out = &client_out,
         .peer_bytes = .{
@@ -95,7 +95,7 @@ test "RFC 9001 §4, a client and a server complete a TLS handshake through Conn"
     } }, @splat(0x11));
     defer client_driver.deinit();
 
-    const server_storage: driver.Storage = .{
+    const server_storage: driver.Buffers = .{
         .slots = &server_slots,
         .out = &server_out,
         .peer_bytes = .{

@@ -48,18 +48,6 @@ pub fn build(b: *std.Build) void {
     const run_vector_tests = b.addRunArtifact(vector_tests);
     test_step.dependOn(&run_vector_tests.step);
 
-    // The I/O shell over `std.Io`: a socket, a receive that waits, and a flush
-    // that sends what the machine owes. Separate from `quic` so a caller that
-    // never opens a socket never compiles std.Io.
-    const io_mod = b.addModule("quic-io", .{
-        .root_source_file = b.path("src/io.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "quic", .module = mod }},
-    });
-    const io_tests = b.addTest(.{ .root_module = io_mod });
-    test_step.dependOn(&b.addRunArtifact(io_tests).step);
-
     // The driver itself, and a second module because it imports tls: `quic`
     // never imports crypto, so `quic-tls` is the one module that does. It
     // exists unless `-Dno-tls` asks for the codecs alone.
@@ -78,8 +66,58 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tls", .module = dependency.module("tls") },
             },
         });
-        const driver_tests = b.addTest(.{ .root_module = driver_mod });
+        // The driver's tests need a certificate and key, which are tls's
+        // fixtures and not copies this repository could let go stale.
+        const driver_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "tls", .module = dependency.module("tls") },
+            },
+        });
+        driver_test_mod.addAnonymousImport("tls_server_crt", .{
+            .root_source_file = dependency.path("tests/fixtures/server.crt"),
+        });
+        driver_test_mod.addAnonymousImport("tls_server_key", .{
+            .root_source_file = dependency.path("tests/fixtures/server.key"),
+        });
+        const driver_tests = b.addTest(.{ .root_module = driver_test_mod });
         test_step.dependOn(&b.addRunArtifact(driver_tests).step);
+
+        // The I/O shell over `std.Io`: a socket, a receive that waits, and a
+        // flush that sends what the machine owes, with the handshake built
+        // inside it. Separate from `quic` so a caller that never opens a socket
+        // never compiles std.Io, and the machine stays free of crypto: the
+        // dependencies run tls, then quic and quic-tls, then quic-io.
+        const io_mod = b.addModule("quic-io", .{
+            .root_source_file = b.path("src/io.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "quic-tls", .module = driver_mod },
+            },
+        });
+        // Its tests listen with tls's fixture certificate, as the driver's do.
+        const io_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/io.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "quic-tls", .module = driver_mod },
+            },
+        });
+        io_test_mod.addAnonymousImport("tls_server_crt", .{
+            .root_source_file = dependency.path("tests/fixtures/server.crt"),
+        });
+        io_test_mod.addAnonymousImport("tls_server_key", .{
+            .root_source_file = dependency.path("tests/fixtures/server.key"),
+        });
+        const io_tests = b.addTest(.{ .root_module = io_test_mod });
+        test_step.dependOn(&b.addRunArtifact(io_tests).step);
 
         const seam_mod = b.createModule(.{
             .root_source_file = b.path("tests/tls_seam.zig"),
@@ -129,8 +167,6 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "quic", .module = mod },
                     .{ .name = "quic-io", .module = io_mod },
-                    .{ .name = "quic-tls", .module = driver_mod },
-                    .{ .name = "tls", .module = dependency.module("tls") },
                 },
             });
             const hq_exe = b.addExecutable(.{ .name = name, .root_module = hq_mod });
@@ -147,8 +183,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "quic", .module = mod },
                 .{ .name = "quic-io", .module = io_mod },
-                .{ .name = "quic-tls", .module = driver_mod },
-                .{ .name = "tls", .module = dependency.module("tls") },
             },
         });
         hq_test_mod.addAnonymousImport("tls_server_crt", .{

@@ -332,6 +332,30 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `quic-io` builds the TLS handshake, and a caller no longer sizes or builds a
+  driver. `Endpoint.listen` takes `.certificate` and `.key` (PEM bytes, decoded
+  into the endpoint, so they need not outlive the call) and `.alpn`, and
+  returns an error: `error.InvalidCertificate`, `error.InvalidKey`, or
+  `error.NoSpace`. `Endpoint.connect` takes `.server_name`, `.alpn`, and
+  `.trust`, which is required: `.insecure` accepts a chain with no trust anchor
+  (self-signed demos and tests), `.{ .verify = policy }` checks it. The
+  `.driver` field is gone from both, and with it every program-side buffer: the
+  hq examples lose their 42-line `Tls` wrapper and their `baskingspot/tls`
+  import. The one knob is `SizingLimits.tls`, four numbers (`chain`, `alpn`,
+  `parameters`, `post_handshake`) with defaults. `quic-io` now imports
+  `quic-tls`, so it needs the TLS build and is absent under `-Dno-tls`; `quic`
+  stays free of crypto, and a program that wants its own `quic.handshake.Driver`
+  (a stub, say) builds a `quic.Conn` directly.
+- `quic-tls`: `Storage(limits)` replaces the slice-by-slice `Storage` struct,
+  which is now `Buffers` (`Tls.init(buffers, config, random)` is unchanged).
+  `Storage(.{ .chain, .alpn, .parameters, .post_handshake })` owns the engine
+  and every buffer the engine needs, derived from those four. A caller writes
+  `var storage: driver.Storage(.{}) = undefined; storage.init();`, then
+  `storage.credentials(certificate_pem, key_pem)` for a server, then
+  `storage.start(config, random)` for the `quic.handshake.Driver`, and
+  `storage.deinit()` after. A limit exceeded is `error.NoSpace`, where the
+  engine formerly reported `HandshakeFailed` for a ClientHello that did not fit
+  its buffer. `quic-tls` also exports `Credentials` and `Trust`.
 - `Conn.onFlowControlSent` is gone: `Conn.writeFlowControl` seals the owed
   frames and records the raises itself, because only the machine knows which
   packet number they went out under. `Conn.Loss` requires `sent_streams`.
@@ -345,7 +369,7 @@ All notable changes to quic are recorded here. The format follows
   `quic-tls` driver, the loopback and seam suites, and the hq-interop examples,
   and resolve the `baskingspot/tls` dependency, which needs OpenSSL headers and
   pkg-config to build. `-Dno-tls` opts out and gives the codec-only build: no
-  tls, no `quic-tls`, no C toolchain. The `-Dtls` option is gone. A consumer
+  tls, no `quic-tls`, no `quic-io`, no C toolchain. The `-Dtls` option is gone. A consumer
   who wants no C toolchain must pass `-Dno-tls` to the `quic` dependency. QUIC
   requires TLS 1.3, so a package that cannot connect was a footgun. `just
   test-no-tls` runs the codec-only suites, and CI runs it as one extra job.
@@ -354,12 +378,12 @@ All notable changes to quic are recorded here. The format follows
   `accept(accepting, now, timeout)`, `receive`, `flush`, and `established`.
   Declare one `quic_io.Endpoint(quic_io.Sizing(.{ ... }))` per connection, in
   place (static or file scope: it holds every buffer and must not move). A
-  server calls `listen(.{ .io, .socket, .driver, .parameters })` and then
-  `accept(io)`; a client calls `connect(.{ .io, .socket, .peer, .driver,
-  .parameters })`. Both return a `Connection` once the handshake is done.
-- `quic-io` takes a ready `quic.handshake.Driver` instead of building one: the
-  certificate, key, and ALPN go into the driver (`quic-tls`), so `quic-io` still
-  imports `quic` alone and so builds under `-Dno-tls`. `parameters` is a
+  server calls `listen(.{ .io, .socket, .certificate, .key, .alpn,
+  .parameters })` and then `accept(io)`; a client calls `connect(.{ .io,
+  .socket, .peer, .alpn, .trust, .parameters })`. Both return a `Connection`
+  once the handshake is done.
+- `quic-io` builds the TLS handshake itself (see the entry on `Storage`
+  below). `parameters` is a
   `TransportParameters` value, not bytes. The windows, the stream counts (all
   bidirectional when you set neither), `max_udp_payload_size`, and the
   connection IDs are filled in from the sizing and the handshake.

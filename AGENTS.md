@@ -14,7 +14,10 @@ TLS is built by default: `zig build test` runs the `quic-tls` driver, loopback,
 and handshake seam suites (`tests/tls_seam.zig`) over `baskingspot/tls`, and a
 clean build needs the dev shell's openssl and pkg-config because tls translates
 and links libcrypto. `-Dno-tls` is the codec-only build, with no tls, no
-`quic-tls`, and no C toolchain; `just test-no-tls` runs it, and CI runs it once.
+`quic-tls`, no `quic-io`, and no C toolchain; `just test-no-tls` runs it, and CI
+runs it once. The module graph runs `tls`, then `quic` and `quic-tls`, then
+`quic-io`: `quic` never imports crypto, and `quic-io` builds the handshake from
+a certificate and key.
 
 ## Design
 

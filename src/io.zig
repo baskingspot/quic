@@ -14,9 +14,12 @@
 //! `Endpoint(Sizing(limits))` holds every buffer one connection needs, and is
 //! built in place because the machine inside refuses to move.
 //!
-//! The TLS handshake is not this module's: an endpoint is handed a ready
-//! `quic.handshake.Driver` (the certificate, the key, and ALPN are the
-//! driver's), so a program that speaks no TLS never compiles any.
+//! TLS is part of QUIC, so an endpoint builds its own handshake: a server is
+//! handed a certificate and key (PEM) and its ALPN names, a client the server's
+//! name, its ALPN names, and how far to trust the certificate. The driver and
+//! its buffers (`quic-tls`'s `Storage`) are in the `Sizing`, sized by
+//! `SizingLimits.tls`. The machine in `quic` stays crypto-free; this module is
+//! where it meets TLS.
 //!
 //! What it does not do yet, by name: congestion control (it sends what the
 //! peer's flow control allows), Version Negotiation and Retry (a client drops
@@ -29,6 +32,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
 
+const driver = @import("quic-tls");
 const quic = @import("quic");
 const Conn = quic.Conn;
 const Recovery = quic.Recovery;
@@ -50,10 +54,17 @@ pub const Direction = quic.stream_id.Direction;
 /// `error.FlowControl`, `error.StreamLimit`, ...).
 pub const ConnectionError = Core.Failure;
 
-pub const AcceptError = ConnectionError || Io.ConcurrentError || TransportParameters.Error;
-pub const ConnectError = ConnectionError || Io.ConcurrentError || TransportParameters.Error;
+/// How a client decides whether to believe a server's certificate.
+pub const Trust = driver.Trust;
 
-/// The four numbers a caller chooses. Every other length follows from them.
+/// What `Endpoint.listen` can refuse: a certificate or key that does not load
+/// (`error.InvalidCertificate`, `error.InvalidKey`), and anything that exceeds
+/// `SizingLimits.tls` (`error.NoSpace`).
+pub const ListenError = driver.LoadError || driver.Error;
+pub const AcceptError = ConnectionError || Io.ConcurrentError || TransportParameters.Error;
+pub const ConnectError = ConnectionError || Io.ConcurrentError || TransportParameters.Error || driver.Error;
+
+/// The numbers a caller chooses. Every other length follows from them.
 pub const SizingLimits = struct {
     /// Streams held at once, both directions and both initiators.
     streams: u16 = 4,
@@ -67,6 +78,9 @@ pub const SizingLimits = struct {
     crypto: u32 = 4096,
     /// One datagram, in and out, and the max_udp_payload_size advertised.
     datagram: u16 = 1500,
+    /// What the handshake may carry: certificate chain, ALPN name, transport
+    /// parameters, and post-handshake messages. Four numbers of their own.
+    tls: driver.Limits = .{},
 };
 
 /// The most frames one packet may carry that the machine hands back rather
@@ -143,9 +157,12 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         control: [streams + 3]frame.Frame = undefined,
         offers: [streams]Conn.Offer = undefined,
         written: [streams]Conn.Written = undefined,
+        /// The TLS driver and every buffer it writes into.
+        tls: driver.Storage(limits_given.tls) = undefined,
 
         fn prepare(self: *Self) void {
             self.loss_state = .{};
+            self.tls.init();
             // `Conn.init` asserts no two buffers overlap, so each stream has
             // its own pair.
             for (&self.streams, &self.send_bytes, &self.recv_bytes) |*stream, *send, *recv| {
@@ -217,9 +234,14 @@ pub fn Endpoint(comptime S: type) type {
             io: Io,
             /// A bound UDP socket. The endpoint owns it: `deinit` closes it.
             socket: Io.net.Socket,
-            /// The handshake, built by the caller with its certificate, key,
-            /// and ALPN. One connection's worth.
-            driver: quic.handshake.Driver,
+            /// The certificate chain, leaf first, in PEM. Decoded into the
+            /// sizing, so it need not outlive `listen`.
+            certificate: []const u8,
+            /// The private key for the leaf, in PEM, likewise.
+            key: []const u8,
+            /// The protocols this server speaks, in its order of preference.
+            /// Borrowed: the slice and the names must outlive the endpoint.
+            alpn: []const []const u8 = &.{},
             /// This endpoint's limits. The windows, the stream counts when both
             /// are null, and max_udp_payload_size come from the sizing; the
             /// connection IDs from the handshake. max_idle_timeout also bounds
@@ -233,15 +255,28 @@ pub fn Endpoint(comptime S: type) type {
             /// A bound UDP socket. The endpoint owns it: `deinit` closes it.
             socket: Io.net.Socket,
             peer: IpAddress,
-            driver: quic.handshake.Driver,
+            /// The name sent in server_name_indication, when there is one.
+            /// Borrowed, as `alpn` is.
+            server_name: ?[]const u8 = null,
+            /// The protocols offered, in order; the server picks. Borrowed.
+            alpn: []const []const u8 = &.{},
+            /// There is no default: a client states whether it verifies.
+            trust: Trust,
             /// As in `Listen`.
             parameters: TransportParameters = .{},
         };
 
-        /// Start listening on `config.socket`. Nothing is read until `accept`.
-        pub fn listen(self: *Self, config: Listen) void {
+        /// Start listening on `config.socket`, with the certificate and key
+        /// loaded. Nothing is read until `accept`. The endpoint owns the socket
+        /// from here, so `deinit` follows a failed `listen` too.
+        pub fn listen(self: *Self, config: Listen) ListenError!void {
             const nowhere: IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
-            self.prepare(config.io, config.socket, nowhere, config.driver, config.parameters);
+            self.prepare(config.io, config.socket, nowhere, config.parameters);
+            const credentials = try self.sizing.tls.credentials(config.certificate, config.key);
+            self.driver = try self.startTls(config.io, .{ .server = .{
+                .credentials = credentials,
+                .alpn = config.alpn,
+            } });
         }
 
         /// Wait for a client's first Initial, build the connection from it,
@@ -284,7 +319,12 @@ pub fn Endpoint(comptime S: type) type {
         /// `connect` too.
         pub fn connect(self: *Self, config: Connect) ConnectError!Connection {
             const io = config.io;
-            self.prepare(io, config.socket, config.peer, config.driver, config.parameters);
+            self.prepare(io, config.socket, config.peer, config.parameters);
+            self.driver = try self.startTls(io, .{ .client = .{
+                .policy = config.trust.policy(),
+                .server_name = config.server_name,
+                .alpn = config.alpn,
+            } });
             const sizing = &self.sizing;
             io.random(&sizing.original_id);
             io.random(&sizing.own_id);
@@ -305,6 +345,7 @@ pub fn Endpoint(comptime S: type) type {
         /// close the socket. No CONNECTION_CLOSE: that is `Connection.close`.
         pub fn deinit(self: *Self, io: Io) void {
             self.core.stop(io);
+            self.sizing.tls.deinit();
             self.core.socket.close(io);
             self.* = undefined;
         }
@@ -314,11 +355,9 @@ pub fn Endpoint(comptime S: type) type {
             io: Io,
             socket: Io.net.Socket,
             peer: IpAddress,
-            driver: quic.handshake.Driver,
             parameters: TransportParameters,
         ) void {
             self.sizing.prepare();
-            self.driver = driver;
             self.parameters = S.advertised(parameters);
             // §4.6: credit the table cannot back turns a legal peer into a
             // connection error, which `Conn.init` refuses too.
@@ -334,6 +373,14 @@ pub fn Endpoint(comptime S: type) type {
                 .loss = self.sizing.loss(),
                 .idle_timeout_ms = self.parameters.max_idle_timeout orelse 0,
             });
+        }
+
+        /// Build the handshake in the sizing. The Hello random and the ephemeral
+        /// keys come from the platform, never from a constant.
+        fn startTls(self: *Self, io: Io, config: driver.Config) driver.Error!quic.handshake.Driver {
+            var random: [32]u8 = undefined;
+            io.random(&random);
+            return self.sizing.tls.start(config, random);
         }
 
         /// A server's machine, named by the client's first Initial (§7.2),
@@ -712,6 +759,10 @@ test "SizingLimits, every dependent length follows from five numbers" {
     try testing.expectEqual(@as(?u64, 30), advertised.max_idle_timeout);
 }
 
+/// The loopback fixtures, which tls ships and the build hands this module.
+const test_certificate = @embedFile("tls_server_crt");
+const test_key = @embedFile("tls_server_key");
+
 /// File scope: an endpoint is tens of kilobytes and must not move.
 var test_endpoint: Endpoint(Sizing(.{})) = undefined;
 
@@ -733,8 +784,12 @@ test "RFC 9000 §14.1, accept drops what cannot start a connection, and is cance
     const sender = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
     defer sender.close(io);
 
-    var stub: quic.handshake.Stub = .{};
-    test_endpoint.listen(.{ .io = io, .socket = socket, .driver = stub.driver() });
+    try test_endpoint.listen(.{
+        .io = io,
+        .socket = socket,
+        .certificate = test_certificate,
+        .key = test_key,
+    });
     defer test_endpoint.deinit(io);
 
     var accepting = try io.concurrent(Endpoint(Sizing(.{})).accept, .{ &test_endpoint, io });
@@ -790,8 +845,12 @@ test "RFC 9000 §8.1, a first datagram that does not open leaves the endpoint as
     const sender = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
     defer sender.close(io);
 
-    var stub: quic.handshake.Stub = .{};
-    test_endpoint.listen(.{ .io = io, .socket = socket, .driver = stub.driver() });
+    try test_endpoint.listen(.{
+        .io = io,
+        .socket = socket,
+        .certificate = test_certificate,
+        .key = test_key,
+    });
     defer test_endpoint.deinit(io);
     const nowhere: IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
 
