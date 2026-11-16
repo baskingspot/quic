@@ -2250,6 +2250,28 @@ pub fn closeStream(self: *Conn, id: u64) Error!void {
     }
 }
 
+/// §4.6: let the peer open `count` more streams of `direction`, beyond the
+/// credit `closeStream` returns. The raise is owed as MAX_STREAMS from here,
+/// and a loss of the packet carrying it makes it owed again (§13.3), exactly as
+/// for the credit a closed stream gives back.
+///
+/// The caller's rule, which the machine cannot check: credit the peer holds is
+/// a stream it may open at any moment, and its first frame takes the lowest
+/// free slot in `Config.streams` and writes into that slot's buffers. So grant
+/// only what free slots with buffers already back.
+///
+/// A count past what §19.11 lets MAX_STREAMS carry is
+/// `error.StreamCountTooLarge`, and nothing is granted.
+pub fn allowStreams(self: *Conn, direction: stream_id.Direction, count: u16) Error!void {
+    self.pin();
+    const allowed = switch (direction) {
+        .bidi => &self.streams_allowed.bidi,
+        .uni => &self.streams_allowed.uni,
+    };
+    if (allowed.* + count > max_streams) return error.StreamCountTooLarge;
+    allowed.* += count;
+}
+
 /// Whether both halves of a stream are in a terminal state (§3.1, §3.2): the
 /// send side has nothing left to acknowledge, and the receive side has nothing
 /// left to read.
@@ -8793,6 +8815,35 @@ test "RFC 9000 §13.3, a lost MAX_STREAMS goes again with the count advertised" 
     const due = f.server.flowControlOwed(&owed);
     try testing.expectEqual(@as(usize, 1), due.len);
     try testing.expectEqual(frame.MaxStreams{ .direction = .bidi, .maximum = 2 }, due[0].max_streams);
+}
+
+test "RFC 9000 §4.6 and §13.3, credit the caller grants is owed as MAX_STREAMS, and again when lost" {
+    var f: ResendFixture = .{};
+    f.init(16);
+    var owed: [4]frame.Frame = undefined;
+    var control_bytes: [64]u8 = undefined;
+
+    // Nothing closed, so only the caller's grant is owed, in its direction.
+    try testing.expectEqual(@as(usize, 0), f.server.flowControlOwed(&owed).len);
+    try f.server.allowStreams(.uni, 2);
+    const due = f.server.flowControlOwed(&owed);
+    try testing.expectEqual(@as(usize, 1), due.len);
+    try testing.expectEqual(frame.MaxStreams{ .direction = .uni, .maximum = 2 }, due[0].max_streams);
+
+    _ = (try f.server.writeFlowControl(&owed, &control_bytes, &f.datagram, 0)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u64, 2), f.server.streams_advertised.uni);
+    try testing.expectEqual(@as(usize, 0), f.server.flowControlOwed(&owed).len);
+
+    try loseOldest(&f.server, &f.client, &f.report);
+    const again = f.server.flowControlOwed(&owed);
+    try testing.expectEqual(@as(usize, 1), again.len);
+    try testing.expectEqual(frame.MaxStreams{ .direction = .uni, .maximum = 2 }, again[0].max_streams);
+
+    // §19.11: no count past 2^60, and a refused grant leaves the credit alone.
+    f.server.streams_allowed.bidi = max_streams;
+    try testing.expectError(error.StreamCountTooLarge, f.server.allowStreams(.bidi, 1));
+    try testing.expectEqual(max_streams, f.server.streams_allowed.bidi);
 }
 
 test "a sent STREAM record is one fixed size per packet" {

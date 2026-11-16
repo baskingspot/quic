@@ -7,6 +7,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `Conn.allowStreams(direction, count)`: the caller grants the peer more
+  streams (§4.6) beyond the credit `Conn.closeStream` gives back. The raise is
+  owed as MAX_STREAMS and owed again if the packet carrying it is lost (§13.3).
+  Grant only what free `Config.streams` entries with buffers already back: a
+  peer's first frame on a new stream writes into the lowest free entry's
+  buffers at once, and above 2^60 it is `error.StreamCountTooLarge`.
 - Loss is repaired for more than CRYPTO (RFC 9000 §13.3). When a 1-RTT packet
   is declared lost, its STREAM data goes again from the stream's own send
   buffer at the same offsets (the next `Conn.writeStreams` sends it before new
