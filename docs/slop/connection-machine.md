@@ -961,3 +961,19 @@ Entropy is the caller's, like the clock: Zig 0.17 has no `std.crypto.random`
 outside `std.Io`, so `Tls.init` takes the 32 Hello bytes. tls reads its own
 entropy for keypairs, by its own decision; this package does not gain an OS
 syscall for one field.
+
+## Retransmission moved into the machine
+
+"The line" above gave the resend queue to the caller and kept no packet-to-frame
+mapping in the machine. That is reversed for what the machine writes itself.
+`Conn.Loss.sent_streams` is one fixed 112-byte record per 1-RTT sent slot (a
+packet number and up to four STREAM ranges, no bytes); a loss marks the ranges
+unsent in their `SendStream`, and `writeStreams` sends them first at the same
+offsets. HANDSHAKE_DONE and the MAX_* frames need no record: §13.3 resends them
+when "the packet containing the most recently sent" one is lost, so the machine
+keeps that packet number (`Conn.Latest`) and re-encodes the current value.
+`quic-io`'s queue shrank to the RESET_STREAM and STOP_SENDING it composes. Still
+open: the machine sees only the losses an ACK declares, so a caller must hand a
+loss timer's packets to `Conn.onPacketsLost`; RESET_STREAM and STOP_SENDING are
+still composed and resent by the caller; and `replayCrypto` still resends the
+whole flight, because CRYPTO ranges are not recorded per packet.
