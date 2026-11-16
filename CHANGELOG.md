@@ -338,6 +338,14 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `quic-io`'s application-level CRYPTO buffers follow what that level
+  carries, and `Sizing(.{})` drops from 68,936 to 61,256 bytes.
+  `SizingLimits.crypto` now sizes the Initial and Handshake levels only. The
+  application level receives into `SizingLimits.tls.post_handshake` bytes, so
+  a post-handshake message longer than that ends the connection with
+  `error.NoSpace`, as it already did in the driver; and it sends nothing, so a
+  CRYPTO message queued there (tls's answer to a KeyUpdate, which QUIC
+  forbids) is `error.NoSpace` before any of it is framed.
 - `quic-io` streams are pooled. `Endpoint.listen(allocator, config)` and
   `Endpoint.connect(allocator, config)` take an `std.mem.Allocator`, and
   `error.OutOfMemory` is their one new failure. `Sizing(.{})` drops from

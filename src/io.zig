@@ -83,7 +83,14 @@ pub const SizingLimits = struct {
     stream_ring: u32 = 4096,
     /// Sent packets tracked per packet number space for loss recovery.
     sent_packets: u16 = 32,
-    /// CRYPTO reassembly and replay, per encryption level.
+    /// CRYPTO reassembly and replay at the Initial and Handshake levels, each
+    /// way. The application level is smaller: it receives post-handshake
+    /// messages into `tls.post_handshake` bytes, and a peer's bytes further
+    /// ahead of what arrived in order than that, which includes any one
+    /// message longer, end the connection with `error.NoSpace`. It sends
+    /// nothing, because nothing this package runs sends CRYPTO there (no
+    /// 0-RTT, no tickets, no post-handshake authentication), so a message the
+    /// driver queues there is `error.NoSpace` before any of it is framed.
     crypto: u32 = 4096,
     /// One datagram, in and out, and the max_udp_payload_size advertised.
     datagram: u16 = 1500,
@@ -195,8 +202,14 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         sent_streams: [sent]Conn.SentStreams = undefined,
         acked: [sent]Recovery.SentPacket = undefined,
         lost: [sent]Recovery.SentPacket = undefined,
-        crypto_in: [3][limits_given.crypto]u8 = undefined,
-        crypto_sent: [3][limits_given.crypto]u8 = undefined,
+        /// CRYPTO reassembly at the Initial and Handshake levels.
+        crypto_in: [2][limits_given.crypto]u8 = undefined,
+        /// CRYPTO reassembly at the application level, where only
+        /// post-handshake messages arrive.
+        crypto_in_app: [limits_given.tls.post_handshake]u8 = undefined,
+        /// What this endpoint sent at the Initial and Handshake levels, for
+        /// §13.3. The application level has none (`cryptoSent`).
+        crypto_sent: [2][limits_given.crypto]u8 = undefined,
         connection_ids: [2 * max_connection_id]u8 = undefined,
         adopted_id: [max_connection_id]u8 = undefined,
         original_id: [own_id_len]u8 = undefined,
@@ -232,6 +245,25 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
                 .sent_app = &self.sent[2],
                 .sent_streams = &self.sent_streams,
             };
+        }
+
+        /// `Conn.Config.crypto`: where each level's CRYPTO data is reassembled.
+        fn cryptoReceived(self: *Self) Conn.CryptoStorage {
+            return .{
+                .initial = &self.crypto_in[0],
+                .handshake = &self.crypto_in[1],
+                .app = &self.crypto_in_app,
+            };
+        }
+
+        /// `Conn.Config.crypto_sent`. The application level is left empty on
+        /// purpose: a client's post-handshake messages are received, not sent,
+        /// and 0-RTT and post-handshake authentication are out of scope. A
+        /// message the driver queues there anyway, such as the answer the core
+        /// composes to a KeyUpdate, is `error.NoSpace` from
+        /// `Conn.writeHandshake` before any of it is framed.
+        fn cryptoSent(self: *Self) Conn.CryptoStorage {
+            return .{ .initial = &self.crypto_sent[0], .handshake = &self.crypto_sent[1] };
         }
 
         fn coreStorage(self: *Self) Core.Storage {
@@ -555,16 +587,8 @@ pub fn Endpoint(comptime S: type) type {
             const sizing = &self.sizing;
             var config = base;
             config.tls = self.driver;
-            config.crypto = .{
-                .initial = &sizing.crypto_in[0],
-                .handshake = &sizing.crypto_in[1],
-                .app = &sizing.crypto_in[2],
-            };
-            config.crypto_sent = .{
-                .initial = &sizing.crypto_sent[0],
-                .handshake = &sizing.crypto_sent[1],
-                .app = &sizing.crypto_sent[2],
-            };
+            config.crypto = sizing.cryptoReceived();
+            config.crypto_sent = sizing.cryptoSent();
             config.stream_slots = self.table;
             config.streams = self.core.storage.streams;
             config.receive_limit = S.receive_limit;
@@ -897,9 +921,10 @@ test "SizingLimits, every dependent length follows from its numbers" {
         .sent_packets = 5,
         .crypto = 7,
         .datagram = 1300,
+        .tls = .{ .post_handshake = 9 },
         .peer_initial = 2,
     });
-    const sizing: S = undefined;
+    var sizing: S = undefined;
     const slot: S.StreamSlot = undefined;
     try testing.expectEqual(@as(u64, 300), S.receive_limit);
     try testing.expectEqual(3, sizing.stream_events.len);
@@ -909,7 +934,12 @@ test "SizingLimits, every dependent length follows from its numbers" {
     try testing.expectEqual(5, sizing.lost.len);
     try testing.expectEqual(5, sizing.records.len);
     try testing.expectEqual(5, sizing.sent_streams.len);
-    try testing.expectEqual(7, sizing.crypto_sent[1].len);
+    try testing.expectEqual(7, sizing.cryptoReceived().handshake.len);
+    try testing.expectEqual(7, sizing.cryptoSent().handshake.len);
+    // The application level receives one post-handshake message and sends
+    // nothing (`SizingLimits.crypto`).
+    try testing.expectEqual(9, sizing.cryptoReceived().app.len);
+    try testing.expectEqual(0, sizing.cryptoSent().app.len);
     try testing.expectEqual(1300, sizing.datagram_out.len);
     try testing.expectEqual(6, sizing.control.len);
 
@@ -920,6 +950,7 @@ test "SizingLimits, every dependent length follows from its numbers" {
         .sent_packets = 5,
         .crypto = 7,
         .datagram = 1300,
+        .tls = .{ .post_handshake = 9 },
     })));
     try testing.expectEqual(200, @sizeOf(S.StreamSlot));
 
@@ -1052,6 +1083,155 @@ test "RFC 9000 §8.1, a first datagram that does not open leaves the endpoint as
     try test_endpoint.receiveFirst(io);
     try testing.expectEqual(Core.Phase.handshaking, test_endpoint.core.phase);
     try testing.expect(test_endpoint.core.peer.eql(&sender.address));
+}
+
+// -- The application level's CRYPTO buffers ----------------------------------
+//
+// Two machines over two `Sizing`s, wired as `Endpoint.machine` wires one, with
+// the handshake between them carried in memory: no socket and no tasks, so a
+// test can hand the client exactly the CRYPTO frames it means to.
+
+const TestSizing = Sizing(.{});
+var test_client_sizing: TestSizing = undefined;
+var test_server_sizing: TestSizing = undefined;
+var test_client: Conn = undefined;
+var test_server: Conn = undefined;
+
+/// Build both machines and run their handshake to the end. `deinit` both
+/// sizings' `tls` afterwards.
+fn testHandshake() !void {
+    const client = &test_client_sizing;
+    const server = &test_server_sizing;
+    client.prepare();
+    server.prepare();
+    const alpn: []const []const u8 = &.{"hq-interop"};
+    const trust: Trust = .insecure;
+    const credentials = try server.tls.credentials(test_certificate, test_key);
+    const server_tls = try server.tls.start(.{ .server = .{ .credentials = credentials, .alpn = alpn } }, @splat(0x22));
+    const client_tls = try client.tls.start(.{ .client = .{ .policy = trust.policy(), .alpn = alpn } }, @splat(0x11));
+
+    client.original_id = @splat(0xc0);
+    client.own_id = @splat(0xc1);
+    var client_config = Conn.clientConfig(&client.original_id, &client.own_id, client.loss());
+    client_config.connection_id_storage = &client.adopted_id;
+    client_config.tls = client_tls;
+    client_config.crypto = client.cryptoReceived();
+    client_config.crypto_sent = client.cryptoSent();
+    client_config.transport_parameters = try testParameters(client, .{
+        .initial_source_connection_id = &client.own_id,
+    }, .client);
+    test_client = .init(client_config);
+    const first = (try test_client.writeHandshake(&client.scratch, &client.datagram_out, 0)).?;
+
+    server.own_id = @splat(0x5e);
+    const opening = try Conn.Opening.fromDatagram(client.datagram_out[0..first], &server.connection_ids);
+    var server_config = opening.serverConfig(&server.own_id, server.loss());
+    server_config.tls = server_tls;
+    server_config.crypto = server.cryptoReceived();
+    server_config.crypto_sent = server.cryptoSent();
+    server_config.transport_parameters = try testParameters(server, .{
+        .original_destination_connection_id = opening.destination_connection_id,
+        .initial_source_connection_id = &server.own_id,
+    }, .server);
+    test_server = .init(server_config);
+    try testFeed(&test_server, server, client.datagram_out[0..first]);
+
+    var rounds: u32 = 0;
+    while (rounds < 8) : (rounds += 1) {
+        const answered = try testCarry(&test_server, server, &test_client, client);
+        const finished = try testCarry(&test_client, client, &test_server, server);
+        if (!answered and !finished) break;
+    }
+    try testing.expect(client.tls.engine.done());
+    try testing.expect(server.tls.engine.done());
+}
+
+fn testParameters(
+    sizing: *TestSizing,
+    parameters: TransportParameters,
+    role: TransportParameters.Role,
+) TransportParameters.Error![]const u8 {
+    var writer: quic.Writer = .init(&sizing.parameter_bytes);
+    try TransportParameters.encode(&writer, parameters, role);
+    return writer.written();
+}
+
+/// Every handshake datagram `from` owes, fed to `to`. Whether there was one.
+fn testCarry(from: *Conn, from_sizing: *TestSizing, to: *Conn, to_sizing: *TestSizing) !bool {
+    var moved = false;
+    while (try from.writeHandshake(&from_sizing.scratch, &from_sizing.datagram_out, 0)) |length| {
+        try testFeed(to, to_sizing, from_sizing.datagram_out[0..length]);
+        moved = true;
+    }
+    return moved;
+}
+
+fn testFeed(conn: *Conn, sizing: *TestSizing, datagram: []u8) Conn.Error!void {
+    var events: Recovery.Events = .init(&sizing.acked, &sizing.lost);
+    _ = try conn.feed(datagram, &sizing.plaintext, &sizing.frames, &sizing.stream_events, &events, 0);
+}
+
+/// One 1-RTT packet from the server carrying one CRYPTO frame, fed to the
+/// client.
+fn testServerCrypto(offset: u64, data: []const u8) Conn.Error!void {
+    const server = &test_server_sizing;
+    var writer: quic.Writer = .init(&server.scratch);
+    try frame.write(&writer, .{ .crypto = .{ .offset = offset, .data = data } });
+    const length = try test_server.writeFrames(.app, writer.written(), &server.datagram_out, .data(0));
+    try testFeed(&test_client, &test_client_sizing, server.datagram_out[0..length]);
+}
+
+/// A NewSessionTicket (§4.6.1 of RFC 8446) exactly `len` bytes long: no nonce,
+/// no extensions, and the ticket itself the rest.
+fn testTicket(comptime len: u32) [len]u8 {
+    const fixed = 4 + 4 + 4 + 1 + 2 + 2;
+    comptime assert(len > fixed);
+    var message: [len]u8 = @splat(0x7e);
+    message[0] = 4; // new_session_ticket
+    std.mem.writeInt(u24, message[1..4], len - 4, .big);
+    message[4..12].* = @splat(0); // ticket_lifetime, ticket_age_add
+    message[12] = 0; // ticket_nonce, empty
+    std.mem.writeInt(u16, message[13..15], len - fixed, .big);
+    message[len - 2 ..][0..2].* = .{ 0, 0 }; // extensions, empty
+    return message;
+}
+
+test "RFC 8446 §4.6, a post-handshake message of tls.post_handshake bytes arrives, one byte more is NoSpace" {
+    try testHandshake();
+    defer test_client_sizing.tls.deinit();
+    defer test_server_sizing.tls.deinit();
+    const limit = TestSizing.limits.tls.post_handshake;
+    const client_tls = &test_client_sizing.tls.engine.engine.client;
+
+    // Exactly the limit, in one frame: the ring and the driver each hold it.
+    try testServerCrypto(0, &testTicket(limit));
+    try testing.expectEqual(limit - 17, client_tls.lastTicket().?.ticket.len);
+
+    // QUIC forbids KeyUpdate (§6 of RFC 9001), but tls's client answers one at
+    // the application level, which is the one CRYPTO send there it can make.
+    // The buffer for it is empty, and the answer is refused before a byte of
+    // it is framed.
+    const key_update = [_]u8{ 24, 0, 0, 1, 1 };
+    try testServerCrypto(limit, &key_update);
+    const app_sent = test_client.app.?.next_packet_number;
+    try testing.expectError(
+        error.NoSpace,
+        test_client.writeHandshake(&test_client_sizing.scratch, &test_client_sizing.datagram_out, 0),
+    );
+    try testing.expectEqual(app_sent, test_client.app.?.next_packet_number);
+    try testing.expectEqual(0, test_client.replayCrypto(.app).len);
+
+    // One byte over, in one frame: the ring refuses it, and takes none of it.
+    const offset = limit + key_update.len;
+    const over = testTicket(limit + 1);
+    try testing.expectError(error.NoSpace, testServerCrypto(offset, &over));
+    try testing.expectEqual(offset, test_client.crypto[@backingInt(Conn.SpaceId.app)].received());
+
+    // The same message in two frames: each fits the ring, and the driver,
+    // which reassembles whole messages, refuses the second.
+    const half = over.len / 2;
+    try testServerCrypto(offset, over[0..half]);
+    try testing.expectError(error.NoSpace, testServerCrypto(offset + half, over[half..]));
 }
 
 test {
