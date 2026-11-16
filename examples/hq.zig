@@ -21,8 +21,12 @@ pub const alpn = "hq-interop";
 pub const body = "hello from baskingspot/quic\n";
 
 /// One connection's storage, handshake included, with the module's default
-/// limits.
-pub const Endpoint = quic_io.Endpoint(quic_io.Sizing(.{}));
+/// limits and two stream slots preheated: a client's one request and the slot
+/// it keeps for the stream the server may open, and a server's one request and
+/// the slot accepting it grants the client for another. So neither end
+/// allocates once it runs.
+pub const Sizing = quic_io.Sizing(.{ .preheat = 2 });
+pub const Endpoint = quic_io.Endpoint(Sizing);
 
 /// §10.1: five seconds of silence ends the connection, which is also what
 /// bounds a handshake that goes nowhere.
@@ -65,6 +69,8 @@ fn PairOf(comptime E: type, comptime client: *E, comptime server: *E) type {
 
         threaded: Io.Threaded,
         io: Io,
+        /// What the client's streams come from; the server's is `init`'s.
+        client_allocator: std.mem.Allocator,
         server_address: Io.net.IpAddress,
         /// Whether `connect` got far enough that `client` is built, and so
         /// is `deinit`'s to tear down.
@@ -79,14 +85,20 @@ fn PairOf(comptime E: type, comptime client: *E, comptime server: *E) type {
         /// test's server) arrives as this server's first datagram and takes its
         /// one connection (§8.1).
         fn init(self: *Self) !void {
+            return self.initWith(testing.allocator, testing.allocator);
+        }
+
+        /// `init`, with the allocator each endpoint's streams come from.
+        fn initWith(self: *Self, client_allocator: std.mem.Allocator, server_allocator: std.mem.Allocator) !void {
             self.threaded = .init(testing.allocator, .{});
             self.io = self.threaded.io();
+            self.client_allocator = client_allocator;
             self.client_started = false;
             const io = self.io;
             const any: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
             const socket = try any.bind(io, .{ .mode = .dgram });
             self.server_address = socket.address;
-            try server.listen(.{
+            try server.listen(server_allocator, .{
                 .io = io,
                 .socket = socket,
                 .certificate = @embedFile("tls_server_crt"),
@@ -108,7 +120,7 @@ fn PairOf(comptime E: type, comptime client: *E, comptime server: *E) type {
             // From here the endpoint owns the socket, and `connect` failing still
             // leaves it for `deinit`.
             self.client_started = true;
-            return client.connect(.{
+            return client.connect(self.client_allocator, .{
                 .io = self.io,
                 .socket = socket,
                 .peer = peer,
@@ -643,4 +655,269 @@ test "RFC 9002 §6 and RFC 9000 §13.3, the exchange survives two datagrams of e
 
 test "RFC 9002 §6 and RFC 9000 §13.3, the exchange survives every seventh datagram dropped each way" {
     try expectRecovery(&.{ false, false, false, false, false, false, true });
+}
+
+// -- Pooled streams --------------------------------------------------------------
+//
+// A stream's buffers come from its endpoint's pool, which takes them from the
+// allocator `listen` or `connect` was handed. These pin when it does: never
+// once a preheated pool runs, never again for a slot a closed stream gave back,
+// never because of what a peer sends, and never with a failure the connection
+// does not survive.
+
+/// The streams `endpoint`'s machine holds open, read under its mutex.
+fn openStreams(endpoint: *Endpoint, io: Io) usize {
+    endpoint.core.mutex.lockUncancelable(io);
+    defer endpoint.core.mutex.unlock(io);
+    var count: usize = 0;
+    for (endpoint.core.storage.streams) |*entry| count += @intFromBool(entry.isOpen());
+    return count;
+}
+
+/// How many slots `endpoint`'s pool has taken from its allocator.
+fn poolCapacity(endpoint: *Endpoint, io: Io) u32 {
+    endpoint.core.mutex.lockUncancelable(io);
+    defer endpoint.core.mutex.unlock(io);
+    return endpoint.pool_capacity;
+}
+
+/// Wait until neither endpoint holds a stream open. A closed stream's slot
+/// comes free once both halves are over (§3.1, §3.2), which is the peer's
+/// acknowledgment arriving, not the close.
+fn awaitNoStreams(io: Io) !void {
+    for (0..2000) |_| {
+        if (openStreams(&test_client, io) + openStreams(&test_server, io) == 0) return;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    return error.StreamsStillOpen;
+}
+
+/// Read one request off `stream`, answer it with `body` and a FIN, and close.
+fn answer(stream: quic_io.Stream, io: Io) !void {
+    defer stream.close(io);
+    var request: [64]u8 = undefined;
+    try testing.expectEqualStrings("GET /index.html\r\n", try readAll(stream, io, &request));
+    try writeAll(stream, io, body);
+    try stream.shutdown(io, .send);
+}
+
+/// `serveOne` for `count` streams in turn.
+fn serveMany(io: Io, count: usize) !void {
+    const connection = try test_server.accept(io);
+    for (0..count) |_| try answer(try connection.acceptStream(io), io);
+    try testing.expectError(error.ConnectionClosed, connection.acceptStream(io));
+}
+
+/// Accept the next stream on `connection` and answer it.
+fn answerNext(connection: quic_io.Connection, io: Io) !void {
+    try answer(try connection.acceptStream(io), io);
+}
+
+/// One request, its whole response, and both ends' streams freed.
+fn fetchOne(connection: quic_io.Connection, io: Io) !void {
+    const stream = try sendRequest(connection, io);
+    var response: [64]u8 = undefined;
+    try testing.expectEqualStrings(body, try readAll(stream, io, &response));
+    stream.close(io);
+    try awaitNoStreams(io);
+}
+
+/// §4.6: the client has no credit for another stream, so an open waits for
+/// it until canceled.
+fn expectNoCredit(connection: quic_io.Connection, io: Io) !void {
+    var opening = try io.concurrent(quic_io.Connection.openStream, .{ connection, io, .bidi });
+    try io.sleep(.fromMilliseconds(settle_ms), .awake);
+    try testing.expectError(error.Canceled, opening.cancel(io));
+}
+
+/// Each endpoint's own memory, `fixed_buffer_bytes` exactly, for the tests
+/// that hold an endpoint to it. An endpoint's allocator is its alone.
+var client_memory: [Sizing.fixed_buffer_bytes]u8 = undefined;
+var server_memory: [Sizing.fixed_buffer_bytes]u8 = undefined;
+
+test "RFC 9000 §2, endpoints on a FixedBufferAllocator and a preheated pool exchange without allocating" {
+    var client_fixed: std.heap.FixedBufferAllocator = .init(&client_memory);
+    var server_fixed: std.heap.FixedBufferAllocator = .init(&server_memory);
+    // Counting every call, and failing none.
+    var client_counted: testing.FailingAllocator = .init(client_fixed.allocator(), .{});
+    var server_counted: testing.FailingAllocator = .init(server_fixed.allocator(), .{});
+    var pair: Pair = undefined;
+    try pair.initWith(client_counted.allocator(), server_counted.allocator());
+    defer pair.deinit();
+    const io = pair.io;
+    const server_preheated = server_counted.allocated_bytes;
+    const server_calls = server_counted.allocations;
+    try testing.expect(server_calls > 0);
+
+    var serving = try io.concurrent(serveOne, .{io});
+    defer serving.cancel(io) catch {};
+    const connection = try pair.connect();
+    const client_preheated = client_counted.allocated_bytes;
+    const client_calls = client_counted.allocations;
+    try testing.expect(client_calls > 0);
+    try expectExchange(connection, io);
+    try serving.await(io);
+
+    // Not a byte after the preheat: not for the stream the client opened, the
+    // one the server accepted, or the credit accepting it granted (§4.6).
+    try testing.expectEqual(client_calls, client_counted.allocations);
+    try testing.expectEqual(server_calls, server_counted.allocations);
+    try testing.expectEqual(client_preheated, client_counted.allocated_bytes);
+    try testing.expectEqual(server_preheated, server_counted.allocated_bytes);
+    // And the reserve `fixed_buffer_bytes` names is what was used, but for
+    // alignment.
+    try testing.expect(Sizing.fixed_buffer_bytes - client_fixed.end_index < 64);
+    try testing.expect(Sizing.fixed_buffer_bytes - server_fixed.end_index < 64);
+}
+
+test "RFC 9000 §2.1, four streams in turn reuse the pool's slots rather than growing it" {
+    var pair: Pair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    const io = pair.io;
+
+    var serving = try io.concurrent(serveMany, .{ io, 4 });
+    defer serving.cancel(io) catch {};
+    const connection = try pair.connect();
+    for (0..4) |_| try fetchOne(connection, io);
+    connection.close(io);
+    try serving.await(io);
+
+    // Two slots at most in use at once on either end: the live stream, and
+    // the one held for the stream the peer may open next (§4.6). Four
+    // streams, and the pool never held more.
+    try testing.expectEqual(@as(u32, 2), poolCapacity(&test_client, io));
+    try testing.expectEqual(@as(u32, 2), poolCapacity(&test_server, io));
+}
+
+test "RFC 9000 §2.1, a handle to a closed stream is StreamClosed, even once its slot is another stream's" {
+    var pair: Pair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    const io = pair.io;
+
+    var serving = try io.concurrent(serveMany, .{ io, 2 });
+    defer serving.cancel(io) catch {};
+    const connection = try pair.connect();
+    const first = try sendRequest(connection, io);
+    var response: [64]u8 = undefined;
+    try testing.expectEqualStrings(body, try readAll(first, io, &response));
+    first.close(io);
+    try awaitNoStreams(io);
+
+    // The same slot, recycled, under a new generation.
+    const second = try sendRequest(connection, io);
+    try testing.expectEqual(first.index, second.index);
+    try testing.expect(first.generation != second.generation);
+    var vector = [_][]u8{&response};
+    try testing.expectError(error.StreamClosed, first.read(io, &vector));
+    try testing.expectError(error.StreamClosed, first.write(io, "x"));
+    try testing.expectError(error.StreamClosed, first.shutdown(io, .both));
+    // A no-op, which leaves the stream now in the slot alone.
+    first.close(io);
+    try testing.expectEqualStrings(body, try readAll(second, io, &response));
+    second.close(io);
+    connection.close(io);
+    try serving.await(io);
+}
+
+test "RFC 9000 §4.6, an open the pool cannot back is OutOfMemory, and the connection goes on" {
+    var client_fixed: std.heap.FixedBufferAllocator = .init(&client_memory);
+    var pair: Pair = undefined;
+    try pair.initWith(client_fixed.allocator(), testing.allocator);
+    defer pair.deinit();
+    const io = pair.io;
+
+    var serving = try io.concurrent(serveMany, .{ io, 2 });
+    defer serving.cancel(io) catch {};
+    const connection = try pair.connect();
+    // Two slots preheated: one held for the stream the server may open, one
+    // for this stream. The memory has room for no third.
+    const first = try sendRequest(connection, io);
+    try testing.expectError(error.OutOfMemory, connection.openStream(io, .bidi));
+
+    var response: [64]u8 = undefined;
+    try testing.expectEqualStrings(body, try readAll(first, io, &response));
+    first.close(io);
+    try awaitNoStreams(io);
+    // The slot it gave back is the next stream's.
+    try fetchOne(connection, io);
+    connection.close(io);
+    try serving.await(io);
+}
+
+test "RFC 9000 §4.6, an accept the pool cannot back grants no credit, and the connection goes on" {
+    var server_fixed: std.heap.FixedBufferAllocator = .init(&server_memory);
+    var pair: Pair = undefined;
+    try pair.initWith(testing.allocator, server_fixed.allocator());
+    defer pair.deinit();
+    const io = pair.io;
+
+    var accepting = try io.concurrent(Endpoint.accept, .{ &test_server, io });
+    defer _ = accepting.cancel(io) catch {};
+    const connection = try pair.connect();
+    const server = try accepting.await(io);
+
+    // The server's one credit, then the one its first accept granted from the
+    // preheated pool. Its second accept finds the pool empty and the memory
+    // full, so it grants nothing, and the client's next open waits.
+    const first = try sendRequest(connection, io);
+    const one = try server.acceptStream(io);
+    const second = try sendRequest(connection, io);
+    const two = try server.acceptStream(io);
+    try expectNoCredit(connection, io);
+
+    try answer(one, io);
+    try answer(two, io);
+    var response: [64]u8 = undefined;
+    for ([_]quic_io.Stream{ first, second }) |stream| {
+        try testing.expectEqualStrings(body, try readAll(stream, io, &response));
+        stream.close(io);
+    }
+    try awaitNoStreams(io);
+    // The two streams freed give their credit back, on the slots they free.
+    var answering = try io.concurrent(answerNext, .{ server, io });
+    defer answering.cancel(io) catch {};
+    try fetchOne(connection, io);
+    try answering.await(io);
+    connection.close(io);
+}
+
+test "RFC 9000 §4.6, a peer that opens what it may and closes nothing cannot make the endpoint allocate" {
+    var server_counted: testing.FailingAllocator = .init(testing.allocator, .{});
+    var pair: Pair = undefined;
+    try pair.initWith(testing.allocator, server_counted.allocator());
+    defer pair.deinit();
+    const io = pair.io;
+    const listened = server_counted.allocated_bytes;
+
+    var accepting = try io.concurrent(Endpoint.accept, .{ &test_server, io });
+    defer _ = accepting.cancel(io) catch {};
+    const connection = try pair.connect();
+    const server = try accepting.await(io);
+
+    // The client spends its one credit, keeps the stream open, and asks for
+    // more. Nothing it does moves the server's allocator.
+    _ = try sendRequest(connection, io);
+    try expectNoCredit(connection, io);
+    try testing.expectEqual(listened, server_counted.allocated_bytes);
+    try testing.expectEqual(@as(u32, 2), poolCapacity(&test_server, io));
+
+    // Each accept grants one more, its slot first: from the preheat, then
+    // from the allocator. The pool is the peer's backlog plus what the
+    // application took, never what the peer asked for.
+    _ = try server.acceptStream(io);
+    _ = try sendRequest(connection, io);
+    try expectNoCredit(connection, io);
+    try testing.expectEqual(listened, server_counted.allocated_bytes);
+    try testing.expectEqual(@as(u32, 2), poolCapacity(&test_server, io));
+
+    _ = try server.acceptStream(io);
+    _ = try sendRequest(connection, io);
+    // Three streams and the slot kept for one the server may open fill the
+    // client's table of four, so this time its own limit stops it.
+    try testing.expectError(error.StreamLimit, connection.openStream(io, .bidi));
+    try io.sleep(.fromMilliseconds(settle_ms), .awake);
+    try testing.expectEqual(@as(u32, 3), poolCapacity(&test_server, io));
+    connection.close(io);
 }

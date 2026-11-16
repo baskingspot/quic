@@ -338,6 +338,23 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `quic-io` streams are pooled. `Endpoint.listen(allocator, config)` and
+  `Endpoint.connect(allocator, config)` take an `std.mem.Allocator`, and
+  `error.OutOfMemory` is their one new failure. `Sizing(.{})` drops from
+  104,648 to 68,936 bytes: the stream table (736 bytes per `streams`) is
+  allocated in `listen` or `connect`, and each stream's buffers are a
+  `Sizing.StreamSlot` (8,192 bytes by default) from a
+  `std.heap.MemoryPool`, taken while the stream lives and returned to the pool,
+  not the allocator, when it is freed. `SizingLimits.preheat` (default 0) fills
+  the pool up front; `SizingLimits.peer_initial` (default 1) is the
+  initial_max_streams_bidi advertised when the parameters name no stream
+  count, which was `streams`. Each `acceptStream` grants the peer one more
+  stream once a slot backs it, and grants nothing if the pool cannot grow, so
+  nothing a peer sends makes an endpoint allocate. `Connection.openStream` can
+  return `error.OutOfMemory`, and the connection goes on. A
+  `FixedBufferAllocator` over `Sizing.fixed_buffer_bytes` with enough
+  `preheat` is the old heap-free endpoint through the same API (see
+  `Endpoint.listen`); the hq examples run that way.
 - `quic-io` builds the TLS handshake, and a caller no longer sizes or builds a
   driver. `Endpoint.listen` takes `.certificate` and `.key` (PEM bytes, decoded
   into the endpoint, so they need not outlive the call) and `.alpn`, and

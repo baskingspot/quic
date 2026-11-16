@@ -10,9 +10,13 @@
 //! either returns or parks on its stream's `Io.Condition`, cancelable like any
 //! other `Io` wait.
 //!
-//! Nothing allocates and nothing is sized by the caller except `SizingLimits`.
-//! `Endpoint(Sizing(limits))` holds every buffer one connection needs, and is
-//! built in place because the machine inside refuses to move.
+//! `Endpoint(Sizing(limits))` holds the buffers one connection needs whatever
+//! it does, and is built in place because the machine inside refuses to move.
+//! Streams are what a connection may or may not use, so their buffers come from
+//! a pool over the allocator `listen` or `connect` is handed, and only while a
+//! stream is live or the peer may open one. A `FixedBufferAllocator` and a
+//! preheated pool (`SizingLimits.preheat`) keep the whole of it bounded and off
+//! the heap; see `Endpoint.listen`.
 //!
 //! TLS is part of QUIC, so an endpoint builds its own handshake: a server is
 //! handed a certificate and key (PEM) and its ALPN names, a client the server's
@@ -31,6 +35,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
+const Allocator = std.mem.Allocator;
 
 const driver = @import("quic-tls");
 const quic = @import("quic");
@@ -58,15 +63,19 @@ pub const ConnectionError = Core.Failure;
 pub const Trust = driver.Trust;
 
 /// What `Endpoint.listen` can refuse: a certificate or key that does not load
-/// (`error.InvalidCertificate`, `error.InvalidKey`), and anything that exceeds
-/// `SizingLimits.tls` (`error.NoSpace`).
-pub const ListenError = driver.LoadError || driver.Error;
+/// (`error.InvalidCertificate`, `error.InvalidKey`), anything that exceeds
+/// `SizingLimits.tls` (`error.NoSpace`), and an allocator that cannot supply
+/// the stream table and the pool (`error.OutOfMemory`).
+pub const ListenError = driver.LoadError || driver.Error || Allocator.Error;
 pub const AcceptError = ConnectionError || Io.ConcurrentError || TransportParameters.Error;
-pub const ConnectError = ConnectionError || Io.ConcurrentError || TransportParameters.Error || driver.Error;
+pub const ConnectError = ConnectionError || Io.ConcurrentError || TransportParameters.Error ||
+    driver.Error || Allocator.Error;
 
 /// The numbers a caller chooses. Every other length follows from them.
 pub const SizingLimits = struct {
-    /// Streams held at once, both directions and both initiators.
+    /// The most streams live at once, both directions and both initiators: the
+    /// length of the machine's stream table, which `listen` and `connect`
+    /// allocate whole. A stream's buffers are allocated only while it lives.
     streams: u16 = 4,
     /// Each stream's receive ring and send buffer, and so the per-stream window
     /// this endpoint advertises (§4.1). The send buffer does not wrap: a stream
@@ -81,6 +90,17 @@ pub const SizingLimits = struct {
     /// What the handshake may carry: certificate chain, ALPN name, transport
     /// parameters, and post-handshake messages. Four numbers of their own.
     tls: driver.Limits = .{},
+    /// Stream slots (`StreamSlot`, one stream's two buffers) the pool takes from
+    /// the allocator in `listen` or `connect`, before anything runs. With
+    /// enough of them no stream ever allocates; with fewer the pool grows on
+    /// demand.
+    preheat: u16 = 0,
+    /// §4.6: the streams the peer may open before the application accepts
+    /// any, advertised as initial_max_streams_bidi when the caller's parameters
+    /// name no stream count. Each one is a slot taken from the pool in `listen`
+    /// or `connect`, because a peer's first frame lands in its buffers, and
+    /// each stream the application accepts lets the peer open one more.
+    peer_initial: u16 = 1,
 };
 
 /// The most frames one packet may carry that the machine hands back rather
@@ -99,13 +119,15 @@ const own_id_len = 8;
 /// Room for this endpoint's encoded transport parameters.
 const parameter_capacity = 256;
 
-/// Every buffer one connection needs, sized from `limits`: the loss tables and
-/// the STREAM records beside them, the CRYPTO buffers, the stream slots and
-/// rings, the shell's own sent-frame records, and the datagram scratch.
+/// Every buffer one connection needs whatever it does, sized from `limits`:
+/// the loss tables and the STREAM records beside them, the CRYPTO buffers, the
+/// shell's own sent-frame records, the frame lists, the datagram scratch, and
+/// the TLS driver's storage. The streams' buffers are `StreamSlot`s, pooled.
 pub fn Sizing(comptime limits_given: SizingLimits) type {
     comptime {
         assert(limits_given.streams > 0);
         assert(limits_given.stream_ring > 0);
+        assert(limits_given.peer_initial <= limits_given.streams);
         assert(limits_given.sent_packets > 0);
         assert(limits_given.crypto > 0);
         // IPv6's minimum path, 1280 bytes less 48 of headers. It holds the
@@ -124,6 +146,47 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         /// §4.1: the connection window, every ring full.
         pub const receive_limit: u64 = @as(u64, streams) * ring;
 
+        /// One stream's buffers, the item the endpoint's pool hands out: what
+        /// it sends, which does not wrap, and the ring it receives into.
+        pub const StreamSlot = struct {
+            send: [ring]u8,
+            recv: [ring]u8,
+        };
+
+        pub const Pool = std.heap.MemoryPool(StreamSlot);
+
+        /// What one entry of the stream table costs, allocated whole by
+        /// `listen` or `connect` whether a stream ever uses it or not: the
+        /// machine's stream state, the table's slot, and the shell's.
+        pub const table_entry_bytes = @sizeOf(Conn.Stream) + @sizeOf(StreamTable.Slot) + @sizeOf(Core.Slot);
+
+        /// What `listen` or `connect` takes from a `FixedBufferAllocator`
+        /// that holds nothing else, when the parameters name no stream count:
+        /// the stream table, then the pool with `preheat` slots, or with
+        /// `peer_initial` if that is more, since each of those is armed at
+        /// once. Within alignment padding, it is exactly what they take.
+        ///
+        /// The pool keeps its slots in a `std.heap.ArenaAllocator`, which in
+        /// Zig 0.17.1 takes its first slot in a block half again as large, and
+        /// leaves one slot's room unused each time it grows that block in
+        /// place, as it does on a `FixedBufferAllocator`. So past the first,
+        /// each preheated slot costs two.
+        pub const fixed_buffer_bytes: usize = table_bytes + pool_bytes;
+
+        /// Three arrays, each aligned on its own.
+        const table_bytes = streams * table_entry_bytes + @alignOf(StreamTable.Slot) - 1 +
+            @alignOf(Conn.Stream) - 1 + @alignOf(Core.Slot) - 1;
+        const pooled: usize = @max(limits_given.preheat, limits_given.peer_initial);
+        /// The arena's block header, three words in Zig 0.17.1.
+        const arena_header = 3 * @sizeOf(usize);
+        /// The arena's first block, sized for one slot and half again.
+        const first_block = block: {
+            const wanted = arena_header + Pool.item_alignment.toByteUnits() + Pool.item_size + 16;
+            break :block std.mem.alignForward(usize, wanted + wanted / 2, 2);
+        };
+        const pool_bytes = if (pooled == 0) 0 else @alignOf(usize) - 1 +
+            @max(first_block, arena_header + (2 * pooled - 1) * Pool.item_size);
+
         loss_state: Recovery = .{},
         spaces: [3]Recovery.Space = undefined,
         sent: [3][sent]Recovery.SentPacket = undefined,
@@ -139,11 +202,6 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         original_id: [own_id_len]u8 = undefined,
         own_id: [own_id_len]u8 = undefined,
         parameter_bytes: [parameter_capacity]u8 = undefined,
-        table: [streams]StreamTable.Slot = undefined,
-        streams: [streams]Conn.Stream = undefined,
-        send_bytes: [streams][ring]u8 = undefined,
-        recv_bytes: [streams][ring]u8 = undefined,
-        slots: [streams]Core.Slot = undefined,
         /// One record per tracked 1-RTT packet, for the RESET_STREAM or
         /// STOP_SENDING this shell composes itself.
         records: [sent]Core.Record = undefined,
@@ -163,11 +221,6 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         fn prepare(self: *Self) void {
             self.loss_state = .{};
             self.tls.init();
-            // `Conn.init` asserts no two buffers overlap, so each stream has
-            // its own pair.
-            for (&self.streams, &self.send_bytes, &self.recv_bytes) |*stream, *send, *recv| {
-                stream.* = .{ .send_buffer = send, .recv_buffer = recv, .recv_limit_bytes = ring };
-            }
         }
 
         fn loss(self: *Self) Conn.Loss {
@@ -192,15 +245,14 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
                 .control = &self.control,
                 .offers = &self.offers,
                 .written = &self.written,
-                .slots = &self.slots,
                 .records = &self.records,
             };
         }
 
         /// The caller's transport parameters with every number this sizing
         /// decides written over: the windows, the datagram size, and, when the
-        /// caller named neither stream count, every slot for the peer's
-        /// bidirectional streams.
+        /// caller named neither stream count, `peer_initial` bidirectional
+        /// streams for the peer.
         fn advertised(given: TransportParameters) TransportParameters {
             var parameters = given;
             parameters.initial_max_data = receive_limit;
@@ -209,7 +261,7 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
             parameters.initial_max_stream_data_uni = ring;
             parameters.max_udp_payload_size = datagram;
             if (given.initial_max_streams_bidi == null and given.initial_max_streams_uni == null) {
-                parameters.initial_max_streams_bidi = streams;
+                parameters.initial_max_streams_bidi = limits_given.peer_initial;
             }
             return parameters;
         }
@@ -229,6 +281,14 @@ pub fn Endpoint(comptime S: type) type {
         core: Core,
         driver: quic.handshake.Driver,
         parameters: TransportParameters,
+        /// What the stream table and the pool come from, until `deinit`.
+        allocator: Allocator,
+        /// Every stream's buffers. A slot destroyed goes back on the pool's
+        /// free list, never to the allocator, until `deinit`.
+        pool: S.Pool,
+        /// How many slots the pool has taken from the allocator, live or free.
+        pool_capacity: u32,
+        table: []StreamTable.Slot,
 
         pub const Listen = struct {
             io: Io,
@@ -269,9 +329,38 @@ pub fn Endpoint(comptime S: type) type {
         /// Start listening on `config.socket`, with the certificate and key
         /// loaded. Nothing is read until `accept`. The endpoint owns the socket
         /// from here, so `deinit` follows a failed `listen` too.
-        pub fn listen(self: *Self, config: Listen) ListenError!void {
+        ///
+        /// `allocator` is where streams come from, and its failure is the one
+        /// new way to fail. Here and in `connect` it supplies the stream table
+        /// (`S.table_entry_bytes` for each of `streams`) and the pool, which
+        /// takes `preheat` slots at once and hands the peer's credit
+        /// (`peer_initial`, or the parameters' stream counts) a slot each.
+        /// After that it is called only when `openStream` or `acceptStream`
+        /// finds the pool empty (`S.StreamSlot`, two `stream_ring` buffers),
+        /// from whichever task holds the connection's mutex, and never because
+        /// of anything the peer sends. A slot freed goes back to the pool, not
+        /// to the allocator.
+        ///
+        /// So a `FixedBufferAllocator` over `S.fixed_buffer_bytes` bytes, with
+        /// `preheat` at least the slots in use at once, is the old bounded
+        /// endpoint with no heap at all, through this same API: every byte
+        /// reserved up front, nothing allocated once it runs, and an open past
+        /// the reserve `error.OutOfMemory` rather than a surprise. Slots in use
+        /// at once are the live streams plus the peer's backlog
+        /// (`peer_initial`): a client making N requests one after another
+        /// needs `1 + peer_initial`, and a server answering N peer streams at
+        /// once `N + peer_initial`.
+        ///
+        /// The reserve is the table, `streams * S.table_entry_bytes`, and the
+        /// pool: one and a half slots for the first slot and two for each
+        /// after it, because the pool's arena leaves a slot's room behind each
+        /// time it grows in place (Zig 0.17.1). With the default limits and
+        /// `preheat = 2` that is 2,944 + 24,600 = 27,544 bytes, which
+        /// `S.fixed_buffer_bytes` (27,568) covers with alignment to spare. The
+        /// allocator is the endpoint's alone: give each endpoint its own.
+        pub fn listen(self: *Self, allocator: Allocator, config: Listen) ListenError!void {
             const nowhere: IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
-            self.prepare(config.io, config.socket, nowhere, config.parameters);
+            try self.prepare(allocator, config.io, config.socket, nowhere, config.parameters);
             const credentials = try self.sizing.tls.credentials(config.certificate, config.key);
             self.driver = try self.startTls(config.io, .{ .server = .{
                 .credentials = credentials,
@@ -316,10 +405,10 @@ pub fn Endpoint(comptime S: type) type {
 
         /// Connect to `config.peer` and return once the handshake is done. The
         /// endpoint owns the socket from here, so `deinit` follows a failed
-        /// `connect` too.
-        pub fn connect(self: *Self, config: Connect) ConnectError!Connection {
+        /// `connect` too. `allocator` is as in `listen`.
+        pub fn connect(self: *Self, allocator: Allocator, config: Connect) ConnectError!Connection {
             const io = config.io;
-            self.prepare(io, config.socket, config.peer, config.parameters);
+            try self.prepare(allocator, io, config.socket, config.peer, config.parameters);
             self.driver = try self.startTls(io, .{ .client = .{
                 .policy = config.trust.policy(),
                 .server_name = config.server_name,
@@ -341,22 +430,28 @@ pub fn Endpoint(comptime S: type) type {
             return .{ .core = &self.core };
         }
 
-        /// Cancel the connection's tasks, return only once neither runs, and
-        /// close the socket. No CONNECTION_CLOSE: that is `Connection.close`.
+        /// Cancel the connection's tasks, return only once neither runs, close
+        /// the socket, and give back everything the allocator supplied. No
+        /// CONNECTION_CLOSE: that is `Connection.close`.
         pub fn deinit(self: *Self, io: Io) void {
             self.core.stop(io);
             self.sizing.tls.deinit();
             self.core.socket.close(io);
+            self.pool.deinit(self.allocator);
+            self.allocator.free(self.core.storage.slots);
+            self.allocator.free(self.core.storage.streams);
+            self.allocator.free(self.table);
             self.* = undefined;
         }
 
         fn prepare(
             self: *Self,
+            allocator: Allocator,
             io: Io,
             socket: Io.net.Socket,
             peer: IpAddress,
             parameters: TransportParameters,
-        ) void {
+        ) Allocator.Error!void {
             self.sizing.prepare();
             self.parameters = S.advertised(parameters);
             // §4.6: credit the table cannot back turns a legal peer into a
@@ -364,6 +459,12 @@ pub fn Endpoint(comptime S: type) type {
             const bidi = self.parameters.initial_max_streams_bidi orelse 0;
             const uni = self.parameters.initial_max_streams_uni orelse 0;
             assert(bidi + uni <= S.limits.streams);
+            // Empty first, so `deinit` frees what exists whichever allocation
+            // below fails.
+            self.allocator = allocator;
+            self.pool = .empty;
+            self.pool_capacity = 0;
+            self.table = &.{};
             self.core.init(.{
                 .io = io,
                 .socket = socket,
@@ -372,7 +473,48 @@ pub fn Endpoint(comptime S: type) type {
                 .events = .init(&self.sizing.acked, &self.sizing.lost),
                 .loss = self.sizing.loss(),
                 .idle_timeout_ms = self.parameters.max_idle_timeout orelse 0,
+                .pool = .{ .context = self, .create = createSlot, .destroy = destroySlot },
+                .peer_streams = .{ .bidi = bidi, .uni = uni },
             });
+            try self.allocateStreams();
+            // §4.6: every stream the peer may open has its buffers before the
+            // first datagram can open it.
+            try self.core.arm(@intCast(bidi + uni));
+        }
+
+        /// The stream table whole, then the pool: last, so that on a
+        /// `FixedBufferAllocator` the pool's block is the newest allocation and
+        /// grows in place.
+        fn allocateStreams(self: *Self) Allocator.Error!void {
+            const count = S.limits.streams;
+            self.table = try self.allocator.alloc(StreamTable.Slot, count);
+            const streams = try self.allocator.alloc(Conn.Stream, count);
+            const slots = self.allocator.alloc(Core.Slot, count) catch |err| {
+                self.allocator.free(streams);
+                return err;
+            };
+            self.core.attach(streams, slots);
+            self.pool = try .initCapacity(self.allocator, S.limits.preheat);
+            self.pool_capacity = S.limits.preheat;
+        }
+
+        /// `Core.Pool.create`: a slot off the free list, or a new one.
+        fn createSlot(context: *anyopaque) Allocator.Error!Core.Buffers {
+            const self: *Self = @ptrCast(@alignCast(context));
+            const grows = self.pool.free_list.first == null;
+            const slot = try self.pool.create(self.allocator);
+            if (grows) self.pool_capacity += 1;
+            return .{ .send = &slot.send, .recv = &slot.recv };
+        }
+
+        /// `Core.Pool.destroy`: back on the free list, from the buffers alone.
+        fn destroySlot(context: *anyopaque, buffers: Core.Buffers) void {
+            const self: *Self = @ptrCast(@alignCast(context));
+            assert(buffers.send.len == S.limits.stream_ring);
+            const send: *[S.limits.stream_ring]u8 = buffers.send[0..S.limits.stream_ring];
+            const slot: *S.StreamSlot = @fieldParentPtr("send", send);
+            assert(buffers.recv.ptr == &slot.recv);
+            self.pool.destroy(@alignCast(slot));
         }
 
         /// Build the handshake in the sizing. The Hello random and the ephemeral
@@ -423,8 +565,8 @@ pub fn Endpoint(comptime S: type) type {
                 .handshake = &sizing.crypto_sent[1],
                 .app = &sizing.crypto_sent[2],
             };
-            config.stream_slots = &sizing.table;
-            config.streams = &sizing.streams;
+            config.stream_slots = self.table;
+            config.streams = self.core.storage.streams;
             config.receive_limit = S.receive_limit;
             config.max_streams_bidi = self.parameters.initial_max_streams_bidi orelse 0;
             config.max_streams_uni = self.parameters.initial_max_streams_uni orelse 0;
@@ -449,18 +591,30 @@ pub const Connection = struct {
     core: *Core,
 
     pub const AcceptStreamError = ConnectionError || Io.Cancelable;
-    pub const OpenStreamError = ConnectionError || Io.Cancelable;
+    /// `error.OutOfMemory` is the pool, which could not grow: the connection
+    /// goes on as it was.
+    pub const OpenStreamError = ConnectionError || Io.Cancelable || Allocator.Error;
 
     /// Wait for the next stream the peer opens, lowest ID first.
     ///
+    /// Its buffers were ready before the peer could open it. Taking it lets
+    /// the peer open one more, once the pool supplies the slot that stream
+    /// will land in; a pool that cannot is not an error here, and the peer
+    /// waits for credit until a stream closes (§4.6).
+    ///
     /// A peer that opens more than this endpoint advertised has broken §4.6,
-    /// and the connection ends with `error.StreamLimit`, which this returns.
+    /// and the connection ends, which this returns: `error.StreamLimit` when
+    /// the table is full, and otherwise `error.FlowControl` once its bytes
+    /// land in an entry with no buffers, because the machine does not count
+    /// the peer's streams against its credit.
     pub fn acceptStream(self: Connection, io: Io) AcceptStreamError!Stream {
         return self.stream(try self.core.acceptStream(io));
     }
 
     /// Open a stream, waiting while the peer grants no credit for one (§4.6).
-    /// `error.StreamLimit` when every slot is held: close a stream first.
+    /// `error.StreamLimit` when every slot is held, or kept for the streams
+    /// the peer may open: close a stream first. `error.OutOfMemory` when the
+    /// pool is empty and the allocator refuses another slot.
     pub fn openStream(self: Connection, io: Io, direction: Direction) OpenStreamError!Stream {
         return self.stream(try self.core.openStream(io, direction));
     }
@@ -736,13 +890,21 @@ pub const Stream = struct {
 // `Stream.Reader` and `Stream.Writer` are in examples/hq.zig, which has a real
 // TLS driver.
 
-test "SizingLimits, every dependent length follows from five numbers" {
-    const S = Sizing(.{ .streams = 3, .stream_ring = 100, .sent_packets = 5, .crypto = 7, .datagram = 1300 });
+test "SizingLimits, every dependent length follows from its numbers" {
+    const S = Sizing(.{
+        .streams = 3,
+        .stream_ring = 100,
+        .sent_packets = 5,
+        .crypto = 7,
+        .datagram = 1300,
+        .peer_initial = 2,
+    });
     const sizing: S = undefined;
+    const slot: S.StreamSlot = undefined;
     try testing.expectEqual(@as(u64, 300), S.receive_limit);
-    try testing.expectEqual(3, sizing.streams.len);
-    try testing.expectEqual(100, sizing.recv_bytes[0].len);
-    try testing.expectEqual(100, sizing.send_bytes[2].len);
+    try testing.expectEqual(3, sizing.stream_events.len);
+    try testing.expectEqual(100, slot.recv.len);
+    try testing.expectEqual(100, slot.send.len);
     try testing.expectEqual(5, sizing.sent[2].len);
     try testing.expectEqual(5, sizing.lost.len);
     try testing.expectEqual(5, sizing.records.len);
@@ -751,10 +913,20 @@ test "SizingLimits, every dependent length follows from five numbers" {
     try testing.expectEqual(1300, sizing.datagram_out.len);
     try testing.expectEqual(6, sizing.control.len);
 
+    // The rings are the pool's: a larger one changes the slot, not the sizing.
+    try testing.expectEqual(@sizeOf(S), @sizeOf(Sizing(.{
+        .streams = 3,
+        .stream_ring = 100_000,
+        .sent_packets = 5,
+        .crypto = 7,
+        .datagram = 1300,
+    })));
+    try testing.expectEqual(200, @sizeOf(S.StreamSlot));
+
     const advertised = S.advertised(.{ .max_idle_timeout = 30 });
     try testing.expectEqual(@as(?u64, 300), advertised.initial_max_data);
     try testing.expectEqual(@as(?u64, 100), advertised.initial_max_stream_data_bidi_remote);
-    try testing.expectEqual(@as(?u64, 3), advertised.initial_max_streams_bidi);
+    try testing.expectEqual(@as(?u64, 2), advertised.initial_max_streams_bidi);
     try testing.expectEqual(@as(?u64, 1300), advertised.max_udp_payload_size);
     try testing.expectEqual(@as(?u64, 30), advertised.max_idle_timeout);
 }
@@ -784,7 +956,7 @@ test "RFC 9000 §14.1, accept drops what cannot start a connection, and is cance
     const sender = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
     defer sender.close(io);
 
-    try test_endpoint.listen(.{
+    try test_endpoint.listen(testing.allocator, .{
         .io = io,
         .socket = socket,
         .certificate = test_certificate,
@@ -845,7 +1017,7 @@ test "RFC 9000 §8.1, a first datagram that does not open leaves the endpoint as
     const sender = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
     defer sender.close(io);
 
-    try test_endpoint.listen(.{
+    try test_endpoint.listen(testing.allocator, .{
         .io = io,
         .socket = socket,
         .certificate = test_certificate,

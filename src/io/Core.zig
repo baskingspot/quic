@@ -20,6 +20,15 @@
 //!
 //! Everything below runs with `mutex` held unless it says otherwise. The
 //! receive and the condition waits are the only places a task lets go of it.
+//!
+//! A stream's buffers come from the endpoint's pool (`Pool`) and sit in the
+//! machine's stream entries (`Conn.Stream.send_buffer`, `recv_buffer`) only
+//! while they are needed. The machine hands a new stream the lowest free entry
+//! and writes into that entry's buffers at once, a peer's stream included, in
+//! the middle of a datagram. So before every datagram and every open, the
+//! lowest free entries carry buffers, one per stream the peer may still open
+//! (`reserve`), and the peer is never granted a stream there are no buffers
+//! for (`replenish`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -93,6 +102,21 @@ pub const Record = struct {
     entry: ?Entry = null,
 };
 
+/// One stream's two buffers, which the pool hands out and takes back together.
+pub const Buffers = struct {
+    send: []u8,
+    recv: []u8,
+};
+
+/// Where stream buffers come from: the endpoint's pool, behind the two calls
+/// the core makes, both with `mutex` held. `create` is the one place a
+/// connection allocates once it runs.
+pub const Pool = struct {
+    context: *anyopaque,
+    create: *const fn (context: *anyopaque) error{OutOfMemory}!Buffers,
+    destroy: *const fn (context: *anyopaque, buffers: Buffers) void,
+};
+
 /// The buffers the core works in, all the caller's (`Sizing`'s).
 pub const Storage = struct {
     /// The receiver's datagram, filled without the mutex held.
@@ -109,7 +133,10 @@ pub const Storage = struct {
     control: []frame.Frame,
     offers: []Conn.Offer,
     written: []Conn.Written,
-    slots: []Slot,
+    /// The machine's stream entries, and this shell's state beside each, the
+    /// same length. `attach` sets both.
+    streams: []Conn.Stream = &.{},
+    slots: []Slot = &.{},
     records: []Record,
 };
 
@@ -154,6 +181,12 @@ received_at: Conn.Duration = 0,
 idle_timeout: Conn.Duration,
 /// How many streams this endpoint has opened, per direction.
 opened: Conn.StreamLimits = .{},
+pool: Pool,
+/// How many streams the peer has opened, per direction: each took one entry.
+peer_opened: Conn.StreamLimits = .{},
+/// §4.6: how many streams the peer may have opened and the application not
+/// yet accepted, per direction, which `replenish` keeps it at.
+peer_backlog: Conn.StreamLimits,
 
 pub const Options = struct {
     io: Io,
@@ -163,6 +196,9 @@ pub const Options = struct {
     events: Recovery.Events,
     loss: Conn.Loss,
     idle_timeout_ms: u64,
+    pool: Pool,
+    /// The stream counts this endpoint advertised, per direction.
+    peer_streams: Conn.StreamLimits,
 };
 
 /// Build the core in place: `recovery` points at `recovery_spaces`.
@@ -171,6 +207,7 @@ pub fn init(self: *Core, options: Options) void {
     assert(storage.records.len > 0);
     assert(storage.scratch.len >= initial_payload_floor);
     assert(storage.datagram_out.len > crypto_overhead);
+    assert(storage.streams.len == storage.slots.len);
     for (storage.slots) |*slot| slot.* = .{};
     for (storage.records) |*record| record.* = .{};
     self.* = .{
@@ -178,12 +215,27 @@ pub fn init(self: *Core, options: Options) void {
         .socket = options.socket,
         .peer = options.peer,
         .storage = storage,
+        .pool = options.pool,
+        .peer_backlog = options.peer_streams,
         .events = options.events,
         .recovery_spaces = .{ &options.loss.spaces[0], &options.loss.spaces[1], &options.loss.spaces[2] },
         .origin = Io.Timestamp.now(options.io, .awake),
         .idle_timeout = options.idle_timeout_ms *| std.time.ns_per_ms,
     };
     self.recovery = .init(options.loss.shared, &self.recovery_spaces);
+}
+
+/// Hand the core the machine's stream entries and their shell slots, empty and
+/// without buffers. Separate from `init` because the endpoint allocates them,
+/// and a core that exists is one `deinit` can tear down whether or not that
+/// allocation worked.
+pub fn attach(self: *Core, streams: []Conn.Stream, slots: []Slot) void {
+    assert(self.phase == .listening);
+    assert(streams.len == slots.len);
+    for (streams) |*entry| entry.* = .{};
+    for (slots) |*slot| slot.* = .{};
+    self.storage.streams = streams;
+    self.storage.slots = slots;
 }
 
 /// Build the machine, walk the datagram that started it (a server's first
@@ -261,22 +313,33 @@ fn hold(self: *Core, index: u16) Held {
     return .{ .index = index, .generation = slot.generation };
 }
 
-/// The next stream the peer opened, lowest ID first, waiting for one.
+/// The next stream the peer opened, lowest ID first, waiting for one. Taking
+/// it lets the peer open another (`replenish`).
 pub fn acceptStream(self: *Core, io: Io) (Failure || Io.Cancelable)!Held {
     try self.mutex.lock(io);
     defer self.mutex.unlock(io);
     while (true) {
         // A stream that arrived with the close is still the application's.
-        if (try self.takePending()) |index| return self.hold(index);
+        if (try self.takePending()) |index| {
+            const taken = self.hold(index);
+            self.replenish();
+            return taken;
+        }
         try self.alive();
         try self.changed.wait(io, &self.mutex);
     }
 }
 
 /// Open the next stream of `direction`, waiting for the peer's credit (§4.6).
-/// A table with no free slot is `error.StreamLimit`: only a handle's close can
-/// free one, so waiting would be waiting on the caller.
-pub fn openStream(self: *Core, io: Io, direction: stream_id.Direction) (Failure || Io.Cancelable)!Held {
+/// A table with no free entry but the ones the peer's credit holds is
+/// `error.StreamLimit`: only a handle's close can free one, so waiting would be
+/// waiting on the caller. A pool that cannot grow is `error.OutOfMemory`, and
+/// the connection goes on as it was.
+pub fn openStream(
+    self: *Core,
+    io: Io,
+    direction: stream_id.Direction,
+) (Failure || Io.Cancelable || error{OutOfMemory})!Held {
     try self.mutex.lock(io);
     defer self.mutex.unlock(io);
     const kind: stream_id.Kind = .{ .initiator = self.initiator(), .direction = direction };
@@ -287,6 +350,11 @@ pub fn openStream(self: *Core, io: Io, direction: stream_id.Direction) (Failure 
     while (true) {
         try self.alive();
         const id = kind.at(count.*) catch return error.StreamLimit;
+        const reserved = self.reserve();
+        if (self.freeEntries() <= reserved) return error.StreamLimit;
+        // One entry past the reserve gets buffers too: the machine takes the
+        // lowest, and the rest stay the peer's. A wait below hands it back.
+        try self.arm(reserved + 1);
         const entry = self.conn.openStream(id) catch |err| switch (err) {
             error.NoStreamCredit => {
                 try self.changed.wait(io, &self.mutex);
@@ -302,13 +370,16 @@ pub fn openStream(self: *Core, io: Io, direction: stream_id.Direction) (Failure 
 }
 
 /// Give a slot back: the handle goes stale now, and the machine's slot frees
-/// once both halves are terminal (`reclaim`).
+/// once both halves are terminal (`reclaim`), its buffers going back to the
+/// pool unless the peer's credit needs them.
 pub fn release(self: *Core, index: u16) void {
     const slot = &self.storage.slots[index];
     assert(slot.handle == .held);
     slot.handle = .released;
     slot.generation +%= 1;
     self.reclaim(index);
+    self.rearm();
+    self.replenish();
 }
 
 /// §3.5: ask the peer to stop sending, if the receive half is still taking
@@ -469,16 +540,24 @@ fn onStreamEvent(self: *Core, event: Conn.StreamEvent) void {
 }
 
 /// After a datagram: find the streams the peer opened, free the ones that
-/// ended, note the handshake, and wake everyone who might care.
+/// ended, ready the entries for the next datagram, note the handshake, and wake
+/// everyone who might care.
 fn settle(self: *Core) void {
     for (self.storage.slots, 0..) |*slot, index| {
         if (slot.handle != .none) continue;
         const entry = &self.conn.streams[index];
         if (!entry.isOpen()) continue;
-        if (stream_id.isLocal(idOf(entry), self.initiator())) continue;
+        const id = idOf(entry);
+        if (stream_id.isLocal(id, self.initiator())) continue;
         slot.handle = .pending;
+        switch (stream_id.direction(id)) {
+            .bidi => self.peer_opened.bidi += 1,
+            .uni => self.peer_opened.uni += 1,
+        }
     }
     for (0..self.storage.slots.len) |index| self.reclaim(@intCast(index));
+    self.rearm();
+    self.replenish();
     if (self.phase == .handshaking and self.established()) self.phase = .established;
     self.changed.broadcast(self.io);
     self.wake.signal(self.io);
@@ -537,6 +616,135 @@ fn takePending(self: *Core) Failure!?u16 {
     const id = idOf(entry);
     if (stream_id.direction(id) == .bidi and !entry.canSend()) _ = try self.conn.joinStream(id);
     return @intCast(index);
+}
+
+// -- Stream buffers --------------------------------------------------------
+
+/// §4.6: streams the peer may still open in `direction`: its credit less the
+/// streams it has opened. Each one would take a free entry.
+fn unspent(self: *const Core, direction: stream_id.Direction) u64 {
+    return switch (direction) {
+        .bidi => self.conn.streams_allowed.bidi -| self.peer_opened.bidi,
+        .uni => self.conn.streams_allowed.uni -| self.peer_opened.uni,
+    };
+}
+
+/// How many free entries need buffers before the machine sees another
+/// datagram: one per stream the peer may open in it.
+fn reserve(self: *const Core) usize {
+    return @intCast(self.unspent(.bidi) + self.unspent(.uni));
+}
+
+fn freeEntries(self: *const Core) usize {
+    var count: usize = 0;
+    for (self.storage.streams) |*entry| count += @intFromBool(!entry.isOpen());
+    return count;
+}
+
+/// Peer streams of `direction` that `acceptStream` has not handed out.
+fn pendingCount(self: *const Core, direction: stream_id.Direction) u64 {
+    var count: u64 = 0;
+    for (self.storage.slots, self.storage.streams) |slot, *entry| {
+        if (slot.handle != .pending) continue;
+        count += @intFromBool(stream_id.direction(idOf(entry)) == direction);
+    }
+    return count;
+}
+
+/// `arm` for the reserve, after the machine opened or freed entries. The
+/// buffers it needs are already in free entries: the peer's open used up a
+/// reserved entry with its credit, and a freed entry keeps its buffers, which is
+/// what backs the credit `Conn.closeStream` returns to the peer. So this only
+/// moves and returns buffers, and never allocates; were it ever short, the
+/// pool's refusal leaves an entry bare and a peer stream there fails the
+/// connection rather than anything here.
+fn rearm(self: *Core) void {
+    self.arm(self.reserve()) catch |err| switch (err) {
+        error.OutOfMemory => return,
+    };
+}
+
+/// Give buffers to exactly the `count` lowest free entries, the ones the
+/// machine hands its next streams (`Conn.freeStream`), and take them from every
+/// other free entry. Buffers move between entries first, the pool fills what
+/// is still bare, and what is left over goes back to it.
+pub fn arm(self: *Core, count: usize) error{OutOfMemory}!void {
+    const entries = self.storage.streams;
+    // `entries[0..cut]` holds the first `count` free entries.
+    var cut: usize = 0;
+    var free: usize = 0;
+    while (free < count) : (cut += 1) {
+        assert(cut < entries.len);
+        free += @intFromBool(!entries[cut].isOpen());
+    }
+    var hole: usize = 0;
+    for (entries[cut..]) |*donor| {
+        if (donor.isOpen() or donor.send_buffer.len == 0) continue;
+        const buffers = disarm(donor);
+        if (nextBare(entries[0..cut], hole)) |index| {
+            place(&entries[index], buffers);
+            hole = index + 1;
+        } else {
+            self.pool.destroy(self.pool.context, buffers);
+        }
+    }
+    while (nextBare(entries[0..cut], hole)) |index| : (hole = index + 1) {
+        place(&entries[index], try self.pool.create(self.pool.context));
+    }
+}
+
+/// The first free entry from `from` on with no buffers.
+fn nextBare(entries: []const Conn.Stream, from: usize) ?usize {
+    for (entries[from..], from..) |*entry, index| {
+        if (!entry.isOpen() and entry.send_buffer.len == 0) return index;
+    }
+    return null;
+}
+
+fn place(entry: *Conn.Stream, buffers: Buffers) void {
+    assert(!entry.isOpen());
+    assert(entry.send_buffer.len == 0);
+    assert(buffers.send.len > 0);
+    assert(buffers.recv.len > 0);
+    entry.send_buffer = buffers.send;
+    entry.recv_buffer = buffers.recv;
+    // §4.1: the window a stream advertises is its ring.
+    entry.recv_limit_bytes = buffers.recv.len;
+}
+
+fn disarm(entry: *Conn.Stream) Buffers {
+    assert(!entry.isOpen());
+    const buffers: Buffers = .{ .send = entry.send_buffer, .recv = entry.recv_buffer };
+    entry.* = .{};
+    return buffers;
+}
+
+/// §4.6: let the peer open another stream for each one the application took,
+/// up to `peer_backlog` waiting or grantable in each direction. The buffers
+/// come first and the credit after, so the peer never holds credit for a
+/// stream with nowhere to land. Without a free entry, or the memory for one,
+/// nothing is granted: the peer waits for credit, which is flow control doing
+/// its job, not a failure. Only the application's accepts make a shortfall,
+/// so nothing a peer sends makes this allocate.
+fn replenish(self: *Core) void {
+    assert(self.phase != .listening);
+    if (self.phase == .closed) return;
+    var granted = false;
+    for ([_]stream_id.Direction{ .bidi, .uni }) |direction| {
+        const backlog = switch (direction) {
+            .bidi => self.peer_backlog.bidi,
+            .uni => self.peer_backlog.uni,
+        };
+        while (self.unspent(direction) + self.pendingCount(direction) < backlog) {
+            const reserved = self.reserve();
+            if (self.freeEntries() <= reserved) break;
+            self.arm(reserved + 1) catch break;
+            self.conn.allowStreams(direction, 1) catch break;
+            granted = true;
+        }
+    }
+    // The sender owes the peer a MAX_STREAMS now.
+    if (granted) self.wake.signal(self.io);
 }
 
 // -- Sending ---------------------------------------------------------------
@@ -991,10 +1199,21 @@ const LossFixture = struct {
             .control = &self.control,
             .offers = &self.offers,
             .written = &self.written,
+            .streams = &self.streams,
             .slots = &self.slots,
             .records = &self.records,
         };
     }
+
+    /// The fixture's one stream has buffers of its own, so the pool is never
+    /// asked for more, and has nothing to take back.
+    const no_pool: Pool = .{ .context = undefined, .create = refuse, .destroy = keep };
+
+    fn refuse(_: *anyopaque) error{OutOfMemory}!Buffers {
+        return error.OutOfMemory;
+    }
+
+    fn keep(_: *anyopaque, _: Buffers) void {}
 
     fn encode(
         self: *LossFixture,
@@ -1041,6 +1260,8 @@ const LossFixture = struct {
             .events = .init(&self.acked, &self.lost),
             .loss = self.loss(0, &self.client_loss),
             .idle_timeout_ms = 0,
+            .pool = no_pool,
+            .peer_streams = .{},
         });
         var config = Conn.clientConfig(&server_id, &client_id, self.loss(0, &self.client_loss));
         config.tls = self.client_stub.driver();

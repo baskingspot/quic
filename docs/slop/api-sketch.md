@@ -59,6 +59,21 @@ generation, so a stale handle cannot name a recycled stream. Streams are bounded
 by `streams` and that is the point: `Sizing(.{ .streams = 256, ... })` is how a
 program asks for 256, and it costs exactly what it says.
 
+Measured after pooling streams (Zig 0.17.1, aarch64, default limits):
+
+| | before | after |
+|---|---|---|
+| `@sizeOf(Sizing(.{}))` | 104,648 | 68,936 |
+| stream table, per `streams`, allocated in `listen`/`connect` | (in `Sizing`) | 736 |
+| one live stream's slot (`StreamSlot`, 2 x `stream_ring`) | (in `Sizing`) | 8,192 |
+| `listen`/`connect` allocation, `preheat = 0`, `peer_initial = 1` | 0 | 15,304 |
+| total up front, defaults | 104,648 | 84,240 |
+| `fixed_buffer_bytes`, `preheat = 2` (the hq examples) | n/a | 27,568 (27,544 used) |
+
+The pool's `ArenaAllocator` takes 12,360 bytes for its first 8,192-byte slot
+and 16,384 for each slot after it when it grows in place, as on a
+`FixedBufferAllocator`.
+
 ## Concurrency
 
 `Connection` spawns **two** tasks with `Io.concurrent` when it is accepted or
