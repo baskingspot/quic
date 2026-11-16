@@ -9,8 +9,13 @@
 //! Reset Recvd. Transitions happen on what is actually sent and acknowledged,
 //! not on what the application asked for, because the peer can only observe the
 //! former.
+//!
+//! A loss is a range marked unsent again, not a copy (§13.3). The bytes never
+//! leave the application's buffer, so `onLost` records which offsets have to go
+//! out again and `nextSegment` hands them out first, at the offsets they had.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const testing = std.testing;
 
 const SendStream = @This();
@@ -47,6 +52,10 @@ pub const Segment = struct {
     data: []const u8,
     /// §19.8: the FIN bit belongs on the segment that reaches the final size.
     fin: bool,
+    /// These bytes were sent before and declared lost (§13.3). The peer's
+    /// credit for them was spent the first time (§4.1), so a sender counts only
+    /// segments that are not retransmissions against the connection's window.
+    retransmit: bool = false,
 };
 
 const Range = struct {
@@ -57,6 +66,12 @@ const Range = struct {
 /// How many out-of-order acknowledged runs are tracked. Beyond it, `onAck`
 /// reports `error.NoSpace` rather than forgetting an acknowledgment.
 pub const pending_capacity = 8;
+
+/// How many separate lost runs are tracked. Beyond it the runs collapse into
+/// one, from the lowest lost offset to the highest: bytes the peer may already
+/// have go again, which §2.2 allows because they are the same bytes at the same
+/// offsets, and nothing lost is ever forgotten.
+pub const lost_capacity = 8;
 
 id: u64,
 state: State = .ready,
@@ -78,6 +93,12 @@ final_size: ?u64 = null,
 reset_code: ?u64 = null,
 /// §3.5: a STOP_SENDING the peer sent, waiting for the caller to send a reset.
 stop_sending_code: ?u64 = null,
+/// Runs below `sent` that went out in a packet declared lost, ascending and
+/// disjoint, waiting to be sent again (§13.3).
+lost: [lost_capacity]Range = undefined,
+lost_len: usize = 0,
+/// The FIN went out in a packet declared lost and has not gone out since.
+fin_lost: bool = false,
 
 pub fn init(id: u64, buffer: []u8, limit: u64) SendStream {
     return .{ .id = id, .buffer = buffer, .limit = limit };
@@ -101,7 +122,7 @@ pub fn write(self: *SendStream, bytes: []const u8) Error!void {
 
     // The only mutator of `written` is this function, and it never passes the
     // end of the buffer, so the subtraction below cannot wrap.
-    std.debug.assert(self.written <= self.buffer.len);
+    assert(self.written <= self.buffer.len);
     const space = self.buffer.len - @as(usize, @intCast(self.written));
     if (bytes.len > space) return error.NoSpace;
 
@@ -131,14 +152,22 @@ pub fn reset(self: *SendStream, error_code: u64) Error!void {
     }
     self.reset_code = error_code;
     self.state = .reset_sent;
+    // §13.3: "Once an endpoint sends a RESET_STREAM for that stream, no further
+    // STREAM frames are needed."
+    self.lost_len = 0;
+    self.fin_lost = false;
 }
 
 /// The next run to packetize, bounded by `max_len` and by the peer's limit.
 ///
-/// Retransmission is the caller's: this only hands out bytes that were never
-/// sent. A caller that needs a lost range again asks `data(offset, len)`.
+/// Lost runs come first, lowest offset first, because §13.3 asks a sender to
+/// prioritize retransmission over new data; then bytes that were never sent.
 pub fn nextSegment(self: *SendStream, max_len: u32) ?Segment {
     const segment = self.peekSegment(max_len) orelse return null;
+    if (segment.retransmit) {
+        self.takeLost(segment);
+        return segment;
+    }
 
     // A packetizer has to know a frame's size before it decides to write it, so
     // the decision and the taking are separate: `peekSegment` says what would go
@@ -158,6 +187,7 @@ pub fn nextSegment(self: *SendStream, max_len: u32) ?Segment {
 /// before it commits to it; taking a segment it then cannot write would lose the
 /// bytes, because `nextSegment` moves the stream's cursor.
 pub fn peekSegment(self: *const SendStream, max_len: u32) ?Segment {
+    if (self.peekLost(max_len)) |segment| return segment;
     if (self.state != .ready and self.state != .send) return null;
 
     // §19.8: FIN sets the final size, and a frame of length zero at that offset
@@ -182,6 +212,84 @@ pub fn peekSegment(self: *const SendStream, max_len: u32) ?Segment {
     };
 }
 
+/// The front of the first lost run, or the lost FIN on its own.
+fn peekLost(self: *const SendStream, max_len: u32) ?Segment {
+    if (self.lost_len == 0) {
+        if (!self.fin_lost) return null;
+        // The data before the FIN arrived or is still in flight; only the
+        // final size has to be said again (§19.8).
+        const size = self.final_size.?;
+        return .{ .offset = size, .data = &.{}, .fin = true, .retransmit = true };
+    }
+    const run = self.lost[0];
+    assert(run.start < run.end);
+    assert(run.end <= self.sent);
+    const length = @min(run.end - run.start, max_len);
+    const end = run.start + length;
+    const fin = self.fin_lost and end == self.final_size.?;
+    return .{
+        .offset = run.start,
+        .data = self.buffer[@intCast(run.start)..@intCast(end)],
+        .fin = fin,
+        .retransmit = true,
+    };
+}
+
+/// Mark a retransmitted segment as sent: it was the front of the first run.
+fn takeLost(self: *SendStream, segment: Segment) void {
+    if (segment.fin) self.fin_lost = false;
+    if (segment.data.len == 0) return;
+    assert(self.lost_len > 0);
+    assert(self.lost[0].start == segment.offset);
+    self.lost[0].start += segment.data.len;
+    assert(self.lost[0].start <= self.lost[0].end);
+    if (self.lost[0].start == self.lost[0].end) removeRange(&self.lost, &self.lost_len, 0);
+}
+
+/// §13.3: the packet that carried `[offset, offset + length)`, and the FIN when
+/// `fin` is set, was declared lost, so the range is unsent again.
+///
+/// Nothing is copied: the bytes are still in the application's buffer, and the
+/// next `nextSegment` hands them out at the same offsets. A reset stream needs
+/// no STREAM frames at all, a terminal one has nothing left to say, and bytes
+/// the peer already acknowledged are not sent again.
+pub fn onLost(self: *SendStream, offset: u64, length: u32, fin: bool) void {
+    if (self.reset_code != null or self.isTerminal()) return;
+    const end = offset + length;
+    // Only what was handed out can have been in a packet.
+    assert(end <= self.sent);
+    if (fin) {
+        // A FIN that left is the state's own record that it left.
+        assert(self.state == .data_sent);
+        assert(end == self.final_size.?);
+        self.fin_lost = true;
+    }
+    const start = @max(offset, self.acked);
+    if (start < end) self.insertLost(start, end);
+}
+
+/// Merge `[start, stop)` into the lost runs, collapsing them when full.
+fn insertLost(self: *SendStream, start: u64, stop: u64) void {
+    if (self.lost_len == self.lost.len) {
+        // Full: one run from the lowest lost byte to the highest. Bounded, and
+        // it can only send a byte twice, never forget one.
+        const low = @min(start, self.lost[0].start);
+        const high = @max(stop, self.lost[self.lost_len - 1].end);
+        self.lost[0] = .{ .start = low, .end = high };
+        self.lost_len = 1;
+        return;
+    }
+    insertRange(&self.lost, &self.lost_len, start, stop);
+}
+
+/// Drop the parts of the lost runs the peer has now acknowledged.
+fn trimLost(self: *SendStream) void {
+    while (self.lost_len > 0 and self.lost[0].end <= self.acked) {
+        removeRange(&self.lost, &self.lost_len, 0);
+    }
+    if (self.lost_len > 0 and self.lost[0].start < self.acked) self.lost[0].start = self.acked;
+}
+
 /// The bytes to put in a retransmission of `[offset, offset + length)`.
 pub fn data(self: *const SendStream, offset: u64, length: u32) Error![]const u8 {
     if (offset + length > self.written) return error.OutOfBounds;
@@ -204,6 +312,7 @@ pub fn onAck(self: *SendStream, offset: u64, length: u32) Error!void {
         if (offset <= self.acked) {
             self.acked = stop;
             self.absorb();
+            self.trimLost();
         } else {
             try self.insertPending(offset, stop);
         }
@@ -214,6 +323,12 @@ pub fn onAck(self: *SendStream, offset: u64, length: u32) Error!void {
         if (self.final_size) |size| {
             if (self.acked >= size) self.state = .data_recvd;
         }
+    }
+    // §13.3: "sending ceases when a packet containing that information is
+    // acknowledged", and in Data Recvd all of it has been.
+    if (self.state == .data_recvd) {
+        self.lost_len = 0;
+        self.fin_lost = false;
     }
 }
 
@@ -247,28 +362,39 @@ pub fn isBlocked(self: *const SendStream) bool {
 
 fn insertPending(self: *SendStream, start: u64, stop: u64) Error!void {
     if (self.pending_len == self.pending.len) return error.NoSpace;
+    insertRange(&self.pending, &self.pending_len, start, stop);
+}
+
+/// Insert `[start, stop)` into ascending runs with room for one more, merging
+/// neighbours so the table does not fill with abutting runs.
+fn insertRange(ranges: []Range, len: *usize, start: u64, stop: u64) void {
+    assert(len.* < ranges.len);
+    assert(start < stop);
 
     var index: usize = 0;
-    while (index < self.pending_len and self.pending[index].start < start) : (index += 1) {}
-    var shift = self.pending_len;
-    while (shift > index) : (shift -= 1) self.pending[shift] = self.pending[shift - 1];
-    self.pending[index] = .{ .start = start, .end = stop };
-    self.pending_len += 1;
+    while (index < len.* and ranges[index].start < start) : (index += 1) {}
+    var shift = len.*;
+    while (shift > index) : (shift -= 1) ranges[shift] = ranges[shift - 1];
+    ranges[index] = .{ .start = start, .end = stop };
+    len.* += 1;
 
-    // Merge neighbours so the table does not fill with abutting runs.
     var merged: usize = 1;
-    while (merged < self.pending_len) : (merged += 1) {
-        const previous = &self.pending[merged - 1];
-        if (self.pending[merged].start <= previous.end) {
-            previous.end = @max(previous.end, self.pending[merged].end);
-            var move = merged;
-            while (move + 1 < self.pending_len) : (move += 1) {
-                self.pending[move] = self.pending[move + 1];
-            }
-            self.pending_len -= 1;
+    while (merged < len.*) : (merged += 1) {
+        const previous = &ranges[merged - 1];
+        if (ranges[merged].start <= previous.end) {
+            previous.end = @max(previous.end, ranges[merged].end);
+            removeRange(ranges, len, merged);
             merged -= 1;
         }
     }
+}
+
+/// Remove the run at `index`, moving the ones after it down.
+fn removeRange(ranges: []Range, len: *usize, index: usize) void {
+    assert(index < len.*);
+    var move = index;
+    while (move + 1 < len.*) : (move += 1) ranges[move] = ranges[move + 1];
+    len.* -= 1;
 }
 
 /// Extend the contiguous offset through whatever pending runs now touch it.
@@ -612,4 +738,118 @@ test "RFC 9000 §3.1, a FIN sent on its own is acknowledged on its own" {
 
     try stream.onAck(fin.offset, 0);
     try testing.expectEqual(State.data_recvd, stream.state);
+}
+
+test "RFC 9000 §13.3, a lost range goes again at its own offset, before new data" {
+    var buffer: [32]u8 = undefined;
+    var stream: SendStream = .init(0, &buffer, 1000);
+    try stream.write("0123456789");
+    _ = stream.nextSegment(4).?;
+    _ = stream.nextSegment(4).?;
+    try stream.write("abcd");
+
+    // The packet with [4, 8) is lost: the bytes are still in the buffer, so the
+    // range is unsent again and nothing is copied.
+    stream.onLost(4, 4, false);
+    const again = stream.nextSegment(16).?;
+    try testing.expect(again.retransmit);
+    try testing.expectEqual(@as(u64, 4), again.offset);
+    try testing.expectEqualStrings("4567", again.data);
+    try testing.expect(!again.fin);
+    // §13.3 puts the retransmission ahead of the bytes never sent, which come
+    // next and are not marked as a retransmission.
+    const fresh = stream.nextSegment(16).?;
+    try testing.expect(!fresh.retransmit);
+    try testing.expectEqual(@as(u64, 8), fresh.offset);
+    try testing.expectEqualStrings("89abcd", fresh.data);
+    try testing.expectEqual(@as(?Segment, null), stream.nextSegment(16));
+}
+
+test "RFC 9000 §13.3, a lost range is cut to the packet and to what was acknowledged" {
+    var buffer: [32]u8 = undefined;
+    var stream: SendStream = .init(0, &buffer, 1000);
+    try stream.write("0123456789");
+    _ = stream.nextSegment(10).?;
+
+    // A later copy of [0, 3) was acknowledged, so only [3, 10) goes again.
+    try stream.onAck(0, 3);
+    stream.onLost(0, 10, false);
+    const first = stream.nextSegment(4).?;
+    try testing.expectEqual(@as(u64, 3), first.offset);
+    try testing.expectEqualStrings("3456", first.data);
+    // An acknowledgment that arrives while the rest waits trims it too.
+    try stream.onAck(3, 5);
+    const rest = stream.nextSegment(16).?;
+    try testing.expectEqual(@as(u64, 8), rest.offset);
+    try testing.expectEqualStrings("89", rest.data);
+    try testing.expectEqual(@as(?Segment, null), stream.nextSegment(16));
+}
+
+test "RFC 9000 §13.3, a lost FIN goes again, alone or on the last bytes" {
+    var buffer: [16]u8 = undefined;
+    var stream: SendStream = .init(0, &buffer, 1000);
+    try stream.write("abcd");
+    try stream.finish();
+    const all = stream.nextSegment(16).?;
+    try testing.expect(all.fin);
+    try testing.expectEqual(State.data_sent, stream.state);
+
+    // The whole frame is lost: the bytes and the FIN go together again.
+    stream.onLost(0, 4, true);
+    const again = stream.nextSegment(16).?;
+    try testing.expectEqualStrings("abcd", again.data);
+    try testing.expect(again.fin);
+    try testing.expectEqual(State.data_sent, stream.state);
+
+    try stream.onAck(0, 4);
+    try testing.expectEqual(State.data_recvd, stream.state);
+
+    // The data went and was acknowledged before the application finished, so
+    // the FIN rode a frame of its own, and that frame is lost: §19.8's
+    // zero-length frame at the final size says it again.
+    var late: SendStream = .init(0, &buffer, 1000);
+    try late.write("ab");
+    _ = late.nextSegment(16).?;
+    try late.onAck(0, 2);
+    try late.finish();
+    _ = late.nextSegment(16).?;
+    late.onLost(2, 0, true);
+    const fin = late.nextSegment(16).?;
+    try testing.expect(fin.fin and fin.retransmit);
+    try testing.expectEqual(@as(u64, 2), fin.offset);
+    try testing.expectEqual(@as(usize, 0), fin.data.len);
+    try testing.expectEqual(@as(?Segment, null), late.nextSegment(16));
+    try late.onAck(2, 0);
+    try testing.expectEqual(State.data_recvd, late.state);
+}
+
+test "RFC 9000 §13.3, a reset stream sends no lost STREAM data" {
+    var buffer: [16]u8 = undefined;
+    var stream: SendStream = .init(0, &buffer, 1000);
+    try stream.write("abcd");
+    _ = stream.nextSegment(16).?;
+    stream.onLost(0, 4, false);
+    try stream.reset(7);
+    try testing.expectEqual(@as(?Segment, null), stream.nextSegment(16));
+    // A loss reported after the reset is not owed either.
+    stream.onLost(0, 4, false);
+    try testing.expectEqual(@as(?Segment, null), stream.nextSegment(16));
+}
+
+test "RFC 9000 §13.3, more lost runs than the table holds collapse and lose nothing" {
+    var buffer: [64]u8 = undefined;
+    var stream: SendStream = .init(0, &buffer, 1000);
+    try stream.write(&@as([40]u8, @splat('x')));
+    _ = stream.nextSegment(40).?;
+
+    // Every other two-byte run, one more than `lost_capacity`.
+    var run: u64 = 0;
+    while (run <= lost_capacity) : (run += 1) stream.onLost(run * 4, 2, false);
+    try testing.expectEqual(@as(usize, 1), stream.lost_len);
+    // One run from the first lost byte to the last: bounded, and nothing lost
+    // is forgotten, which is the trade §2.2 allows.
+    const again = stream.nextSegment(64).?;
+    try testing.expectEqual(@as(u64, 0), again.offset);
+    try testing.expectEqual(@as(usize, lost_capacity * 4 + 2), again.data.len);
+    try testing.expectEqual(@as(?Segment, null), stream.nextSegment(64));
 }
