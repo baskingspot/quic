@@ -111,23 +111,28 @@ const Pair = struct {
     key: tls.signature.PrivateKey,
     der: [cert_pem.len]u8 = undefined,
     chain_slots: [1][]const u8 = undefined,
+    /// Whether `connect` got far enough that `test_client` and `client_tls`
+    /// are built, and so are `deinit`'s to tear down.
+    client_started: bool,
 
     const cert_pem = @embedFile("tls_server_crt");
 
-    /// Bind the server, start listening, and build the client's driver. The
-    /// client's `connect` is the test's to call.
+    /// Bind the server and start listening. The client's `connect` is the
+    /// test's to call.
+    ///
+    /// The kernel names the port, so no two tests, and no two processes, share
+    /// one. A fixed port is shared by all of them, and whatever reaches it (a
+    /// client of another process, a straggler for the last test's server)
+    /// arrives as this server's first datagram and takes its one connection
+    /// (§8.1).
     fn init(self: *Pair) !void {
         self.threaded = .init(testing.allocator, .{});
         self.io = self.threaded.io();
+        self.client_started = false;
         const io = self.io;
-        const socket = bound: {
-            var port: u16 = 47401;
-            while (port < 47451) : (port += 1) {
-                self.server_address = .{ .ip4 = .loopback(port) };
-                break :bound self.server_address.bind(io, .{ .mode = .dgram }) catch continue;
-            }
-            return error.NoFreePort;
-        };
+        const any: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const socket = try any.bind(io, .{ .mode = .dgram });
+        self.server_address = socket.address;
         const chain: tls.certificate_chain.CertificateChain = try .fromPem(cert_pem, &self.der, &self.chain_slots);
         self.key = try .fromPemAuto(@embedFile("tls_server_key"));
         const server_driver = try server_tls.start(io, .{ .server = .{
@@ -141,11 +146,18 @@ const Pair = struct {
         const io = self.io;
         var policy: tls.certificate.Policy = .init;
         policy.insecure_no_chain_anchor = true;
-        const client_driver = try client_tls.start(io, .{ .client = .{ .policy = policy, .alpn = &.{alpn} } });
         const local: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const socket = try local.bind(io, .{ .mode = .dgram });
+        const client_driver = client_tls.start(io, .{ .client = .{ .policy = policy, .alpn = &.{alpn} } }) catch |err| {
+            socket.close(io);
+            return err;
+        };
+        // From here the endpoint owns the socket, and `connect` failing still
+        // leaves it for `deinit`.
+        self.client_started = true;
         return test_client.connect(.{
             .io = io,
-            .socket = try local.bind(io, .{ .mode = .dgram }),
+            .socket = socket,
             .peer = self.server_address,
             .driver = client_driver,
             .parameters = parameters,
@@ -153,9 +165,11 @@ const Pair = struct {
     }
 
     /// `deinit` both endpoints, which must return with their tasks running.
-    fn deinit(self: *Pair, client_started: bool) void {
+    /// The client only if `connect` started it: tearing down an endpoint that
+    /// was never built is a `Group.cancel` on whatever the last test left.
+    fn deinit(self: *Pair) void {
         const io = self.io;
-        if (client_started) {
+        if (self.client_started) {
             test_client.deinit(io);
             client_tls.deinit();
         }
@@ -183,7 +197,7 @@ fn serveOne(io: Io) !void {
 test "RFC 9000 §2, a request and its response cross a stream, and the client closes" {
     var pair: Pair = undefined;
     try pair.init();
-    defer pair.deinit(true);
+    defer pair.deinit();
     const io = pair.io;
 
     var serving = try io.concurrent(serveOne, .{io});
@@ -219,7 +233,7 @@ test "a read waiting on a silent peer is canceled like any Io wait, and deinit s
     var pair: Pair = undefined;
     try pair.init();
     // Both endpoints are torn down with their tasks still running.
-    defer pair.deinit(true);
+    defer pair.deinit();
     const io = pair.io;
 
     var serving = try io.concurrent(acceptSilently, .{io});
@@ -250,7 +264,7 @@ fn sendRequest(connection: quic_io.Connection, io: Io) !quic_io.Stream {
 test "RFC 9000 §19.8, a Stream.Reader yields the stream's bytes, then EndOfStream at the FIN" {
     var pair: Pair = undefined;
     try pair.init();
-    defer pair.deinit(true);
+    defer pair.deinit();
     const io = pair.io;
 
     var serving = try io.concurrent(serveOne, .{io});
@@ -274,7 +288,7 @@ test "RFC 9000 §19.8, a Stream.Reader yields the stream's bytes, then EndOfStre
 test "RFC 9000 §2.2, a Stream.Reader smaller than the data reads it in order across many reads" {
     var pair: Pair = undefined;
     try pair.init();
-    defer pair.deinit(true);
+    defer pair.deinit();
     const io = pair.io;
 
     var serving = try io.concurrent(serveOne, .{io});
@@ -309,7 +323,7 @@ test "RFC 9000 §2.2, a Stream.Reader smaller than the data reads it in order ac
 test "RFC 9000 §19.8, what a Stream.Writer drains crosses as STREAM frames, byte for byte" {
     var pair: Pair = undefined;
     try pair.init();
-    defer pair.deinit(true);
+    defer pair.deinit();
     const io = pair.io;
 
     var serving = try io.concurrent(serveOne, .{io});
@@ -348,7 +362,7 @@ fn resetOne(io: Io) !void {
 test "RFC 9000 §19.4, a RESET_STREAM fails a Stream.Reader, and err says so" {
     var pair: Pair = undefined;
     try pair.init();
-    defer pair.deinit(true);
+    defer pair.deinit();
     const io = pair.io;
 
     var serving = try io.concurrent(resetOne, .{io});
@@ -423,7 +437,7 @@ fn expectExchange(connection: quic_io.Connection, io: Io) !void {
 test "RFC 9000 §8.1, a forged Initial does not take the one connection, and the client after it does" {
     var pair: Pair = undefined;
     try pair.init();
-    defer pair.deinit(true);
+    defer pair.deinit();
     const io = pair.io;
 
     var serving = try io.concurrent(serveOne, .{io});
@@ -443,7 +457,7 @@ test "RFC 9000 §8.1, a forged Initial does not take the one connection, and the
 test "RFC 9000 §8.1, a first datagram that is malformed does not take the one connection either" {
     var pair: Pair = undefined;
     try pair.init();
-    defer pair.deinit(true);
+    defer pair.deinit();
     const io = pair.io;
 
     var serving = try io.concurrent(serveOne, .{io});
@@ -473,7 +487,7 @@ test "RFC 9000 §8.1, a first datagram that is malformed does not take the one c
 test "RFC 9000 §8.1, a genuine first datagram opens on the first accept, from its own address" {
     var pair: Pair = undefined;
     try pair.init();
-    defer pair.deinit(true);
+    defer pair.deinit();
     const io = pair.io;
 
     var serving = try io.concurrent(serveOne, .{io});
