@@ -527,6 +527,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- A FIN sent on its own and lost after the bytes before it were acknowledged
+  was never sent again (RFC 9000 §3.1, §13.3). `SendStream` reached Data Recvd
+  on the bytes alone, so the peer never learned the stream ended and both ends
+  waited until the idle timeout. `SendStream.onAck` now takes `fin`, whether the
+  acknowledged frame carried the FIN, and Data Recvd needs that acknowledgment
+  too; a caller of `onAck` passes `Conn.Written.fin` or `Segment.fin`.
 - A lost MAX_DATA, MAX_STREAM_DATA, or MAX_STREAMS was never sent again. The
   limit rose when the frame left, so `Conn.flowControlOwed` had nothing left to
   report, and a peer that never heard the raise stayed blocked until the

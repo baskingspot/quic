@@ -1409,7 +1409,7 @@ fn onPacketAcked(self: *Conn, number: u64) Error!void {
         // A closed stream was terminal, so everything on it was delivered.
         const entry = self.stream(written.stream_id) orelse continue;
         if (!entry.canSend()) continue;
-        try entry.send.onAck(written.offset, written.length);
+        try entry.send.onAck(written.offset, written.length, written.fin);
     }
 }
 
@@ -3928,7 +3928,7 @@ test "RFC 9000 §4.6, closing a stream this endpoint opened grants no credit" {
     var sent: u64 = 0;
     while (entry.send.nextSegment(64)) |next| {
         sent += next.data.len;
-        try entry.send.onAck(next.offset, @intCast(next.data.len));
+        try entry.send.onAck(next.offset, @intCast(next.data.len), next.fin);
     }
     try testing.expectEqual(@as(u64, 5), sent);
     try testing.expectEqual(SendStream.State.data_recvd, entry.send.state);
@@ -8528,6 +8528,42 @@ test "RFC 9000 §13.3, lost STREAM data is sent again at the same offset" {
     // machine hands the recorded range back to the stream it came from.
     const ack = try f.server.writeAck(.app, &f.datagram, 0);
     _ = try f.client.feed(f.datagram[0..ack], &plaintext, &frames, &stream_events, &f.report, 0);
+    try testing.expectEqual(SendStream.State.data_recvd, entry.send.state);
+}
+
+test "RFC 9000 §3.1, a lone FIN lost after its bytes were acknowledged goes again, and the peer sees the end" {
+    var f: ResendFixture = .{};
+    f.init(16);
+    var plaintext: [1400]u8 = undefined;
+    var frames: [8]frame.Frame = undefined;
+    var stream_events: [4]StreamEvent = undefined;
+    const entry = try f.client.openStream(0);
+    try entry.send.write("data");
+    const bytes = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    _ = try f.server.feed(f.datagram[0..bytes.length], &plaintext, &frames, &stream_events, &f.report, 0);
+
+    // The application ends the stream after the bytes left, so the FIN rides a
+    // zero-length frame in a packet of its own (§19.8), which never arrives.
+    try entry.send.finish();
+    const fin = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Written{ .stream_id = 0, .offset = 4, .length = 0, .fin = true }, fin.frames[0]);
+
+    // Every byte is acknowledged and the FIN is not: the stream is not over.
+    const ack = try f.server.writeAck(.app, &f.datagram, 0);
+    _ = try f.client.feed(f.datagram[0..ack], &plaintext, &frames, &stream_events, &f.report, 0);
+    try testing.expectEqual(SendStream.State.data_sent, entry.send.state);
+
+    // The FIN's packet is declared lost, and the FIN goes again (§13.3).
+    try loseOldest(&f.client, &f.server, &f.report);
+    try testing.expectEqual(fin.number, f.report.lostPackets()[0].packet_number);
+    const again = (try f.client.writeStreams(f.packing(512))) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(Written{ .stream_id = 0, .offset = 4, .length = 0, .fin = true }, again.frames[0]);
+
+    // The peer learns the stream ended, and its acknowledgment ends it here.
+    _ = try f.server.feed(f.datagram[0..again.length], &plaintext, &frames, &stream_events, &f.report, 0);
+    try testing.expectEqual(ReceiveStream.State.data_recvd, f.server.stream(0).?.recv.state);
+    const last = try f.server.writeAck(.app, &f.datagram, 0);
+    _ = try f.client.feed(f.datagram[0..last], &plaintext, &frames, &stream_events, &f.report, 0);
     try testing.expectEqual(SendStream.State.data_recvd, entry.send.state);
 }
 

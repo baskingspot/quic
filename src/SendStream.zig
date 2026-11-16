@@ -99,6 +99,11 @@ lost: [lost_capacity]Range = undefined,
 lost_len: usize = 0,
 /// The FIN went out in a packet declared lost and has not gone out since.
 fin_lost: bool = false,
+/// A frame carrying the FIN was acknowledged. Data Recvd needs this as well as
+/// every byte (§3.1): a FIN sent on its own, in a zero-length frame (§19.8), can
+/// be lost after the bytes before it arrive, and a peer that never receives it
+/// never learns the stream ended.
+fin_acked: bool = false,
 
 pub fn init(id: u64, buffer: []u8, limit: u64) SendStream {
     return .{ .id = id, .buffer = buffer, .limit = limit };
@@ -262,7 +267,8 @@ pub fn onLost(self: *SendStream, offset: u64, length: u32, fin: bool) void {
         // A FIN that left is the state's own record that it left.
         assert(self.state == .data_sent);
         assert(end == self.final_size.?);
-        self.fin_lost = true;
+        // Another copy may already have been acknowledged.
+        if (!self.fin_acked) self.fin_lost = true;
     }
     const start = @max(offset, self.acked);
     if (start < end) self.insertLost(start, end);
@@ -301,12 +307,15 @@ pub fn onMaxStreamData(self: *SendStream, limit: u64) void {
     if (limit > self.limit) self.limit = limit;
 }
 
-/// §3.1: bytes the peer acknowledged, possibly out of order.
+/// §3.1: a frame the peer acknowledged, possibly out of order: its bytes, and
+/// its FIN when `fin` is set.
 ///
-/// A zero-length acknowledgment is the FIN-only frame of §19.8 coming back: it
-/// moves no offset, but it can be the last thing outstanding, so it still gets
-/// the state check below.
-pub fn onAck(self: *SendStream, offset: u64, length: u32) Error!void {
+/// The FIN is acknowledged on its own account, not inferred from the bytes. A
+/// zero-length FIN-only frame (§19.8) moves no offset, and the bytes before it
+/// can all be acknowledged while it is still in flight or lost; only its own
+/// acknowledgment, or one of a frame that carried it with the last bytes, ends
+/// the stream.
+pub fn onAck(self: *SendStream, offset: u64, length: u32, fin: bool) Error!void {
     const stop = offset + length;
     if (length > 0 and stop > self.acked) {
         if (offset <= self.acked) {
@@ -317,12 +326,20 @@ pub fn onAck(self: *SendStream, offset: u64, length: u32) Error!void {
             try self.insertPending(offset, stop);
         }
     }
+    if (fin) {
+        // Only a frame this stream sent comes back, and the one with the FIN
+        // ends at the final size.
+        assert(stop == self.final_size.?);
+        self.fin_acked = true;
+        // §13.3: "sending ceases when a packet containing that information is
+        // acknowledged".
+        self.fin_lost = false;
+    }
 
-    // §3.1: Data Sent moves to Data Recvd once everything is acknowledged.
-    if (self.state == .data_sent) {
-        if (self.final_size) |size| {
-            if (self.acked >= size) self.state = .data_recvd;
-        }
+    // §3.1: Data Sent moves to Data Recvd once every byte and the FIN are
+    // acknowledged.
+    if (self.state == .data_sent and self.fin_acked) {
+        if (self.acked >= self.final_size.?) self.state = .data_recvd;
     }
     // §13.3: "sending ceases when a packet containing that information is
     // acknowledged", and in Data Recvd all of it has been.
@@ -453,10 +470,13 @@ test "RFC 9000 §3.1, the sending state machine" {
     try testing.expect(fin.fin);
     try testing.expectEqual(State.data_sent, stream.state);
 
-    // Acknowledging it all reaches the terminal state.
-    try stream.onAck(0, 8);
+    // Every byte acknowledged is not yet the end: the FIN went in a frame of
+    // its own, and only its acknowledgment reaches the terminal state.
+    try stream.onAck(0, 8, false);
     try testing.expectEqual(State.data_sent, stream.state);
-    try stream.onAck(8, 7);
+    try stream.onAck(8, 7, false);
+    try testing.expectEqual(State.data_sent, stream.state);
+    try stream.onAck(15, 0, true);
     try testing.expectEqual(State.data_recvd, stream.state);
     try testing.expect(stream.isTerminal());
 }
@@ -532,7 +552,7 @@ test "RFC 9000 §3.1, reset is legal before the end and refused after" {
     try third.write("ab");
     try third.finish();
     _ = third.nextSegment(2).?;
-    try third.onAck(0, 2);
+    try third.onAck(0, 2, true);
     try testing.expectEqual(State.data_recvd, third.state);
     try testing.expectError(error.StreamState, third.reset(3));
 }
@@ -569,20 +589,21 @@ test "RFC 9000 §3.1, acknowledgments arrive out of order and the count is hones
     try stream.finish();
     _ = stream.nextSegment(10).?;
 
-    // The back half lands first: nothing is contiguous yet.
-    try stream.onAck(5, 5);
+    // The back half, which carried the FIN, lands first: nothing is
+    // contiguous yet.
+    try stream.onAck(5, 5, true);
     try testing.expectEqual(@as(u64, 0), stream.acked);
     try testing.expectEqual(@as(u64, 10), stream.unacknowledged());
     try testing.expectEqual(State.data_sent, stream.state);
 
     // The front arrives and the run joins it.
-    try stream.onAck(0, 5);
+    try stream.onAck(0, 5, false);
     try testing.expectEqual(@as(u64, 10), stream.acked);
     try testing.expectEqual(@as(u64, 0), stream.unacknowledged());
     try testing.expectEqual(State.data_recvd, stream.state);
 
     // A duplicate acknowledgment changes nothing.
-    try stream.onAck(0, 5);
+    try stream.onAck(0, 5, false);
     try testing.expectEqual(@as(u64, 10), stream.acked);
 }
 
@@ -619,7 +640,7 @@ fn inState(state: State, buffer: []u8) SendStream {
             stream.write("abcd") catch unreachable;
             stream.finish() catch unreachable;
             _ = stream.nextSegment(4);
-            if (state == .data_recvd) stream.onAck(0, 4) catch unreachable;
+            if (state == .data_recvd) stream.onAck(0, 4, true) catch unreachable;
         },
         .reset_sent => stream.reset(1) catch unreachable,
         .reset_recvd => {
@@ -680,7 +701,7 @@ test "RFC 9000 §3.1, every operation in every sending state" {
         // onAck: a valid acknowledgment is never an error, in any state.
         {
             var stream = inState(state, &buffer);
-            try stream.onAck(0, 1);
+            try stream.onAck(0, 1, false);
         }
 
         // onResetAcked: only a reset stream can have one acknowledged.
@@ -714,7 +735,7 @@ test "RFC 9000 §3.1, an acknowledgment beyond the final size is still an acknow
     try stream.write("ab");
     try stream.finish();
     _ = stream.nextSegment(2).?;
-    try stream.onAck(0, 2);
+    try stream.onAck(0, 2, true);
     try testing.expectEqual(State.data_recvd, stream.state);
     try testing.expectEqual(@as(u64, 2), stream.acked);
 }
@@ -727,7 +748,7 @@ test "RFC 9000 §3.1, a FIN sent on its own is acknowledged on its own" {
     var stream: SendStream = .init(0, &buffer, 1000);
     try stream.write("ab");
     _ = stream.nextSegment(8).?;
-    try stream.onAck(0, 2);
+    try stream.onAck(0, 2, false);
     try testing.expectEqual(State.send, stream.state);
 
     try stream.finish();
@@ -736,7 +757,7 @@ test "RFC 9000 §3.1, a FIN sent on its own is acknowledged on its own" {
     try testing.expectEqual(@as(usize, 0), fin.data.len);
     try testing.expectEqual(State.data_sent, stream.state);
 
-    try stream.onAck(fin.offset, 0);
+    try stream.onAck(fin.offset, 0, true);
     try testing.expectEqual(State.data_recvd, stream.state);
 }
 
@@ -772,13 +793,13 @@ test "RFC 9000 §13.3, a lost range is cut to the packet and to what was acknowl
     _ = stream.nextSegment(10).?;
 
     // A later copy of [0, 3) was acknowledged, so only [3, 10) goes again.
-    try stream.onAck(0, 3);
+    try stream.onAck(0, 3, false);
     stream.onLost(0, 10, false);
     const first = stream.nextSegment(4).?;
     try testing.expectEqual(@as(u64, 3), first.offset);
     try testing.expectEqualStrings("3456", first.data);
     // An acknowledgment that arrives while the rest waits trims it too.
-    try stream.onAck(3, 5);
+    try stream.onAck(3, 5, false);
     const rest = stream.nextSegment(16).?;
     try testing.expectEqual(@as(u64, 8), rest.offset);
     try testing.expectEqualStrings("89", rest.data);
@@ -801,7 +822,7 @@ test "RFC 9000 §13.3, a lost FIN goes again, alone or on the last bytes" {
     try testing.expect(again.fin);
     try testing.expectEqual(State.data_sent, stream.state);
 
-    try stream.onAck(0, 4);
+    try stream.onAck(0, 4, true);
     try testing.expectEqual(State.data_recvd, stream.state);
 
     // The data went and was acknowledged before the application finished, so
@@ -810,7 +831,7 @@ test "RFC 9000 §13.3, a lost FIN goes again, alone or on the last bytes" {
     var late: SendStream = .init(0, &buffer, 1000);
     try late.write("ab");
     _ = late.nextSegment(16).?;
-    try late.onAck(0, 2);
+    try late.onAck(0, 2, false);
     try late.finish();
     _ = late.nextSegment(16).?;
     late.onLost(2, 0, true);
@@ -819,8 +840,48 @@ test "RFC 9000 §13.3, a lost FIN goes again, alone or on the last bytes" {
     try testing.expectEqual(@as(u64, 2), fin.offset);
     try testing.expectEqual(@as(usize, 0), fin.data.len);
     try testing.expectEqual(@as(?Segment, null), late.nextSegment(16));
-    try late.onAck(2, 0);
+    try late.onAck(2, 0, true);
     try testing.expectEqual(State.data_recvd, late.state);
+}
+
+test "RFC 9000 §3.1, bytes acknowledged ahead of their lone FIN leave the FIN owed" {
+    // The bytes leave, then the application finishes, so the FIN rides a
+    // zero-length frame in a packet of its own (§19.8), and that packet is
+    // lost while the bytes' packet is acknowledged. Every byte is acknowledged
+    // and the stream is still not over: the peer has not heard the FIN.
+    var buffer: [8]u8 = undefined;
+    var stream: SendStream = .init(0, &buffer, 1000);
+    try stream.write("ab");
+    _ = stream.nextSegment(8).?;
+    try stream.finish();
+    const fin = stream.nextSegment(8).?;
+    try testing.expect(fin.fin);
+    try testing.expectEqual(@as(usize, 0), fin.data.len);
+
+    try stream.onAck(0, 2, false);
+    try testing.expectEqual(State.data_sent, stream.state);
+    try testing.expect(!stream.isTerminal());
+
+    // §13.3: so the FIN's loss is still owed, and it goes again on its own.
+    stream.onLost(fin.offset, 0, true);
+    const again = stream.nextSegment(8).?;
+    try testing.expect(again.fin and again.retransmit);
+    try testing.expectEqual(@as(u64, 2), again.offset);
+    try testing.expectEqual(@as(usize, 0), again.data.len);
+    try stream.onAck(again.offset, 0, true);
+    try testing.expectEqual(State.data_recvd, stream.state);
+
+    // A copy of the FIN acknowledged first makes a later loss of another copy
+    // owe nothing.
+    var acked: SendStream = .init(0, &buffer, 1000);
+    try acked.write("ab");
+    _ = acked.nextSegment(8).?;
+    try acked.finish();
+    const lone = acked.nextSegment(8).?;
+    try acked.onAck(lone.offset, 0, true);
+    try testing.expectEqual(State.data_sent, acked.state);
+    acked.onLost(lone.offset, 0, true);
+    try testing.expectEqual(@as(?Segment, null), acked.nextSegment(8));
 }
 
 test "RFC 9000 §13.3, a reset stream sends no lost STREAM data" {
