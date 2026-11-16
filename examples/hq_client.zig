@@ -23,8 +23,9 @@ const hq = @import("hq.zig");
 /// Static, because the machine and the driver point into it for the life of the
 /// process.
 var endpoint: hq.Endpoint = undefined;
-/// Where the streams' buffers come from: no heap, as in `hq_server`.
-var memory: [hq.Sizing.fixed_buffer_bytes]u8 = undefined;
+/// Where the handshake's and the streams' buffers come from: no heap, as in
+/// `hq_server`, and exactly what `connect` takes.
+var memory: [hq.Sizing.connect_bytes]u8 align(hq.Sizing.allocation_alignment) = undefined;
 var request: [256]u8 = undefined;
 var response: [1024]u8 = undefined;
 
@@ -62,8 +63,8 @@ fn fetch(io: Io, server: Io.net.IpAddress, path: []const u8) !void {
     const socket = try local.bind(io, .{ .mode = .dgram });
     // The endpoint owns the socket from `connect` on, failed or not.
     defer endpoint.deinit(io);
-    var streams: std.heap.FixedBufferAllocator = .init(&memory);
-    const connection = try endpoint.connect(streams.allocator(), .{
+    var fixed: std.heap.FixedBufferAllocator = .init(&memory);
+    const connection = try endpoint.connect(fixed.allocator(), .{
         .io = io,
         .socket = socket,
         .peer = server,

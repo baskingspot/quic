@@ -61,15 +61,19 @@ program asks for 256, and it costs exactly what it says.
 
 Measured after pooling streams (Zig 0.17.1, aarch64, default limits):
 
-| | before | after | crypto by level |
-|---|---|---|---|
-| `@sizeOf(Sizing(.{}))` | 104,648 | 68,936 | 61,256 |
-| CRYPTO in `Sizing` (in: 4,096 + 4,096 + 512; sent: 4,096 + 4,096 + 0) | 24,576 | 24,576 | 16,896 |
-| stream table, per `streams`, allocated in `listen`/`connect` | (in `Sizing`) | 736 | 736 |
-| one live stream's slot (`StreamSlot`, 2 x `stream_ring`) | (in `Sizing`) | 8,192 | 8,192 |
-| `listen`/`connect` allocation, `preheat = 0`, `peer_initial = 1` | 0 | 15,304 | 15,304 |
-| total up front, defaults | 104,648 | 84,240 | 76,560 |
-| `fixed_buffer_bytes`, `preheat = 2` (the hq examples) | n/a | 27,568 (27,544 used) | 27,568 (27,544 used) |
+| | before | after | crypto by level | TLS flights allocated |
+|---|---|---|---|---|
+| `@sizeOf(Sizing(.{}))` | 104,648 | 68,936 | 61,256 | 44,192 |
+| CRYPTO in `Sizing` (in: 4,096 + 4,096 + 512; sent: 4,096 + 4,096 + 0) | 24,576 | 24,576 | 16,896 | 16,896 |
+| TLS in `Sizing` (`Storage(.{})`, then `Fixed(.{})`) | 22,720 | 22,720 | 22,720 | 5,656 |
+| stream table, per `streams`, allocated in `listen`/`connect` | (in `Sizing`) | 736 | 736 | 736 |
+| one live stream's slot (`StreamSlot`, 2 x `stream_ring`) | (in `Sizing`) | 8,192 | 8,192 | 8,192 |
+| TLS allocated by `listen` (411-byte fixture chain: chain 411, out 1,622, peer Initial 3,201, peer Handshake 5,307, ServerHello 187) | (in `Sizing`) | (in `Sizing`) | (in `Sizing`) | 10,728 |
+| TLS allocated by `connect` (out 3,201, peer Initial 3,201, peer Handshake 5,307) | (in `Sizing`) | (in `Sizing`) | (in `Sizing`) | 11,709 |
+| `listen`/`connect` allocation, `preheat = 0`, `peer_initial = 1` | 0 | 15,304 | 15,304 | 26,032 / 27,016 |
+| total up front, defaults (server / client) | 104,648 | 84,240 | 76,560 | 70,224 / 71,208 |
+| `fixed_buffer_bytes`, then `listenBytes(411)` / `connect_bytes`, `preheat = 2` (the hq examples) | n/a | 27,568 (27,544 used) | 27,568 (27,544 used) | 38,272 / 39,256, exact |
+| `allocation_bytes`, `preheat = 2`, chain at its 4,096 limit | n/a | n/a | n/a | 45,648 |
 
 The pool's `ArenaAllocator` takes 12,360 bytes for its first 8,192-byte slot
 and 16,384 for each slot after it when it grows in place, as on a

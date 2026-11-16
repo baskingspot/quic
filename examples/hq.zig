@@ -730,10 +730,14 @@ fn expectNoCredit(connection: quic_io.Connection, io: Io) !void {
     try testing.expectError(error.Canceled, opening.cancel(io));
 }
 
-/// Each endpoint's own memory, `fixed_buffer_bytes` exactly, for the tests
-/// that hold an endpoint to it. An endpoint's allocator is its alone.
-var client_memory: [Sizing.fixed_buffer_bytes]u8 = undefined;
-var server_memory: [Sizing.fixed_buffer_bytes]u8 = undefined;
+/// The DER bytes tls's fixture certificate decodes to, which is what the
+/// server's `listenBytes` follows from.
+const fixture_chain = 411;
+
+/// Each endpoint's own memory, exactly what `connect` and `listen` take, for
+/// the tests that hold an endpoint to it. An endpoint's allocator is its alone.
+var client_memory: [Sizing.connect_bytes]u8 align(Sizing.allocation_alignment) = undefined;
+var server_memory: [Sizing.listenBytes(fixture_chain)]u8 align(Sizing.allocation_alignment) = undefined;
 
 test "RFC 9000 §2, endpoints on a FixedBufferAllocator and a preheated pool exchange without allocating" {
     var client_fixed: std.heap.FixedBufferAllocator = .init(&client_memory);
@@ -764,10 +768,42 @@ test "RFC 9000 §2, endpoints on a FixedBufferAllocator and a preheated pool exc
     try testing.expectEqual(server_calls, server_counted.allocations);
     try testing.expectEqual(client_preheated, client_counted.allocated_bytes);
     try testing.expectEqual(server_preheated, server_counted.allocated_bytes);
-    // And the reserve `fixed_buffer_bytes` names is what was used, but for
-    // alignment.
-    try testing.expect(Sizing.fixed_buffer_bytes - client_fixed.end_index < 64);
-    try testing.expect(Sizing.fixed_buffer_bytes - server_fixed.end_index < 64);
+    // And the reserve each names is what was used, to the byte.
+    try testing.expectEqual(Sizing.connect_bytes, client_fixed.end_index);
+    try testing.expectEqual(Sizing.listenBytes(fixture_chain), server_fixed.end_index);
+}
+
+test "RFC 9000 §2, an endpoint one byte short of its reserve is OutOfMemory before a datagram moves" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const any: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+
+    var server_fixed: std.heap.FixedBufferAllocator = .init(server_memory[0 .. server_memory.len - 1]);
+    const listening = try any.bind(io, .{ .mode = .dgram });
+    try testing.expectError(error.OutOfMemory, test_server.listen(server_fixed.allocator(), .{
+        .io = io,
+        .socket = listening,
+        .certificate = @embedFile("tls_server_crt"),
+        .key = @embedFile("tls_server_key"),
+        .alpn = &.{alpn},
+        .parameters = parameters,
+    }));
+    test_server.deinit(io);
+
+    // Nobody listens there, and nothing is sent: the client fails while it
+    // takes its memory, before its first Initial.
+    var client_fixed: std.heap.FixedBufferAllocator = .init(client_memory[0 .. client_memory.len - 1]);
+    const connecting = try any.bind(io, .{ .mode = .dgram });
+    try testing.expectError(error.OutOfMemory, test_client.connect(client_fixed.allocator(), .{
+        .io = io,
+        .socket = connecting,
+        .peer = listening.address,
+        .alpn = &.{alpn},
+        .trust = .insecure,
+        .parameters = parameters,
+    }));
+    test_client.deinit(io);
 }
 
 test "RFC 9000 §2.1, four streams in turn reuse the pool's slots rather than growing it" {

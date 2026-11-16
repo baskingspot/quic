@@ -21,9 +21,12 @@
 //! TLS is part of QUIC, so an endpoint builds its own handshake: a server is
 //! handed a certificate and key (PEM) and its ALPN names, a client the server's
 //! name, its ALPN names, and how far to trust the certificate. The driver and
-//! its buffers (`quic-tls`'s `Storage`) are in the `Sizing`, sized by
-//! `SizingLimits.tls`. The machine in `quic` stays crypto-free; this module is
-//! where it meets TLS.
+//! what the limits fix before any certificate exists (`quic-tls`'s `Fixed`)
+//! are in the `Sizing`, sized by `SizingLimits.tls`. The handshake's flights,
+//! and a server's certificate chain, come from the same allocator as the
+//! streams, in `listen` or `connect`, sized from the certificate actually
+//! loaded. The machine in `quic` stays crypto-free; this module is where it
+//! meets TLS.
 //!
 //! What it does not do yet, by name: congestion control (it sends what the
 //! peer's flow control allows), Version Negotiation and Retry (a client drops
@@ -64,8 +67,9 @@ pub const Trust = driver.Trust;
 
 /// What `Endpoint.listen` can refuse: a certificate or key that does not load
 /// (`error.InvalidCertificate`, `error.InvalidKey`), anything that exceeds
-/// `SizingLimits.tls` (`error.NoSpace`), and an allocator that cannot supply
-/// the stream table and the pool (`error.OutOfMemory`).
+/// `SizingLimits.tls` (`error.NoSpace`), such as a certificate chain longer
+/// than `tls.chain` DER bytes, and an allocator that cannot supply the
+/// handshake's buffers, the stream table, and the pool (`error.OutOfMemory`).
 pub const ListenError = driver.LoadError || driver.Error || Allocator.Error;
 pub const AcceptError = ConnectionError || Io.ConcurrentError || TransportParameters.Error;
 pub const ConnectError = ConnectionError || Io.ConcurrentError || TransportParameters.Error ||
@@ -95,7 +99,9 @@ pub const SizingLimits = struct {
     /// One datagram, in and out, and the max_udp_payload_size advertised.
     datagram: u16 = 1500,
     /// What the handshake may carry: certificate chain, ALPN name, transport
-    /// parameters, and post-handshake messages. Four numbers of their own.
+    /// parameters, and post-handshake messages. Four numbers of their own,
+    /// each a bound on what the peer decides, and the chain one on this
+    /// endpoint's own certificate too.
     tls: driver.Limits = .{},
     /// Stream slots (`StreamSlot`, one stream's two buffers) the pool takes from
     /// the allocator in `listen` or `connect`, before anything runs. With
@@ -129,7 +135,9 @@ const parameter_capacity = 256;
 /// Every buffer one connection needs whatever it does, sized from `limits`:
 /// the loss tables and the STREAM records beside them, the CRYPTO buffers, the
 /// shell's own sent-frame records, the frame lists, the datagram scratch, and
-/// the TLS driver's storage. The streams' buffers are `StreamSlot`s, pooled.
+/// the TLS driver with what its limits fix. The streams' buffers are
+/// `StreamSlot`s, pooled, and the handshake's flights and a server's
+/// certificate chain are allocated too, by `listen` or `connect`.
 pub fn Sizing(comptime limits_given: SizingLimits) type {
     comptime {
         assert(limits_given.streams > 0);
@@ -167,32 +175,78 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         /// machine's stream state, the table's slot, and the shell's.
         pub const table_entry_bytes = @sizeOf(Conn.Stream) + @sizeOf(StreamTable.Slot) + @sizeOf(Core.Slot);
 
-        /// What `listen` or `connect` takes from a `FixedBufferAllocator`
-        /// that holds nothing else, when the parameters name no stream count:
-        /// the stream table, then the pool with `preheat` slots, or with
-        /// `peer_initial` if that is more, since each of those is armed at
-        /// once. Within alignment padding, it is exactly what they take.
-        ///
-        /// The pool keeps its slots in a `std.heap.ArenaAllocator`, which in
-        /// Zig 0.17.1 takes its first slot in a block half again as large, and
-        /// leaves one slot's room unused each time it grows that block in
-        /// place, as it does on a `FixedBufferAllocator`. So past the first,
-        /// each preheated slot costs two.
-        pub const fixed_buffer_bytes: usize = table_bytes + pool_bytes;
+        /// The alignment `listenBytes`, `connect_bytes`, and
+        /// `allocation_bytes` assume of a `FixedBufferAllocator`'s memory:
+        /// the strictest of the arrays and the pool's blocks it hands out.
+        pub const allocation_alignment: usize = @max(
+            @alignOf(StreamTable.Slot),
+            @alignOf(Conn.Stream),
+            @alignOf(Core.Slot),
+            arena_node_alignment,
+            Pool.item_alignment.toByteUnits(),
+        );
 
-        /// Three arrays, each aligned on its own.
-        const table_bytes = streams * table_entry_bytes + @alignOf(StreamTable.Slot) - 1 +
-            @alignOf(Conn.Stream) - 1 + @alignOf(Core.Slot) - 1;
+        /// Exactly what `listen` takes from a `FixedBufferAllocator` over
+        /// memory aligned to `allocation_alignment` that holds nothing else,
+        /// when the parameters name no stream count and the certificate chain
+        /// decodes to `chain` DER bytes: the handshake's buffers, the chain,
+        /// the stream table, and the pool (`reserve`). One byte less is
+        /// `error.OutOfMemory` from `listen`.
+        pub fn listenBytes(chain: u32) usize {
+            const flight = driver.Flight.lengths(limits_given.tls, .server, chain);
+            return reserve(chain + flight.total());
+        }
+
+        /// Exactly what `connect` takes, as `listenBytes` is for `listen`. A
+        /// client loads no certificate, so this is one number.
+        pub const connect_bytes: usize = reserve(driver.Flight.lengths(limits_given.tls, .client, 0).total());
+
+        /// The most `listen` or `connect` takes, the chain at its limit: the
+        /// size of memory for an endpoint whose certificate is not known when
+        /// it is compiled.
+        pub const allocation_bytes: usize = @max(listenBytes(limits_given.tls.chain), connect_bytes);
+
+        /// Where a `FixedBufferAllocator` that has handed out `handshake` bytes
+        /// of `u8` ends once `listen` or `connect` has taken the stream table,
+        /// three arrays each aligned on its own, and the pool with `preheat`
+        /// slots, or `peer_initial` if that is more, since each of those is
+        /// armed at once.
+        ///
+        /// The pool keeps its slots in a `std.heap.ArenaAllocator`, followed
+        /// here step by step as Zig 0.17.1 runs it: the first slot takes a
+        /// block half again as large as a header, the slot's alignment, the
+        /// slot, and 16 bytes, and each slot after it that does not fit grows the block in place,
+        /// as it does on a `FixedBufferAllocator`, past one slot's room the
+        /// failed attempt left unused. So past the first, a slot costs two.
+        fn reserve(handshake: usize) usize {
+            var end = handshake;
+            end = std.mem.alignForward(usize, end, @alignOf(StreamTable.Slot)) + streams * @sizeOf(StreamTable.Slot);
+            end = std.mem.alignForward(usize, end, @alignOf(Conn.Stream)) + streams * @sizeOf(Conn.Stream);
+            end = std.mem.alignForward(usize, end, @alignOf(Core.Slot)) + streams * @sizeOf(Core.Slot);
+            if (pooled == 0) return end;
+
+            const size = Pool.item_size;
+            const alignment = Pool.item_alignment.toByteUnits();
+            const node = std.mem.alignForward(usize, end, arena_node_alignment);
+            const first = arena_header + alignment + size + 16;
+            var block = std.mem.alignForward(usize, first + first / 2, 2);
+            // Offsets into the block's buffer, which starts after the header.
+            const buffer = node + arena_header;
+            var used = std.mem.alignForward(usize, buffer, alignment) - buffer + size;
+            for (1..pooled) |_| {
+                used = std.mem.alignForward(usize, buffer + used, alignment) - buffer + size;
+                if (arena_header + used <= block) continue;
+                used = std.mem.alignForward(usize, buffer + used, alignment) - buffer + size;
+                block = std.mem.alignForward(usize, arena_header + used, 2);
+            }
+            return node + block;
+        }
+
         const pooled: usize = @max(limits_given.preheat, limits_given.peer_initial);
-        /// The arena's block header, three words in Zig 0.17.1.
+        /// The arena's block header, three words in Zig 0.17.1, and its
+        /// alignment.
         const arena_header = 3 * @sizeOf(usize);
-        /// The arena's first block, sized for one slot and half again.
-        const first_block = block: {
-            const wanted = arena_header + Pool.item_alignment.toByteUnits() + Pool.item_size + 16;
-            break :block std.mem.alignForward(usize, wanted + wanted / 2, 2);
-        };
-        const pool_bytes = if (pooled == 0) 0 else @alignOf(usize) - 1 +
-            @max(first_block, arena_header + (2 * pooled - 1) * Pool.item_size);
+        const arena_node_alignment = @alignOf(usize);
 
         loss_state: Recovery = .{},
         spaces: [3]Recovery.Space = undefined,
@@ -228,8 +282,9 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         control: [streams + 3]frame.Frame = undefined,
         offers: [streams]Conn.Offer = undefined,
         written: [streams]Conn.Written = undefined,
-        /// The TLS driver and every buffer it writes into.
-        tls: driver.Storage(limits_given.tls) = undefined,
+        /// The TLS driver and what the limits fix of its storage. Its flights
+        /// are the endpoint's, from the allocator.
+        tls: driver.Fixed(limits_given.tls) = undefined,
 
         fn prepare(self: *Self) void {
             self.loss_state = .{};
@@ -313,8 +368,14 @@ pub fn Endpoint(comptime S: type) type {
         core: Core,
         driver: quic.handshake.Driver,
         parameters: TransportParameters,
-        /// What the stream table and the pool come from, until `deinit`.
+        /// What the handshake's buffers, the stream table, and the pool come
+        /// from, until `deinit`.
         allocator: Allocator,
+        /// The handshake's flights, `driver.Flight.lengths` of each.
+        flight: driver.Flight,
+        /// A server's certificate chain, exactly the DER bytes it decoded to.
+        /// Empty for a client.
+        chain: []u8,
         /// Every stream's buffers. A slot destroyed goes back on the pool's
         /// free list, never to the allocator, until `deinit`.
         pool: S.Pool,
@@ -326,8 +387,8 @@ pub fn Endpoint(comptime S: type) type {
             io: Io,
             /// A bound UDP socket. The endpoint owns it: `deinit` closes it.
             socket: Io.net.Socket,
-            /// The certificate chain, leaf first, in PEM. Decoded into the
-            /// sizing, so it need not outlive `listen`.
+            /// The certificate chain, leaf first, in PEM. Decoded into memory
+            /// from the allocator, so it need not outlive `listen`.
             certificate: []const u8,
             /// The private key for the leaf, in PEM, likewise.
             key: []const u8,
@@ -362,42 +423,81 @@ pub fn Endpoint(comptime S: type) type {
         /// loaded. Nothing is read until `accept`. The endpoint owns the socket
         /// from here, so `deinit` follows a failed `listen` too.
         ///
-        /// `allocator` is where streams come from, and its failure is the one
-        /// new way to fail. Here and in `connect` it supplies the stream table
-        /// (`S.table_entry_bytes` for each of `streams`) and the pool, which
-        /// takes `preheat` slots at once and hands the peer's credit
-        /// (`peer_initial`, or the parameters' stream counts) a slot each.
+        /// `allocator` is where the handshake's buffers and the streams come
+        /// from, and its failure is the one new way to fail. Here and in
+        /// `connect` it supplies, in this order:
+        ///
+        /// 1. A server's certificate chain, exactly the DER bytes it decodes
+        ///    to. It is decoded first into no more than `tls.chain` bytes, or
+        ///    the PEM's length if that is less, and shrunk to fit; a chain
+        ///    longer than `tls.chain` is `error.NoSpace`, before anything else
+        ///    is taken.
+        /// 2. The handshake's flights, `driver.Flight.lengths` of each: what
+        ///    this endpoint composes (a server's flight follows from its
+        ///    chain), and where the peer's Initial and Handshake messages are
+        ///    reassembled (they follow from `tls`).
+        /// 3. The stream table, `S.table_entry_bytes` for each of `streams`.
+        /// 4. The pool, which takes `preheat` slots at once and hands the
+        ///    peer's credit (`peer_initial`, or the parameters' stream counts)
+        ///    a slot each.
+        ///
         /// After that it is called only when `openStream` or `acceptStream`
         /// finds the pool empty (`S.StreamSlot`, two `stream_ring` buffers),
         /// from whichever task holds the connection's mutex, and never because
         /// of anything the peer sends. A slot freed goes back to the pool, not
-        /// to the allocator.
+        /// to the allocator; everything goes back at `deinit`.
         ///
-        /// So a `FixedBufferAllocator` over `S.fixed_buffer_bytes` bytes, with
-        /// `preheat` at least the slots in use at once, is the old bounded
-        /// endpoint with no heap at all, through this same API: every byte
-        /// reserved up front, nothing allocated once it runs, and an open past
-        /// the reserve `error.OutOfMemory` rather than a surprise. Slots in use
-        /// at once are the live streams plus the peer's backlog
+        /// So a `FixedBufferAllocator` with `preheat` at least the slots in use
+        /// at once is an endpoint with no heap at all, through this same API:
+        /// every byte reserved up front, nothing allocated once it runs, and an
+        /// open past the reserve `error.OutOfMemory` rather than a surprise.
+        /// Slots in use at once are the live streams plus the peer's backlog
         /// (`peer_initial`): a client making N requests one after another
         /// needs `1 + peer_initial`, and a server answering N peer streams at
         /// once `N + peer_initial`.
         ///
-        /// The reserve is the table, `streams * S.table_entry_bytes`, and the
-        /// pool: one and a half slots for the first slot and two for each
-        /// after it, because the pool's arena leaves a slot's room behind each
-        /// time it grows in place (Zig 0.17.1). With the default limits and
-        /// `preheat = 2` that is 2,944 + 24,600 = 27,544 bytes, which
-        /// `S.fixed_buffer_bytes` (27,568) covers with alignment to spare. The
-        /// allocator is the endpoint's alone: give each endpoint its own.
+        /// The reserve, over memory aligned to `S.allocation_alignment` and
+        /// when the parameters name no stream count, is `S.listenBytes(chain)`
+        /// for a chain of `chain` DER bytes, `S.connect_bytes` for a client,
+        /// and `S.allocation_bytes`, the larger of them with the chain at its
+        /// limit, when the certificate is not known until run time. Each is
+        /// exact: one byte less is `error.OutOfMemory` from `listen` or
+        /// `connect`. It is the four steps above, each aligned to what it
+        /// holds:
+        ///
+        ///     chain + Flight.lengths(tls, role, chain).total()
+        ///         + streams * S.table_entry_bytes
+        ///         + 24 + (2 * slots - 1) * @sizeOf(S.StreamSlot)
+        ///
+        /// where `slots` is `max(preheat, peer_initial)`, at least two, and 24
+        /// is the header of the pool's arena block. The arena leaves one
+        /// slot's room behind each time it grows that block in place (Zig
+        /// 0.17.1), so past the first a slot costs two. A single slot takes the
+        /// arena's first block instead, half again `24 + 8 + slot + 16`
+        /// (12,360 bytes with the default ring), and none takes nothing.
+        ///
+        /// For one concurrent peer stream, a server answering one stream at a
+        /// time with the default limits needs two slots (`preheat = 2`, which
+        /// `peer_initial = 1` makes `1 + 1`). With tls's fixture certificate
+        /// (411 DER bytes) `listen` takes 411 + 10,317 of handshake (out 1,622,
+        /// peer Initial 3,201, peer Handshake 5,307, ServerHello 187), then
+        /// 4 * 736 = 2,944 of table, then 24 + 3 * 8,192 = 24,600 of pool:
+        /// `S.listenBytes(411)` = 38,272. The client's `connect` takes 11,709
+        /// of handshake (out 3,201, peer Initial 3,201, peer Handshake 5,307),
+        /// 3 of alignment, and the same table and pool: `S.connect_bytes` =
+        /// 39,256. With the chain at its 4,096-byte limit, `S.allocation_bytes`
+        /// = 45,648. The allocator is the endpoint's alone: give each endpoint
+        /// its own.
         pub fn listen(self: *Self, allocator: Allocator, config: Listen) ListenError!void {
             const nowhere: IpAddress = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
-            try self.prepare(allocator, config.io, config.socket, nowhere, config.parameters);
-            const credentials = try self.sizing.tls.credentials(config.certificate, config.key);
+            self.prepare(allocator, config.io, config.socket, nowhere, config.parameters);
+            const credentials = try self.loadCredentials(config.certificate, config.key);
+            try self.allocateFlight(.server);
             self.driver = try self.startTls(config.io, .{ .server = .{
                 .credentials = credentials,
                 .alpn = config.alpn,
             } });
+            try self.allocateStreams();
         }
 
         /// Wait for a client's first Initial, build the connection from it,
@@ -440,12 +540,14 @@ pub fn Endpoint(comptime S: type) type {
         /// `connect` too. `allocator` is as in `listen`.
         pub fn connect(self: *Self, allocator: Allocator, config: Connect) ConnectError!Connection {
             const io = config.io;
-            try self.prepare(allocator, io, config.socket, config.peer, config.parameters);
+            self.prepare(allocator, io, config.socket, config.peer, config.parameters);
+            try self.allocateFlight(.client);
             self.driver = try self.startTls(io, .{ .client = .{
                 .policy = config.trust.policy(),
                 .server_name = config.server_name,
                 .alpn = config.alpn,
             } });
+            try self.allocateStreams();
             const sizing = &self.sizing;
             io.random(&sizing.original_id);
             io.random(&sizing.own_id);
@@ -473,6 +575,11 @@ pub fn Endpoint(comptime S: type) type {
             self.allocator.free(self.core.storage.slots);
             self.allocator.free(self.core.storage.streams);
             self.allocator.free(self.table);
+            self.allocator.free(self.flight.server_hello);
+            self.allocator.free(self.flight.peer_handshake);
+            self.allocator.free(self.flight.peer_initial);
+            self.allocator.free(self.flight.out);
+            self.allocator.free(self.chain);
             self.* = undefined;
         }
 
@@ -483,7 +590,7 @@ pub fn Endpoint(comptime S: type) type {
             socket: Io.net.Socket,
             peer: IpAddress,
             parameters: TransportParameters,
-        ) Allocator.Error!void {
+        ) void {
             self.sizing.prepare();
             self.parameters = S.advertised(parameters);
             // §4.6: credit the table cannot back turns a legal peer into a
@@ -492,8 +599,10 @@ pub fn Endpoint(comptime S: type) type {
             const uni = self.parameters.initial_max_streams_uni orelse 0;
             assert(bidi + uni <= S.limits.streams);
             // Empty first, so `deinit` frees what exists whichever allocation
-            // below fails.
+            // after this fails.
             self.allocator = allocator;
+            self.flight = .empty;
+            self.chain = &.{};
             self.pool = .empty;
             self.pool_capacity = 0;
             self.table = &.{};
@@ -508,15 +617,46 @@ pub fn Endpoint(comptime S: type) type {
                 .pool = .{ .context = self, .create = createSlot, .destroy = destroySlot },
                 .peer_streams = .{ .bidi = bidi, .uni = uni },
             });
-            try self.allocateStreams();
-            // §4.6: every stream the peer may open has its buffers before the
-            // first datagram can open it.
-            try self.core.arm(@intCast(bidi + uni));
+        }
+
+        /// Decode the certificate chain into exactly the bytes it takes, and
+        /// load the key. The chain is decoded first into no more than the PEM
+        /// (which always holds its DER) or `tls.chain`, whichever is less, and
+        /// that is then shrunk to fit: in place where the allocator can, which
+        /// a `FixedBufferAllocator` always can for its newest allocation, and
+        /// otherwise by decoding again into an allocation of the exact size.
+        fn loadCredentials(self: *Self, certificate: []const u8, key: []const u8) ListenError!driver.Credentials {
+            const tls = &self.sizing.tls;
+            self.chain = try self.allocator.alloc(u8, @min(certificate.len, S.limits.tls.chain));
+            const used = try tls.decodeChain(self.chain, certificate);
+            if (self.allocator.resize(self.chain, used)) {
+                self.chain = self.chain[0..used];
+            } else {
+                self.allocator.free(self.chain);
+                self.chain = &.{};
+                self.chain = try self.allocator.alloc(u8, used);
+                const again = try tls.decodeChain(self.chain, certificate);
+                assert(again == used);
+            }
+            try tls.loadKey(key);
+            return tls.credentials();
+        }
+
+        /// The handshake's flights, before the stream table, so the pool is
+        /// still the newest allocation once they are taken. A server's follow
+        /// from the chain it loaded.
+        fn allocateFlight(self: *Self, role: driver.Role) Allocator.Error!void {
+            const lengths = driver.Flight.lengths(S.limits.tls, role, @intCast(self.chain.len));
+            self.flight.out = try self.allocator.alloc(u8, lengths.out);
+            self.flight.peer_initial = try self.allocator.alloc(u8, lengths.peer_initial);
+            self.flight.peer_handshake = try self.allocator.alloc(u8, lengths.peer_handshake);
+            self.flight.server_hello = try self.allocator.alloc(u8, lengths.server_hello);
         }
 
         /// The stream table whole, then the pool: last, so that on a
         /// `FixedBufferAllocator` the pool's block is the newest allocation and
-        /// grows in place.
+        /// grows in place. Then every stream the peer may open has its buffers
+        /// before the first datagram can open it (§4.6).
         fn allocateStreams(self: *Self) Allocator.Error!void {
             const count = S.limits.streams;
             self.table = try self.allocator.alloc(StreamTable.Slot, count);
@@ -528,6 +668,9 @@ pub fn Endpoint(comptime S: type) type {
             self.core.attach(streams, slots);
             self.pool = try .initCapacity(self.allocator, S.limits.preheat);
             self.pool_capacity = S.limits.preheat;
+            const bidi = self.parameters.initial_max_streams_bidi orelse 0;
+            const uni = self.parameters.initial_max_streams_uni orelse 0;
+            try self.core.arm(@intCast(bidi + uni));
         }
 
         /// `Core.Pool.create`: a slot off the free list, or a new one.
@@ -549,12 +692,13 @@ pub fn Endpoint(comptime S: type) type {
             self.pool.destroy(@alignCast(slot));
         }
 
-        /// Build the handshake in the sizing. The Hello random and the ephemeral
-        /// keys come from the platform, never from a constant.
+        /// Build the handshake in the sizing, over the flights. The Hello
+        /// random and the ephemeral keys come from the platform, never from a
+        /// constant.
         fn startTls(self: *Self, io: Io, config: driver.Config) driver.Error!quic.handshake.Driver {
             var random: [32]u8 = undefined;
             io.random(&random);
-            return self.sizing.tls.start(config, random);
+            return self.sizing.tls.start(self.flight, config, random);
         }
 
         /// A server's machine, named by the client's first Initial (§7.2),
@@ -1085,6 +1229,92 @@ test "RFC 9000 §8.1, a first datagram that does not open leaves the endpoint as
     try testing.expect(test_endpoint.core.peer.eql(&sender.address));
 }
 
+// -- The handshake's buffers -------------------------------------------------
+//
+// What `listen` and `connect` take from the allocator for TLS, and when they
+// give it back.
+
+/// tls's fixture certificate, in the DER bytes it decodes to.
+const test_chain = 411;
+
+/// A sizing whose chain limit is one byte short of the fixture's.
+var test_short: Endpoint(Sizing(.{ .tls = .{ .chain = test_chain - 1 } })) = undefined;
+
+test "RFC 8446 §4.4.2, a certificate longer than tls.chain fails listen with NoSpace, not a truncation" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const any: IpAddress = .{ .ip4 = .loopback(0) };
+
+    var counted: testing.FailingAllocator = .init(testing.allocator, .{});
+    try testing.expectError(error.NoSpace, test_short.listen(counted.allocator(), .{
+        .io = io,
+        .socket = try any.bind(io, .{ .mode = .dgram }),
+        .certificate = test_certificate,
+        .key = test_key,
+    }));
+    // Decoding stopped at the limit: never more than it was asked for, and
+    // nothing after it, no flight and no streams.
+    try testing.expectEqual(1, counted.allocations);
+    try testing.expectEqual(test_chain - 1, counted.allocated_bytes);
+    test_short.deinit(io);
+    try testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+}
+
+test "the handshake's buffers come from the allocator at listen and connect, sized from the certificate, and go back" {
+    var threaded: Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const any: IpAddress = .{ .ip4 = .loopback(0) };
+    const S = Sizing(.{});
+
+    var server_counted: testing.FailingAllocator = .init(testing.allocator, .{});
+    const listening = try any.bind(io, .{ .mode = .dgram });
+    try test_endpoint.listen(server_counted.allocator(), .{
+        .io = io,
+        .socket = listening,
+        .certificate = test_certificate,
+        .key = test_key,
+    });
+    // The chain is the certificate's DER exactly, and the flight follows from
+    // it, not from the limit.
+    const server_flight = driver.Flight.lengths(S.limits.tls, .server, test_chain);
+    try testing.expectEqual(test_chain, test_endpoint.chain.len);
+    try testing.expectEqual(server_flight.out, test_endpoint.flight.out.len);
+    try testing.expectEqual(server_flight.peer_handshake, test_endpoint.flight.peer_handshake.len);
+    try testing.expectEqual(server_flight.server_hello, test_endpoint.flight.server_hello.len);
+    try testing.expect(server_flight.out < driver.Flight.lengths(S.limits.tls, .server, S.limits.tls.chain).out);
+    const outstanding = server_counted.allocated_bytes - server_counted.freed_bytes;
+    try testing.expect(outstanding >= test_chain + server_flight.total());
+    test_endpoint.deinit(io);
+    try testing.expectEqual(server_counted.allocated_bytes, server_counted.freed_bytes);
+    try testing.expectEqual(server_counted.allocations, server_counted.deallocations);
+
+    // A client that gets no answer: its handshake ends on the idle timeout,
+    // or on the port refusing it, and its memory goes back all the same.
+    var client_counted: testing.FailingAllocator = .init(testing.allocator, .{});
+    const nobody = try any.bind(io, .{ .mode = .dgram });
+    const nowhere = nobody.address;
+    nobody.close(io);
+    const client_flight = driver.Flight.lengths(S.limits.tls, .client, 0);
+    if (test_endpoint.connect(client_counted.allocator(), .{
+        .io = io,
+        .socket = try any.bind(io, .{ .mode = .dgram }),
+        .peer = nowhere,
+        .trust = .insecure,
+        .parameters = .{ .max_idle_timeout = 50 },
+    })) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try testing.expectEqual(0, test_endpoint.chain.len);
+    try testing.expectEqual(client_flight.out, test_endpoint.flight.out.len);
+    try testing.expectEqual(0, test_endpoint.flight.server_hello.len);
+    test_endpoint.deinit(io);
+    try testing.expect(client_counted.allocated_bytes >= client_flight.total());
+    try testing.expectEqual(client_counted.allocated_bytes, client_counted.freed_bytes);
+    try testing.expectEqual(client_counted.allocations, client_counted.deallocations);
+}
+
 // -- The application level's CRYPTO buffers ----------------------------------
 //
 // Two machines over two `Sizing`s, wired as `Endpoint.machine` wires one, with
@@ -1094,21 +1324,29 @@ test "RFC 9000 §8.1, a first datagram that does not open leaves the endpoint as
 const TestSizing = Sizing(.{});
 var test_client_sizing: TestSizing = undefined;
 var test_server_sizing: TestSizing = undefined;
+/// Each driver with its flights inline, which is all an endpoint adds to the
+/// sizing's `tls`: the machines here are wired by hand.
+var test_client_tls: driver.Storage(TestSizing.limits.tls) = undefined;
+var test_server_tls: driver.Storage(TestSizing.limits.tls) = undefined;
 var test_client: Conn = undefined;
 var test_server: Conn = undefined;
 
-/// Build both machines and run their handshake to the end. `deinit` both
-/// sizings' `tls` afterwards.
+/// Build both machines and run their handshake to the end. `deinit`
+/// `test_client_tls` and `test_server_tls` afterwards.
 fn testHandshake() !void {
     const client = &test_client_sizing;
     const server = &test_server_sizing;
     client.prepare();
     server.prepare();
+    test_client_tls.init();
+    test_server_tls.init();
     const alpn: []const []const u8 = &.{"hq-interop"};
     const trust: Trust = .insecure;
-    const credentials = try server.tls.credentials(test_certificate, test_key);
-    const server_tls = try server.tls.start(.{ .server = .{ .credentials = credentials, .alpn = alpn } }, @splat(0x22));
-    const client_tls = try client.tls.start(.{ .client = .{ .policy = trust.policy(), .alpn = alpn } }, @splat(0x11));
+    const credentials = try test_server_tls.credentials(test_certificate, test_key);
+    const server_role: driver.Config = .{ .server = .{ .credentials = credentials, .alpn = alpn } };
+    const server_tls = try test_server_tls.start(server_role, @splat(0x22));
+    const client_role: driver.Config = .{ .client = .{ .policy = trust.policy(), .alpn = alpn } };
+    const client_tls = try test_client_tls.start(client_role, @splat(0x11));
 
     client.original_id = @splat(0xc0);
     client.own_id = @splat(0xc1);
@@ -1142,8 +1380,8 @@ fn testHandshake() !void {
         const finished = try testCarry(&test_client, client, &test_server, server);
         if (!answered and !finished) break;
     }
-    try testing.expect(client.tls.engine.done());
-    try testing.expect(server.tls.engine.done());
+    try testing.expect(test_client_tls.fixed.engine.done());
+    try testing.expect(test_server_tls.fixed.engine.done());
 }
 
 fn testParameters(
@@ -1198,10 +1436,10 @@ fn testTicket(comptime len: u32) [len]u8 {
 
 test "RFC 8446 §4.6, a post-handshake message of tls.post_handshake bytes arrives, one byte more is NoSpace" {
     try testHandshake();
-    defer test_client_sizing.tls.deinit();
-    defer test_server_sizing.tls.deinit();
+    defer test_client_tls.deinit();
+    defer test_server_tls.deinit();
     const limit = TestSizing.limits.tls.post_handshake;
-    const client_tls = &test_client_sizing.tls.engine.engine.client;
+    const client_tls = &test_client_tls.fixed.engine.engine.client;
 
     // Exactly the limit, in one frame: the ring and the driver each hold it.
     try testServerCrypto(0, &testTicket(limit));

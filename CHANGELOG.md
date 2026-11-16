@@ -338,6 +338,25 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- `quic-io`'s TLS handshake buffers come from the allocator `listen` and
+  `connect` take, and `Sizing(.{})` drops from 61,256 to 44,192 bytes. The
+  flights (`quic-tls`'s `Flight`: what the driver composes, the peer's Initial
+  and Handshake reassembly, the ServerHello) and a server's certificate chain
+  are allocated there and freed at `deinit`; the chain takes exactly the DER
+  bytes it decodes to, and one longer than `SizingLimits.tls.chain` is still
+  `error.NoSpace` from `listen`. `Sizing.fixed_buffer_bytes` is gone: a
+  `FixedBufferAllocator` over memory aligned to `allocation_alignment` takes
+  exactly `listenBytes(chain)` or `connect_bytes`, or `allocation_bytes` when
+  the certificate is only known at run time, and one byte less is
+  `error.OutOfMemory`.
+- `quic-tls`: `Fixed(limits)` is the part of a driver's storage the limits fix
+  before any certificate exists, and `Fixed.start` takes the handshake's
+  buffers as a `Flight` of `Flight.lengths(limits, role, chain)`.
+  `Storage(limits)` still holds everything inline, with no allocator, and its
+  engine is now `storage.fixed.engine`. `Tls.init` still takes `Buffers`.
+- `quic-tls` sizes a flight with the transport parameters extension the
+  EncryptedExtensions carries (RFC 9001 §8.2), which it left out, so
+  `Storage(.{})` grows from 22,720 to 23,760 bytes.
 - `quic-io`'s application-level CRYPTO buffers follow what that level
   carries, and `Sizing(.{})` drops from 68,936 to 61,256 bytes.
   `SizingLimits.crypto` now sizes the Initial and Handshake levels only. The

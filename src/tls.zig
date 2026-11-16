@@ -35,6 +35,9 @@
 //! is no allocator, and the only entropy is the platform CSPRNG for the two
 //! messages' random fields and the ephemeral keypairs. `Storage(limits)` owns
 //! those buffers, sized from four numbers (`Limits`), and the engine with them.
+//! A caller that would rather not hold the handshake's flight buffers for a
+//! connection's whole life keeps `Fixed(limits)` and hands `Fixed.start` a
+//! `Flight` of `Flight.lengths`, from wherever it likes.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -127,10 +130,12 @@ pub const Error = seam.Error || core.Error;
 
 pub const Credentials = core.Credentials;
 
-/// Why `Storage.credentials` refused a certificate or key.
+/// Why `Storage.credentials`, `Fixed.decodeChain`, or `Fixed.loadKey` refused
+/// a certificate or key.
 pub const LoadError = error{
-    /// The chain is longer than `Limits.chain`, or has more than
-    /// `max_certificates` certificates.
+    /// The chain decodes to more than `Limits.chain` DER bytes, or to more
+    /// than the buffer it was handed, or has more than `max_certificates`
+    /// certificates.
     NoSpace,
     /// No certificate in the PEM, or one that does not decode.
     InvalidCertificate,
@@ -161,16 +166,18 @@ pub const Trust = union(enum) {
     }
 };
 
-/// The four numbers a caller chooses. Every buffer the driver needs follows
-/// from them (`Storage`). Each is a bound on something the peer, or the
-/// caller's own certificate, decides, so each is checked where it is used: a
-/// handshake that exceeds one fails with `error.NoSpace`, never a truncation.
+/// The four numbers a caller chooses: what has to be bounded before any
+/// certificate exists, because the peer decides it. Every buffer the driver
+/// needs follows from them and from this endpoint's own certificate
+/// (`Fixed`, `Flight.lengths`). Each is checked where it is used: a handshake
+/// that exceeds one fails with `error.NoSpace`, never a truncation.
 pub const Limits = struct {
     /// The longest certificate chain, in DER bytes summed over its
-    /// certificates: this endpoint's own as a server (and as a client that
-    /// authenticates), and the longest it will take from a peer. The PEM
-    /// file's length is a safe over-estimate. The framing TLS adds, up to
-    /// `max_certificates` certificates of it, is allowed for on top.
+    /// certificates, that the peer's flight may carry: it sizes the buffer the
+    /// peer's Handshake-level messages are reassembled in (`Flight.lengths`),
+    /// with the framing TLS adds and the flight's other messages at their
+    /// longest allowed for on top. This endpoint's own chain is held to it
+    /// too, and is stored in as many bytes as it decodes to.
     chain: u32 = 4096,
     /// The longest ALPN protocol name, in bytes, offered or selected.
     alpn: u8 = 32,
@@ -215,39 +222,90 @@ const server_hello_len = 76 + 6 + 105;
 
 /// The largest ClientHello either side handles, which the server holds whole
 /// until it answers.
-fn helloLen(comptime limits: Limits) usize {
+fn helloLen(limits: Limits) usize {
     return hybrid_share_len + hello_slack + limits.parameters;
 }
 
-/// The largest flight of handshake messages at one level, mirroring the
-/// bound `core.Server.flightBufferLen` demands of a server's buffer: the
-/// EncryptedExtensions, a CertificateRequest, the Certificate, a
+/// The largest flight of handshake messages at one level carrying a chain of
+/// `chain` DER bytes, mirroring the bound `core.Server.flightBufferLen` demands
+/// of a server's buffer once the transport parameters are set: the
+/// EncryptedExtensions with the ALPN name and the transport parameters
+/// extension (RFC 9001 §8.2), a CertificateRequest, the Certificate, a
 /// CertificateVerify sized for an RSA-4096 signature, and the Finished.
-fn flightLen(comptime limits: Limits) usize {
-    const encrypted_extensions = 4 + 2 + 4 + 2 + 1 + limits.alpn;
+fn flightLen(limits: Limits, chain: u32) usize {
+    const encrypted_extensions = 4 + 2 + (4 + 2 + 1 + @as(usize, limits.alpn)) + (4 + @as(usize, limits.parameters));
     const certificate_request = 4 + 1 + 2 + 2 + 2 + 2 + 2 * max_signature_schemes;
-    const certificate = 4 + 1 + 3 + (3 + 2) * max_certificates + limits.chain;
+    const certificate = 4 + 1 + 3 + (3 + 2) * max_certificates + @as(usize, chain);
     const certificate_verify = 4 + 2 + 1 + 2 + 512;
     const finished = 36;
     return encrypted_extensions + certificate_request + certificate + certificate_verify + finished;
 }
 
-/// A TLS driver and every buffer it writes into, computed from `limits` and
-/// owned in place. A caller writes
+/// The buffers only the handshake needs, which hold its flights: where the
+/// driver composes this endpoint's (`out`, and a server's `server_hello`), and
+/// where it reassembles the peer's at the Initial and Handshake levels (§19.6
+/// of RFC 9000). `Storage(limits)` holds them inline at their largest; a
+/// caller that takes them from an allocator takes `Flight.lengths` of each,
+/// which for a server follows from the certificate it actually loaded.
+pub const Flight = struct {
+    out: []u8,
+    peer_initial: []u8,
+    peer_handshake: []u8,
+    /// Empty for a client.
+    server_hello: []u8,
+
+    pub const empty: Flight = .{ .out = &.{}, .peer_initial = &.{}, .peer_handshake = &.{}, .server_hello = &.{} };
+
+    pub const Lengths = struct {
+        out: usize,
+        peer_initial: usize,
+        peer_handshake: usize,
+        server_hello: usize,
+
+        pub fn total(self: Lengths) usize {
+            return self.out + self.peer_initial + self.peer_handshake + self.server_hello;
+        }
+    };
+
+    /// What each buffer must hold for `role` under `limits`, when this
+    /// endpoint's own chain decodes to `chain` DER bytes: zero for a client
+    /// that does not authenticate.
+    ///
+    /// - `out`: a server's whole flight with that chain, or a client's
+    ///   ClientHello, or its own Certificate flight when it has one.
+    /// - `peer_initial`: the peer's ClientHello or ServerHello, at the longest
+    ///   ClientHello these limits allow.
+    /// - `peer_handshake`: the peer's flight with a chain of `limits.chain`.
+    /// - `server_hello`: a server's ServerHello.
+    pub fn lengths(limits: Limits, role: Role, chain: u32) Lengths {
+        assert(chain <= limits.chain);
+        const own = flightLen(limits, chain);
+        return .{
+            .out = switch (role) {
+                .server => own,
+                .client => if (chain == 0) helloLen(limits) else @max(helloLen(limits), own),
+            },
+            .peer_initial = helloLen(limits),
+            .peer_handshake = flightLen(limits, limits.chain),
+            .server_hello = switch (role) {
+                .server => server_hello_len,
+                .client => 0,
+            },
+        };
+    }
+};
+
+/// The part of a TLS driver's storage the limits fix before any certificate
+/// exists: the engine, the core's output queue, the post-handshake
+/// reassembly, both ends' transport parameters, the ALPN name, the chain's
+/// slots, and the key. The handshake's flights are a `Flight` handed to
+/// `start`, and a server's chain bytes the buffer handed to `decodeChain`;
+/// both must outlive the driver.
 ///
-///     var storage: Storage(.{}) = undefined;
-///     storage.init();
-///     defer storage.deinit();
-///     const handshake = try storage.start(config, random);
-///
-/// and hands `handshake` to a machine. Built in place and never moved: the
-/// engine, and the machine holding its driver, point into this struct.
-///
-/// A caller reads `engine` (the handshake's outcome: `selectedAlpn`,
-/// `peerTransportParameters`, `done`). Every other field is the engine's
-/// backing, or what the loaded credentials point into, and is not the
-/// caller's.
-pub fn Storage(comptime limits: Limits) type {
+/// Built in place and never moved: the engine, and the machine holding its
+/// driver, point into this struct. A caller reads `engine`; every other field
+/// is the engine's backing.
+pub fn Fixed(comptime limits: Limits) type {
     comptime {
         assert(limits.chain > 0);
         assert(limits.alpn > 0);
@@ -255,46 +313,46 @@ pub fn Storage(comptime limits: Limits) type {
         // A handshake message has a four-byte header.
         assert(limits.post_handshake >= 4);
     }
-    // A server composes its whole flight in `out`; a client composes its
-    // ClientHello there.
-    const out_len = @max(flightLen(limits), helloLen(limits));
 
     return struct {
         const Self = @This();
 
         engine: Tls,
         slots: [output_slots]tls.level.Output,
-        out: [out_len]u8,
-        peer_initial: [helloLen(limits)]u8,
-        peer_handshake: [flightLen(limits)]u8,
         peer_app: [limits.post_handshake]u8,
         peer_shares: [core.peer_share_storage_len]u8,
         extension_slots: [1]tls.extension_type.ExtraExtension,
         our_parameters: [limits.parameters]u8,
         peer_parameters: [limits.parameters]u8,
         selected_alpn: [limits.alpn]u8,
-        server_hello: [server_hello_len]u8,
-        chain_der: [limits.chain]u8,
         chain_slots: [max_certificates][]const u8,
-        /// Loaded by `credentials`, freed by `deinit`.
+        /// How many of `chain_slots` the decoded chain fills.
+        chain_count: u8,
+        /// Loaded by `loadKey`, freed by `deinit`.
         key: ?tls.signature.PrivateKey,
         running: bool,
 
-        /// Put the storage in its empty state: no key loaded, no engine
-        /// running. `deinit` is safe from here on.
+        /// Put the storage in its empty state: no chain or key loaded, no
+        /// engine running. `deinit` is safe from here on.
         pub fn init(self: *Self) void {
+            self.chain_count = 0;
             self.key = null;
             self.running = false;
         }
 
-        /// Decode a PEM certificate chain and private key into this storage,
-        /// for a `Config.server`. The PEM bytes are not kept; the key is, until
-        /// `deinit`.
-        pub fn credentials(self: *Self, certificate_pem: []const u8, key_pem: []const u8) LoadError!Credentials {
-            assert(self.key == null);
+        /// Decode a PEM certificate chain into `der`, which it borrows until
+        /// `deinit`. Returns how many DER bytes it took: the chain is
+        /// `der[0..n]`, and a caller that took `der` from an allocator may
+        /// shrink it to that. A chain that does not fit `der` is
+        /// `error.NoSpace`, and `der` is never longer than `Limits.chain`, so
+        /// neither is a chain. Decoding again replaces the chain.
+        pub fn decodeChain(self: *Self, der: []u8, certificate_pem: []const u8) LoadError!u32 {
+            assert(der.len <= limits.chain);
+            assert(!self.running);
+            self.chain_count = 0;
             const chain = tls.certificate_chain.CertificateChain.fromPem(
                 certificate_pem,
-                &self.chain_der,
+                der,
                 &self.chain_slots,
             ) catch |err| return switch (err) {
                 error.CertificateBufferTooShort, error.CertificateChainTooLong => error.NoSpace,
@@ -303,18 +361,42 @@ pub fn Storage(comptime limits: Limits) type {
                 error.InvalidCertificateEncoding,
                 => error.InvalidCertificate,
             };
-            self.key = tls.signature.PrivateKey.fromPemAuto(key_pem) catch return error.InvalidKey;
-            return .{ .chain = chain, .signer = self.key.?.signer() };
+            const certificates = chain.slice;
+            var length: u32 = 0;
+            for (certificates) |certificate| {
+                // `fromPem` decodes each certificate right after the last.
+                assert(certificate.ptr == der.ptr + length);
+                length += @intCast(certificate.len);
+            }
+            self.chain_count = @intCast(certificates.len);
+            return length;
         }
 
-        /// Build the engine and return its driver. `config` is borrowed for the
-        /// driver's lifetime: its ALPN names, server name, and credentials must
-        /// outlive it. A protocol name longer than `Limits.alpn`, or a server's
-        /// flight that does not fit, is `error.NoSpace` here, before any
-        /// handshake byte moves. `random` is the platform's entropy, never a
-        /// constant: it is the Hello random, and a repeat is forbidden (RFC 8446
-        /// §4.1.2).
-        pub fn start(self: *Self, config: Config, random: [32]u8) Error!seam.Driver {
+        /// Decode the PEM private key for the chain's leaf. It is kept until
+        /// `deinit`.
+        pub fn loadKey(self: *Self, key_pem: []const u8) LoadError!void {
+            assert(self.key == null);
+            self.key = tls.signature.PrivateKey.fromPemAuto(key_pem) catch return error.InvalidKey;
+        }
+
+        /// The decoded chain and the loaded key, for a `Config.server`.
+        pub fn credentials(self: *Self) Credentials {
+            assert(self.chain_count > 0);
+            return .{
+                .chain = .init(self.chain_slots[0..self.chain_count]),
+                .signer = self.key.?.signer(),
+            };
+        }
+
+        /// Build the engine over `flight` and return its driver. `config` is
+        /// borrowed for the driver's lifetime: its ALPN names, server name, and
+        /// credentials must outlive it, as must `flight`. A protocol name
+        /// longer than `Limits.alpn`, or a `flight` shorter than
+        /// `Flight.lengths` asks, is `error.NoSpace` here or at the moment of
+        /// use, never a truncation. `random` is the platform's entropy, never
+        /// a constant: it is the Hello random, and a repeat is forbidden (RFC
+        /// 8446 §4.1.2).
+        pub fn start(self: *Self, flight: Flight, config: Config, random: [32]u8) Error!seam.Driver {
             assert(!self.running);
             const names = switch (config) {
                 inline else => |role| role.alpn,
@@ -324,10 +406,10 @@ pub fn Storage(comptime limits: Limits) type {
             }
             self.engine = try .init(.{
                 .slots = &self.slots,
-                .out = &self.out,
+                .out = flight.out,
                 .peer_bytes = .{
-                    .initial = &self.peer_initial,
-                    .handshake = &self.peer_handshake,
+                    .initial = flight.peer_initial,
+                    .handshake = flight.peer_handshake,
                     .app = &self.peer_app,
                 },
                 .peer_shares = &self.peer_shares,
@@ -335,19 +417,88 @@ pub fn Storage(comptime limits: Limits) type {
                 .our_parameters = &self.our_parameters,
                 .peer_parameters = &self.peer_parameters,
                 .alpn = &self.selected_alpn,
-                .server_hello = &self.server_hello,
+                .server_hello = flight.server_hello,
             }, config, random);
             self.running = true;
             return self.engine.driver();
         }
 
         /// Zero the secrets and free the key. Safe after `init`, whether or not
-        /// `start` or `credentials` ran.
+        /// `start` or `loadKey` ran.
         pub fn deinit(self: *Self) void {
             if (self.running) self.engine.deinit();
             if (self.key) |*key| key.deinit();
+            self.chain_count = 0;
             self.key = null;
             self.running = false;
+        }
+    };
+}
+
+/// A TLS driver and every buffer it writes into, computed from `limits` and
+/// owned in place: `Fixed(limits)`, and its flights and chain at their
+/// largest, so no allocator is involved. A caller writes
+///
+///     var storage: Storage(.{}) = undefined;
+///     storage.init();
+///     defer storage.deinit();
+///     const handshake = try storage.start(config, random);
+///
+/// and hands `handshake` to a machine. Built in place and never moved: the
+/// engine, and the machine holding its driver, point into this struct.
+///
+/// A caller reads `fixed.engine` (the handshake's outcome: `selectedAlpn`,
+/// `peerTransportParameters`, `done`). Every other field is the engine's
+/// backing, or what the loaded credentials point into, and is not the
+/// caller's.
+pub fn Storage(comptime limits: Limits) type {
+    // One storage serves either role, so each buffer is the larger role's, with
+    // this endpoint's own chain as long as the limits allow.
+    const server = Flight.lengths(limits, .server, limits.chain);
+    const client = Flight.lengths(limits, .client, limits.chain);
+    comptime {
+        assert(server.peer_initial == client.peer_initial);
+        assert(server.peer_handshake == client.peer_handshake);
+    }
+
+    return struct {
+        const Self = @This();
+
+        fixed: Fixed(limits),
+        out: [@max(server.out, client.out)]u8,
+        peer_initial: [server.peer_initial]u8,
+        peer_handshake: [server.peer_handshake]u8,
+        server_hello: [server.server_hello]u8,
+        chain_der: [limits.chain]u8,
+
+        /// Put the storage in its empty state. `deinit` is safe from here on.
+        pub fn init(self: *Self) void {
+            self.fixed.init();
+        }
+
+        /// Decode a PEM certificate chain and private key into this storage,
+        /// for a `Config.server`. The PEM bytes are not kept; the key is, until
+        /// `deinit`.
+        pub fn credentials(self: *Self, certificate_pem: []const u8, key_pem: []const u8) LoadError!Credentials {
+            _ = try self.fixed.decodeChain(&self.chain_der, certificate_pem);
+            try self.fixed.loadKey(key_pem);
+            return self.fixed.credentials();
+        }
+
+        /// `Fixed.start`, over this storage's flight buffers.
+        pub fn start(self: *Self, config: Config, random: [32]u8) Error!seam.Driver {
+            return self.fixed.start(.{
+                .out = &self.out,
+                .peer_initial = &self.peer_initial,
+                .peer_handshake = &self.peer_handshake,
+                .server_hello = &self.server_hello,
+            }, config, random);
+        }
+
+        /// Zero the secrets and free the key. Safe after `init`, whether or not
+        /// `start` or `credentials` ran.
+        pub fn deinit(self: *Self) void {
+            self.fixed.deinit();
         }
     };
 }
@@ -1051,12 +1202,12 @@ test "RFC 9001 §4, a Storage of the smallest limits that hold the fixture compl
     try server_driver.setTransportParameters(&server_parameters);
     try exchange(client_driver, server_driver);
 
-    try testing.expect(client.engine.done());
-    try testing.expect(server.engine.done());
-    try testing.expectEqualStrings("h3", client.engine.selectedAlpn().?);
-    try testing.expectEqualStrings("h3", server.engine.selectedAlpn().?);
-    try testing.expectEqualSlices(u8, &client_parameters, server.engine.peerTransportParameters().?);
-    try testing.expectEqualSlices(u8, &server_parameters, client.engine.peerTransportParameters().?);
+    try testing.expect(client.fixed.engine.done());
+    try testing.expect(server.fixed.engine.done());
+    try testing.expectEqualStrings("h3", client.fixed.engine.selectedAlpn().?);
+    try testing.expectEqualStrings("h3", server.fixed.engine.selectedAlpn().?);
+    try testing.expectEqualSlices(u8, &client_parameters, server.fixed.engine.peerTransportParameters().?);
+    try testing.expectEqualSlices(u8, &server_parameters, client.fixed.engine.peerTransportParameters().?);
     try testing.expect(try client_driver.secrets(.app) != null);
     try testing.expect(try server_driver.secrets(.app) != null);
 }
@@ -1101,13 +1252,49 @@ test "RFC 8446 §4, a handshake past its Storage limits fails with NoSpace, neve
     try client_driver.setTransportParameters("client");
     try testing.expectError(error.NoSpace, exchange(client_driver, server_driver));
     // Nothing of them was kept.
-    try testing.expectEqual(null, narrow.engine.peerTransportParameters());
+    try testing.expectEqual(null, narrow.fixed.engine.peerTransportParameters());
 }
 
-// RFC 8446 §4.3.2, §4.4: the flight a `Storage` allows for is the flight the
-// core demands a server's buffer hold, at the limits' extremes, so a later tls
-// that grows a message fails here and not in the field.
-test "the flight Storage allows for bounds the core's flightBufferLen" {
+test "RFC 8446 §4.4.2, a server flight longer than the client's limits is NoSpace, and none of it is taken" {
+    // Three copies of the fixture make a chain of 1,233 DER bytes, which a
+    // server whose limit is that loads, and a client whose limit is one
+    // copy cannot reassemble: the Certificate message alone is longer than the
+    // whole flight its limits allow for.
+    const certificate = fixture.certificate ++ fixture.certificate ++ fixture.certificate;
+    const client_limits: Limits = .{ .chain = fixture.certificate_der, .alpn = 2, .parameters = 64 };
+    const insecure: Trust = .insecure;
+    var client: Storage(client_limits) = undefined;
+    var server: Storage(.{ .chain = 3 * fixture.certificate_der, .alpn = 2, .parameters = 64 }) = undefined;
+    client.init();
+    defer client.deinit();
+    server.init();
+    defer server.deinit();
+
+    const credentials = try server.credentials(certificate, fixture.key);
+    try testing.expectEqual(3, credentials.chain.slice.len);
+    const server_driver = try server.start(.{ .server = .{
+        .credentials = credentials,
+        .alpn = &.{"h3"},
+    } }, @splat(0x22));
+    const client_driver = try client.start(.{ .client = .{
+        .policy = insecure.policy(),
+        .alpn = &.{"h3"},
+    } }, @splat(0x11));
+    try client_driver.setTransportParameters("client");
+    try server_driver.setTransportParameters("server");
+
+    try testing.expectError(error.NoSpace, exchange(client_driver, server_driver));
+    // The handshake ends as a CRYPTO_ERROR (RFC 9001 §4.8), and the message
+    // that did not fit was refused whole: not a byte of it is in the buffer.
+    try testing.expectEqual(crypto_error + internal_error, client_driver.errorCode());
+    try testing.expectEqual(0, client.fixed.engine.in[@backingInt(seam.Level.handshake)].len);
+    try testing.expect(!client.fixed.engine.done());
+}
+
+// RFC 8446 §4.3.2, §4.4: the flight `Flight.lengths` allows for is the flight
+// the core demands a server's buffer hold, at the limits' extremes, so a later
+// tls that grows a message fails here and not in the field.
+test "the flight Flight.lengths allows for bounds the core's flightBufferLen" {
     const limits: Limits = .{ .chain = 1000, .alpn = 7 };
     var der: [limits.chain]u8 = undefined;
     var certificates: [max_certificates][]const u8 = undefined;
@@ -1119,8 +1306,14 @@ test "the flight Storage allows for bounds the core's flightBufferLen" {
     var server: core.Server = .init(&slots);
     defer server.deinit();
     server.requireClientCertificate(.init);
+    // RFC 9001 §8.2: the transport parameters ride in the EncryptedExtensions.
+    const parameters: [limits.parameters]u8 = @splat(0);
+    const extra = [_]tls.extension_type.ExtraExtension{
+        .{ .extension_type = transport_parameters_type, .data = &parameters },
+    };
+    server.sendExtensions(&extra);
     const required = server.flightBufferLen(credentials, "1234567");
-    try testing.expect(flightLen(limits) >= required);
+    try testing.expect(flightLen(limits, limits.chain) >= required);
 }
 
 // RFC 8446 §4.1.3: a ServerHello that echoes the longest session id and answers

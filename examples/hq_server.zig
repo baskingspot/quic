@@ -6,7 +6,8 @@
 //! stream the client opens, answers on the same stream with a fixed body and a
 //! FIN, waits for the client to close the connection, and exits. It never
 //! accepts a second connection, which is why every buffer is static, the
-//! streams' included: they come from a `FixedBufferAllocator` over `memory`.
+//! handshake's and the streams' included: they come from a
+//! `FixedBufferAllocator` over `memory`.
 //!
 //! The idle timeout bounds every wait: a handshake that goes nowhere, or a
 //! client that goes quiet, prints `hq_server: TIMEOUT` and exits 1.
@@ -26,7 +27,9 @@ const hq = @import("hq.zig");
 /// Static, because the machine and the driver point into it for the life of the
 /// process.
 var endpoint: hq.Endpoint = undefined;
-var memory: [hq.Sizing.fixed_buffer_bytes]u8 = undefined;
+/// The certificate is read at run time, so this is enough for one as long as
+/// the sizing allows: `allocation_bytes`, not `listenBytes` of the one in use.
+var memory: [hq.Sizing.allocation_bytes]u8 align(hq.Sizing.allocation_alignment) = undefined;
 var request: [256]u8 = undefined;
 
 /// A file larger than this is not a certificate or a key: reading stops with
@@ -55,8 +58,8 @@ pub fn main(init: std.process.Init) !u8 {
     const socket = try address.bind(io, .{ .mode = .dgram });
     // The endpoint owns the socket from `listen` on, failed or not.
     defer endpoint.deinit(io);
-    var streams: std.heap.FixedBufferAllocator = .init(&memory);
-    try endpoint.listen(streams.allocator(), .{
+    var fixed: std.heap.FixedBufferAllocator = .init(&memory);
+    try endpoint.listen(fixed.allocator(), .{
         .io = io,
         .socket = socket,
         .certificate = certificate,
