@@ -362,21 +362,33 @@ fn receiveTask(self: *Core) Io.Cancelable!void {
     }
 }
 
-/// Send what is owed, fire the timers, and park until either there is more or
+/// Fire the timers, send what is owed, and park until either there is more or
 /// the next timer is due.
 fn sendTask(self: *Core) Io.Cancelable!void {
     try self.mutex.lock(self.io);
     defer self.mutex.unlock(self.io);
-    while (true) {
-        try self.flush();
-        if (self.phase == .closed) return;
-        try self.onTimers();
-        if (self.phase == .closed) return;
-        self.wake.waitTimeout(self.io, &self.mutex, self.nextTimeout()) catch |err| switch (err) {
+    while (try self.turn()) |due| {
+        self.wake.waitTimeout(self.io, &self.mutex, due) catch |err| switch (err) {
             error.Timeout => {},
             error.Canceled => return error.Canceled,
         };
     }
+}
+
+/// One pass of the sender: the timers that are due, then everything owed. Null
+/// once the connection is closed, and otherwise when to wake next.
+///
+/// Timers first, because a timer makes work owed: a loss timer marks STREAM
+/// ranges, a HANDSHAKE_DONE, and the MAX_* frames owed again (§13.3), and only
+/// a flush sends them. The other way round, that work waits for an unrelated
+/// wake, and with nothing else in flight there is no probe timer to give one
+/// (RFC 9002 A.8): the connection sits until its idle timeout.
+fn turn(self: *Core) Io.Cancelable!?Io.Timeout {
+    try self.onTimers();
+    if (self.phase == .closed) return null;
+    try self.flush();
+    if (self.phase == .closed) return null;
+    return self.nextTimeout();
 }
 
 // -- Receiving -------------------------------------------------------------
@@ -912,4 +924,204 @@ fn initiator(self: *const Core) stream_id.Initiator {
 fn idOf(entry: *const Conn.Stream) u64 {
     assert(entry.isOpen());
     return if (entry.canRecv()) entry.recv.id else entry.send.id;
+}
+
+// -- Tests -------------------------------------------------------------------
+
+const testing = std.testing;
+const TransportParameters = quic.TransportParameters;
+
+/// A client core with 1-RTT keys from a stub driver, no tasks, and a socket
+/// whose peer is `observer`, beside a server machine with the same keys that
+/// the test feeds by hand. Built in place: the machines pin their addresses.
+const LossFixture = struct {
+    threaded: Io.Threaded = undefined,
+    observer: Io.net.Socket = undefined,
+    core: Core = undefined,
+    server: Conn = undefined,
+    client_stub: quic.handshake.Stub = undefined,
+    server_stub: quic.handshake.Stub = undefined,
+    client_loss: Recovery = .{},
+    server_loss: Recovery = .{},
+    spaces: [2][3]Recovery.Space = undefined,
+    sent: [2][3][8]Recovery.SentPacket = undefined,
+    sent_streams: [2][8]Conn.SentStreams = @splat(@splat(.{})),
+    acked: [8]Recovery.SentPacket = undefined,
+    lost: [8]Recovery.SentPacket = undefined,
+    send_buffer: [64]u8 = undefined,
+    recv_buffer: [64]u8 = undefined,
+    stream_slots: [1]quic.StreamTable.Slot = undefined,
+    streams: [1]Conn.Stream = undefined,
+    datagram_in: [1500]u8 = undefined,
+    datagram_out: [1500]u8 = undefined,
+    plaintext: [1500]u8 = undefined,
+    scratch: [1500]u8 = undefined,
+    frames: [16]frame.Frame = undefined,
+    stream_events: [1]Conn.StreamEvent = undefined,
+    control: [4]frame.Frame = undefined,
+    offers: [1]Conn.Offer = undefined,
+    written: [Conn.stream_frames_per_packet]Conn.Written = undefined,
+    slots: [1]Slot = undefined,
+    records: [8]Record = undefined,
+    parameter_bytes: [3][64]u8 = undefined,
+
+    const client_id = [_]u8{0xc1};
+    const server_id = [_]u8{0x5e};
+    const secrets: [4][32]u8 = .{ @splat(0x11), @splat(0x22), @splat(0x33), @splat(0x44) };
+
+    fn loss(self: *LossFixture, side: usize, shared: *Recovery) Conn.Loss {
+        return .{
+            .shared = shared,
+            .spaces = &self.spaces[side],
+            .sent_initial = &self.sent[side][0],
+            .sent_handshake = &self.sent[side][1],
+            .sent_app = &self.sent[side][2],
+            .sent_streams = &self.sent_streams[side],
+        };
+    }
+
+    fn storage(self: *LossFixture) Storage {
+        return .{
+            .datagram_in = &self.datagram_in,
+            .datagram_out = &self.datagram_out,
+            .plaintext = &self.plaintext,
+            .scratch = &self.scratch,
+            .frames = &self.frames,
+            .stream_events = &self.stream_events,
+            .control = &self.control,
+            .offers = &self.offers,
+            .written = &self.written,
+            .slots = &self.slots,
+            .records = &self.records,
+        };
+    }
+
+    fn encode(
+        self: *LossFixture,
+        index: usize,
+        sender: TransportParameters.Role,
+        parameters: TransportParameters,
+    ) []const u8 {
+        var writer: quic.Writer = .init(&self.parameter_bytes[index]);
+        TransportParameters.encode(&writer, parameters, sender) catch unreachable;
+        return writer.written();
+    }
+
+    fn init(self: *LossFixture) !void {
+        self.threaded = .init(testing.allocator, .{});
+        errdefer self.threaded.deinit();
+        const io = self.threaded.io();
+        const any: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        self.observer = try any.bind(io, .{ .mode = .dgram });
+        errdefer self.observer.close(io);
+        const socket = try any.bind(io, .{ .mode = .dgram });
+        errdefer socket.close(io);
+
+        // Each stub stands in for TLS: the same secrets on both ends, and the
+        // other end's transport parameters. The server grants one stream.
+        const client_parameters = self.encode(0, .client, .{ .initial_source_connection_id = &client_id });
+        const both: quic.handshake.Secrets = .{ .client = &secrets[0], .server = &secrets[1] };
+        const app: quic.handshake.Secrets = .{ .client = &secrets[2], .server = &secrets[3] };
+        const server_parameters = self.encode(1, .server, .{
+            .original_destination_connection_id = &server_id,
+            .initial_source_connection_id = &server_id,
+            .initial_max_data = 64,
+            .initial_max_stream_data_bidi_remote = 64,
+            .initial_max_streams_bidi = 1,
+        });
+        self.client_stub = .{ .handshake_secrets = both, .app_secrets = app, .peer_parameters = server_parameters };
+        self.server_stub = .{ .handshake_secrets = both, .app_secrets = app, .peer_parameters = client_parameters };
+
+        self.streams = .{.{ .send_buffer = &self.send_buffer, .recv_buffer = &self.recv_buffer }};
+        self.core.init(.{
+            .io = io,
+            .socket = socket,
+            .peer = self.observer.address,
+            .storage = self.storage(),
+            .events = .init(&self.acked, &self.lost),
+            .loss = self.loss(0, &self.client_loss),
+            .idle_timeout_ms = 0,
+        });
+        var config = Conn.clientConfig(&server_id, &client_id, self.loss(0, &self.client_loss));
+        config.tls = self.client_stub.driver();
+        config.transport_parameters = client_parameters;
+        config.stream_slots = &self.stream_slots;
+        config.streams = &self.streams;
+        self.core.conn = .init(config);
+        try self.core.conn.installSpaces();
+        self.core.phase = .established;
+
+        self.server = .init(.{
+            .role = .server,
+            .loss = self.loss(1, &self.server_loss),
+            .original_destination_connection_id = &server_id,
+            .destination_connection_id = &client_id,
+            .source_connection_id = &server_id,
+            .tls = self.server_stub.driver(),
+            .transport_parameters = self.encode(2, .server, .{
+                .original_destination_connection_id = &server_id,
+                .initial_source_connection_id = &server_id,
+            }),
+        });
+        try self.server.installSpaces();
+    }
+
+    fn deinit(self: *LossFixture) void {
+        const io = self.threaded.io();
+        self.core.socket.close(io);
+        self.observer.close(io);
+        self.threaded.deinit();
+        self.* = undefined;
+    }
+
+    /// Hand the server a datagram, and the core what the server acknowledges.
+    fn acknowledge(self: *LossFixture, datagram: []u8) !void {
+        var plaintext: [1500]u8 = undefined;
+        var frames: [4]frame.Frame = undefined;
+        var events: [1]Conn.StreamEvent = undefined;
+        var acked: [8]Recovery.SentPacket = undefined;
+        var lost: [8]Recovery.SentPacket = undefined;
+        var report: Recovery.Events = .init(&acked, &lost);
+        _ = try self.server.feed(datagram, &plaintext, &frames, &events, &report, 0);
+        var ack: [64]u8 = undefined;
+        const length = try self.server.writeAck(.app, &ack, 0);
+        self.core.onDatagram(ack[0..length]);
+    }
+};
+
+/// File scope: the fixture holds two machines, which must not move.
+var loss_fixture: LossFixture = .{};
+
+test "RFC 9002 §6.1.2, a loss timer's STREAM data leaves in the same turn, with nothing else in flight" {
+    const f = &loss_fixture;
+    f.* = .{};
+    try f.init();
+    defer f.deinit();
+    const io = f.threaded.io();
+
+    // The stream's bytes leave in packet 0, and the network drops them.
+    const entry = try f.core.conn.openStream(0);
+    try entry.send.write("lost");
+    _ = try f.core.turn();
+    var dropped: [1500]u8 = undefined;
+    _ = try f.observer.receiveTimeout(io, &dropped, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+
+    // Packet 1, a PING, arrives and is acknowledged. Packet 0 is short of the
+    // packet threshold, so only the loss timer declares it lost, once the time
+    // threshold passes; and then nothing is left in flight to arm a probe.
+    var ping: [64]u8 = undefined;
+    const length = try f.core.conn.writeFrames(.app, &.{0x01}, &ping, .data(f.core.clock()));
+    try f.acknowledge(ping[0..length]);
+    const due = f.core.recovery.deadline(f.core.conn.recoveryOptions());
+    try testing.expectEqual(Recovery.TimerKind.loss, due.kind);
+    try io.sleep(.fromNanoseconds(@intCast(due.at -| f.core.clock() + 1)), .awake);
+
+    // One turn of the sender fires the timer, and the bytes go again before it
+    // parks: not at the next wake, which here would never come. They are no
+    // longer owed, and one packet in flight carries them.
+    _ = try f.core.turn();
+    try testing.expectEqual(@as(usize, 0), entry.send.lost_len);
+    var carrying: usize = 0;
+    for (&f.sent_streams[0]) |*record| carrying += record.written().len;
+    try testing.expectEqual(@as(usize, 1), carrying);
 }

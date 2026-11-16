@@ -527,6 +527,12 @@ All notable changes to quic are recorded here. The format follows
 
 ### Fixed
 
+- `quic-io` sent what a loss timer declared lost only at the sender's next
+  wake, not when the timer fired: it flushed before it fired the timers, then
+  parked. With nothing else in flight no probe timer was armed to wake it, so a
+  lost tail of stream data, a HANDSHAKE_DONE, or a MAX_* frame waited for an
+  unrelated datagram or for the idle timeout. The sender now fires the timers
+  first and flushes what they made owed before it parks.
 - A FIN sent on its own and lost after the bytes before it were acknowledged
   was never sent again (RFC 9000 §3.1, §13.3). `SendStream` reached Data Recvd
   on the bytes alone, so the peer never learned the stream ended and both ends

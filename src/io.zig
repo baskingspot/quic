@@ -822,3 +822,7 @@ test "RFC 9000 §8.1, a first datagram that does not open leaves the endpoint as
     try testing.expectEqual(Core.Phase.handshaking, test_endpoint.core.phase);
     try testing.expect(test_endpoint.core.peer.eql(&sender.address));
 }
+
+test {
+    _ = Core;
+}
