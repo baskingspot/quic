@@ -193,22 +193,39 @@ pub fn build(b: *std.Build) void {
         });
         const hq_tests = b.addTest(.{ .root_module = hq_test_mod });
         test_step.dependOn(&b.addRunArtifact(hq_tests).step);
+
+        // The hello world: `quic-io` over loopback, a server and a client in
+        // one process, with this repository's fixture certificate embedded.
+        const echo_mod = b.createModule(.{
+            .root_source_file = b.path("examples/echo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "quic-io", .module = io_mod },
+            },
+        });
+        echo_mod.addAnonymousImport("server_crt", .{ .root_source_file = b.path("tests/fixtures/server.crt") });
+        echo_mod.addAnonymousImport("server_key", .{ .root_source_file = b.path("tests/fixtures/server.key") });
+        const echo = b.addExecutable(.{ .name = "echo", .root_module = echo_mod });
+        const install_echo = b.addInstallArtifact(echo, .{});
+        b.step("example-bin", "Build the echo example").dependOn(&install_echo.step);
     }
 
-    // The echo example: the machine driven directly, with a stub handshake and no
-    // socket shell. It is an executable rather than a test because its value is
-    // in being read.
-    const echo_mod = b.createModule(.{
-        .root_source_file = b.path("examples/echo.zig"),
+    // The machine example: `quic.Conn` driven directly over a `quic.Storage`,
+    // with a stub handshake and no socket shell, so it needs no TLS. It is an
+    // executable rather than a test because its value is in being read.
+    const machine_mod = b.createModule(.{
+        .root_source_file = b.path("examples/machine.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "quic", .module = mod }},
     });
-    const echo = b.addExecutable(.{ .name = "echo", .root_module = echo_mod });
-    // Installed rather than merely built: `just example` runs it from
+    const machine = b.addExecutable(.{ .name = "machine", .root_module = machine_mod });
+    // Installed rather than merely built: `just machine` runs it from
     // zig-out/bin, and a step that only compiles leaves nothing to run.
-    const install_echo = b.addInstallArtifact(echo, .{});
-    b.step("example-bin", "Build the echo example").dependOn(&install_echo.step);
+    const install_machine = b.addInstallArtifact(machine, .{});
+    b.step("machine-bin", "Build the bare-machine example").dependOn(&install_machine.step);
 
     // The external interop tool: a real UDP socket against a foreign client.
     // Developer-only, like the fuzz step; `just interop` runs it.

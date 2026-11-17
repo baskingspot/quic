@@ -131,10 +131,13 @@ All notable changes to quic are recorded here. The format follows
   same stream. A shared buffer is two byte budgets overwriting each other while
   neither half can detect it. A caller that aliased its storage was silently
   corrupting both streams and now gets a panic at construction.
-- `examples/echo.zig` is a client and a server over `Conn` with a faked
-  handshake, echoing one stream. `just example` builds and runs it. It is the
-  first code in the tree that calls the machine the way an application does, and
-  the gaps it found are recorded in `docs/slop/connection-machine.md`.
+- `examples/echo.zig` is the hello world: a `quic-io` server and client in one
+  process, a real TLS 1.3 handshake with the fixture certificate, and one stream
+  echoed back; `just example` runs it. `examples/machine.zig` is the same
+  exchange for embedders, over `Conn` and a `quic.Storage` with a faked
+  handshake and a lost packet resent; `just machine` runs it. The machine
+  example's first version found the gaps recorded in
+  `docs/slop/connection-machine.md`.
 - `Conn.writeStreams` packs several streams into one packet from the caller's
   ordered offer list, up to the caller's payload budget, the peer's
   connection-wide allowance, and the output buffer, and describes what it wrote so

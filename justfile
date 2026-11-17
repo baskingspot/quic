@@ -15,11 +15,17 @@ test:
 test-no-tls:
     zig build test -Dno-tls --summary all
 
-[doc("Build and run the echo example: `quic.Conn` driven directly with a stub handshake, no sockets and no crypto. examples/hq_server.zig is the real thing")]
+[doc("Build and run the hello world, examples/echo.zig: a `quic-io` server and client in one process, a real TLS 1.3 handshake over loopback, and one stream echoed back")]
 [group("test")]
 example:
     zig build example-bin
     ./zig-out/bin/echo
+
+[doc("Build and run examples/machine.zig, for embedders: `quic.Conn` driven directly over a `quic.Storage`, with a stub handshake, no sockets, and a lost packet resent")]
+[group("test")]
+machine:
+    zig build machine-bin
+    ./zig-out/bin/machine
 
 [doc("Fuzz the codecs with an iteration budget, for example `just fuzz 50M`. A budget is required: without one the build runner opens a web UI and waits")]
 [group("test")]
