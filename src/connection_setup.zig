@@ -14,10 +14,11 @@
 
 const std = @import("std");
 const testing = std.testing;
+const mem = std.mem;
+const assert = std.debug.assert;
+
 const packet = @import("packet.zig");
 const Writer = @import("Writer.zig");
-
-const setup = @This();
 
 pub const VersionNegotiation = struct {
     /// §6.1: a server answers a long header it does not support. It must not
@@ -97,7 +98,7 @@ pub const Retry = struct {
     pub fn integrityTag(original_destination_connection_id: []const u8, retry_without_tag: []const u8) [16]u8 {
         var pseudo: [max_pseudo_packet]u8 = undefined;
         const length = 1 + original_destination_connection_id.len + retry_without_tag.len;
-        std.debug.assert(length <= pseudo.len);
+        assert(length <= pseudo.len);
 
         pseudo[0] = @intCast(original_destination_connection_id.len);
         @memcpy(pseudo[1..][0..original_destination_connection_id.len], original_destination_connection_id);
@@ -140,7 +141,7 @@ pub const Retry = struct {
         const body = raw[0 .. raw.len - packet.retry_integrity_tag_len];
         const sent = raw[raw.len - packet.retry_integrity_tag_len ..];
         const expected = integrityTag(original_destination_connection_id, body);
-        if (!std.mem.eql(u8, &expected, sent)) return error.IntegrityCheckFailed;
+        if (!mem.eql(u8, &expected, sent)) return error.IntegrityCheckFailed;
     }
 };
 

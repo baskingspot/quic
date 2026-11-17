@@ -14,9 +14,11 @@
 //! it would not change.
 
 const std = @import("std");
-const quic = @import("quic");
-
 const Io = std.Io;
+const mem = std.mem;
+const print = std.debug.print;
+
+const quic = @import("quic");
 
 const token = "interop-token";
 const retry_scid = [_]u8{ 0x5e, 0x5e, 0x5e, 0x5e, 0x5e, 0x5e, 0x5e, 0x5e };
@@ -33,9 +35,9 @@ pub fn main(init: std.process.Init) !void {
     const socket = try address.bind(io, .{ .mode = .dgram });
     defer socket.close(io);
 
-    const ok = if (std.mem.eql(u8, mode, "retry"))
+    const ok = if (mem.eql(u8, mode, "retry"))
         try retryScenario(io, &socket)
-    else if (std.mem.eql(u8, mode, "vn"))
+    else if (mem.eql(u8, mode, "vn"))
         try versionScenario(io, &socket)
     else
         return usage();
@@ -44,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() error{Usage} {
-    std.debug.print("usage: interop retry <port> | interop vn <port>\n", .{});
+    print("usage: interop retry <port> | interop vn <port>\n", .{});
     return error.Usage;
 }
 
@@ -75,17 +77,17 @@ fn send(io: Io, socket: *const Io.net.Socket, bytes: []const u8, to: *const Rece
 fn retryScenario(io: Io, socket: *const Io.net.Socket) !bool {
     var buffer: [2048]u8 = undefined;
     const first = (try receive(io, socket, &buffer)) orelse {
-        std.debug.print("interop retry: no Initial arrived\n", .{});
+        print("interop retry: no Initial arrived\n", .{});
         return false;
     };
 
     const invariant = quic.packet.parseInvariant(first.bytes) catch |err| {
-        std.debug.print("interop retry: the first datagram is not a long header: {t}\n", .{err});
+        print("interop retry: the first datagram is not a long header: {t}\n", .{err});
         return false;
     };
     const kind: quic.packet.Kind = @fromBackingInt(@intCast((invariant.first >> 4) & 0x03));
     if (kind != .initial) {
-        std.debug.print("interop retry: expected an Initial, got {t}\n", .{kind});
+        print("interop retry: expected an Initial, got {t}\n", .{kind});
         return false;
     }
 
@@ -95,38 +97,38 @@ fn retryScenario(io: Io, socket: *const Io.net.Socket) !bool {
         .source_connection_id = &retry_scid,
         .token = token,
     }) catch |err| {
-        std.debug.print("interop retry: could not build a Retry: {t}\n", .{err});
+        print("interop retry: could not build a Retry: {t}\n", .{err});
         return false;
     };
     try send(io, socket, out[0..retry_length], &first);
 
     // The client must answer with a new Initial. Nothing else counts.
     const second = (try receive(io, socket, &buffer)) orelse {
-        std.debug.print("interop retry: the client sent nothing after the Retry\n", .{});
+        print("interop retry: the client sent nothing after the Retry\n", .{});
         return false;
     };
     const second_long = quic.packet.parseLong(second.bytes) catch |err| {
-        std.debug.print("interop retry: the reply is not a long header: {t}\n", .{err});
+        print("interop retry: the reply is not a long header: {t}\n", .{err});
         return false;
     };
 
     if (second_long.kind != .initial) {
-        std.debug.print("interop retry: the reply is {t}, not an Initial\n", .{second_long.kind});
+        print("interop retry: the reply is {t}, not an Initial\n", .{second_long.kind});
         return false;
     }
-    if (!std.mem.eql(u8, second_long.token, token)) {
-        std.debug.print(
+    if (!mem.eql(u8, second_long.token, token)) {
+        print(
             "interop retry: FAIL the client's token is {d} bytes, not ours\n",
             .{second_long.token.len},
         );
         return false;
     }
-    if (!std.mem.eql(u8, second_long.destination_connection_id, &retry_scid)) {
-        std.debug.print("interop retry: FAIL the client did not address our connection ID\n", .{});
+    if (!mem.eql(u8, second_long.destination_connection_id, &retry_scid)) {
+        print("interop retry: FAIL the client did not address our connection ID\n", .{});
         return false;
     }
 
-    std.debug.print(
+    print(
         "interop retry: PASS quiche validated our tag, echoed our {d}-byte token, and addressed our SCID\n",
         .{token.len},
     );
@@ -139,12 +141,12 @@ fn retryScenario(io: Io, socket: *const Io.net.Socket) !bool {
 fn versionScenario(io: Io, socket: *const Io.net.Socket) !bool {
     var buffer: [2048]u8 = undefined;
     const first = (try receive(io, socket, &buffer)) orelse {
-        std.debug.print("interop vn: no Initial arrived\n", .{});
+        print("interop vn: no Initial arrived\n", .{});
         return false;
     };
 
     const invariant = quic.packet.parseInvariant(first.bytes) catch |err| {
-        std.debug.print("interop vn: the first datagram is not a long header: {t}\n", .{err});
+        print("interop vn: the first datagram is not a long header: {t}\n", .{err});
         return false;
     };
 
@@ -159,13 +161,13 @@ fn versionScenario(io: Io, socket: *const Io.net.Socket) !bool {
     while (try receive(io, socket, &buffer)) |next| {
         const next_invariant = quic.packet.parseInvariant(next.bytes) catch continue;
         if (next_invariant.version == .v1) continue;
-        std.debug.print(
+        print(
             "interop vn: FAIL the client changed to version 0x{x:0>8}\n",
             .{@backingInt(next_invariant.version)},
         );
         return false;
     }
 
-    std.debug.print("interop vn: PASS the client did not change version\n", .{});
+    print("interop vn: PASS the client did not change version\n", .{});
     return true;
 }

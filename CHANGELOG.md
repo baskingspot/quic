@@ -377,7 +377,7 @@ All notable changes to quic are recorded here. The format follows
   CRYPTO message queued there (tls's answer to a KeyUpdate, which QUIC
   forbids) is `error.NoSpace` before any of it is framed.
 - `quic-io` streams are pooled. `Endpoint.listen(allocator, config)` and
-  `Endpoint.connect(allocator, config)` take an `std.mem.Allocator`, and
+  `Endpoint.connect(allocator, config)` take an `mem.Allocator`, and
   `error.OutOfMemory` is their one new failure. `Sizing(.{})` drops from
   104,648 to 68,936 bytes: the stream table (736 bytes per `streams`) is
   allocated in `listen` or `connect`, and each stream's buffers are a

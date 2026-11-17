@@ -19,6 +19,8 @@
 
 const std = @import("std");
 const testing = std.testing;
+const assert = std.debug.assert;
+
 const varint = @import("varint.zig");
 
 const CryptoStream = @This();
@@ -114,8 +116,8 @@ fn store(self: *CryptoStream, offset: u64, data: []const u8) void {
 
 /// The bytes in `[start, end)` as one or two slices of the ring.
 fn slices(self: *const CryptoStream, start: u64, end: u64) Delivery {
-    std.debug.assert(start < end);
-    std.debug.assert(end - start <= self.ring.len);
+    assert(start < end);
+    assert(end - start <= self.ring.len);
     const capacity: u64 = @intCast(self.ring.len);
     const begin: usize = @intCast(start % capacity);
     const length: usize = @intCast(end - start);
@@ -166,7 +168,7 @@ fn insert(self: *CryptoStream, start: u64, end: u64) Error!void {
 }
 
 fn removeFirst(self: *CryptoStream) void {
-    std.debug.assert(self.pending_len > 0);
+    assert(self.pending_len > 0);
     const left = self.pending_len - 1;
     _ = @memmove(self.pending[0..left], self.pending[1..][0..left]);
     self.pending_len = left;

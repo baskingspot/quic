@@ -17,11 +17,12 @@
 
 const std = @import("std");
 const testing = std.testing;
+const assert = std.debug.assert;
+
 const Recovery = @import("Recovery.zig");
+pub const Duration = Recovery.Duration;
 
 const Congestion = @This();
-
-pub const Duration = Recovery.Duration;
 
 /// RFC 9002 §7.2: the initial window is ten maximum datagram sizes.
 pub const initial_window_packets: u64 = 10;
@@ -67,8 +68,8 @@ residue: u64 = 0,
 
 /// A controller for a path with this maximum datagram size.
 pub fn init(max_datagram_size: u32) Congestion {
-    std.debug.assert(max_datagram_size > 0);
-    std.debug.assert(max_datagram_size <= max_datagram_size_limit);
+    assert(max_datagram_size > 0);
+    assert(max_datagram_size <= max_datagram_size_limit);
     const mds: u64 = max_datagram_size;
     return .{
         .max_datagram_size = max_datagram_size,

@@ -15,10 +15,10 @@
 
 const std = @import("std");
 const testing = std.testing;
+const mem = std.mem;
+
 const Cursor = @import("Cursor.zig");
 const Writer = @import("Writer.zig");
-
-const varint = @This();
 
 /// The largest value the encoding can carry: 2^62 - 1.
 pub const max: u64 = (1 << 62) - 1;
@@ -88,7 +88,7 @@ pub fn write(writer: *Writer, value: u64) EncodeError!void {
     if (value > max) return error.Overflow;
     const width = size(@intCast(value));
     var buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &buf, value, .big);
+    mem.writeInt(u64, &buf, value, .big);
     const start = buf.len - width;
     buf[start] |= switch (width) {
         1 => 0x00,
@@ -141,7 +141,7 @@ test "RFC 9000 §16 Table 4, the four widths and their boundaries" {
 
     try expectEncoded(1073741824, &.{ 0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00 });
     try expectEncoded(151288809941952652, &.{ 0xc2, 0x19, 0x7c, 0x5e, 0xff, 0x14, 0xe8, 0x8c });
-    try expectEncoded(varint.max, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff });
+    try expectEncoded(max, &.{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff });
 }
 
 test "RFC 9000 Appendix A.1, the sample encodings decode" {
@@ -194,7 +194,7 @@ test "RFC 9000 §16, a truncated integer is an error and moves nothing" {
 test "RFC 9000 §16, a value above the 62-bit range has no encoding" {
     var buf: [8]u8 = undefined;
     var writer: Writer = .init(&buf);
-    try testing.expectError(error.Overflow, write(&writer, varint.max + 1));
+    try testing.expectError(error.Overflow, write(&writer, max + 1));
     try testing.expectError(error.Overflow, write(&writer, std.math.maxInt(u64)));
     try testing.expectEqual(@as(u32, 0), writer.pos);
 }
@@ -227,7 +227,7 @@ test "fuzz decode against a bounded model" {
                 try testing.expectEqual(@as(u32, 0), cursor.pos);
                 return;
             };
-            try testing.expect(value <= varint.max);
+            try testing.expect(value <= max);
 
             // A successful decode consumed exactly the width the prefix
             // announced, which is at least the width the value needs.

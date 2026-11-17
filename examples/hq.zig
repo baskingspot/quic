@@ -10,6 +10,8 @@ const std = @import("std");
 const Io = std.Io;
 const assert = std.debug.assert;
 const testing = std.testing;
+const mem = std.mem;
+const Allocator = mem.Allocator;
 
 const quic = @import("quic");
 const quic_io = @import("quic-io");
@@ -70,7 +72,7 @@ fn PairOf(comptime E: type, comptime client: *E, comptime server: *E) type {
         threaded: Io.Threaded,
         io: Io,
         /// What the client's streams come from; the server's is `init`'s.
-        client_allocator: std.mem.Allocator,
+        client_allocator: Allocator,
         server_address: Io.net.IpAddress,
         /// Whether `connect` got far enough that `client` is built, and so
         /// is `deinit`'s to tear down.
@@ -89,7 +91,7 @@ fn PairOf(comptime E: type, comptime client: *E, comptime server: *E) type {
         }
 
         /// `init`, with the allocator each endpoint's streams come from.
-        fn initWith(self: *Self, client_allocator: std.mem.Allocator, server_allocator: std.mem.Allocator) !void {
+        fn initWith(self: *Self, client_allocator: Allocator, server_allocator: Allocator) !void {
             self.threaded = .init(testing.allocator, .{});
             self.io = self.threaded.io();
             self.client_allocator = client_allocator;
@@ -522,7 +524,7 @@ const Relay = struct {
 
     fn bind(io: Io, drop: []const bool) !Relay {
         // A pattern that drops everything is a partition, not loss.
-        assert(std.mem.findScalar(bool, drop, false) != null);
+        assert(mem.findScalar(bool, drop, false) != null);
         const any: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
         const client_side = try any.bind(io, .{ .mode = .dgram });
         errdefer client_side.close(io);

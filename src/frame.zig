@@ -12,11 +12,12 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Cursor = @import("Cursor.zig");
-const Writer = @import("Writer.zig");
-const varint = @import("varint.zig");
+const expect = testing.expect;
+const expectEqual = testing.expectEqual;
 
-const frame = @This();
+const Cursor = @import("Cursor.zig");
+const varint = @import("varint.zig");
+const Writer = @import("Writer.zig");
 
 pub const Error = error{
     /// The payload ended inside a frame.
@@ -595,9 +596,6 @@ fn writeVarint(writer: *Writer, value: u64) Error!void {
         error.Overflow => unreachable,
     };
 }
-
-const expect = testing.expect;
-const expectEqual = testing.expectEqual;
 
 /// Write a frame, read it back, re-encode it, and require both byte strings to
 /// match. Returns the frame as read.

@@ -38,32 +38,29 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const testing = std.testing;
-const Allocator = std.mem.Allocator;
+const mem = std.mem;
+const Allocator = mem.Allocator;
+const Io = std.Io;
+pub const IpAddress = Io.net.IpAddress;
+pub const ShutdownHow = Io.net.ShutdownHow;
 
 const driver = @import("quic-tls");
+/// How a client decides whether to believe a server's certificate.
+pub const Trust = driver.Trust;
 const quic = @import("quic");
 const Conn = quic.Conn;
 const Recovery = quic.Recovery;
 const StreamTable = quic.StreamTable;
 const TransportParameters = quic.TransportParameters;
 const frame = quic.frame;
-
-const Core = @import("io/Core.zig");
-
-const Io = std.Io;
-
-pub const IpAddress = Io.net.IpAddress;
-pub const ShutdownHow = Io.net.ShutdownHow;
 pub const Direction = quic.stream_id.Direction;
 
+const Core = @import("io/Core.zig");
 /// Why a connection ended, which every operation on it returns from then on:
 /// `error.ConnectionClosed` and `error.IdleTimeout`, the socket's errors, and
 /// the machine's transport errors by name (`error.HandshakeFailed`,
 /// `error.FlowControl`, `error.StreamLimit`, ...).
 pub const ConnectionError = Core.Failure;
-
-/// How a client decides whether to believe a server's certificate.
-pub const Trust = driver.Trust;
 
 /// What `Endpoint.listen` can refuse: a certificate or key that does not load
 /// (`error.InvalidCertificate`, `error.InvalidKey`), anything that exceeds
@@ -220,24 +217,24 @@ pub fn Sizing(comptime limits_given: SizingLimits) type {
         /// failed attempt left unused. So past the first, a slot costs two.
         fn reserve(handshake: usize) usize {
             var end = handshake;
-            end = std.mem.alignForward(usize, end, @alignOf(StreamTable.Slot)) + streams * @sizeOf(StreamTable.Slot);
-            end = std.mem.alignForward(usize, end, @alignOf(Conn.Stream)) + streams * @sizeOf(Conn.Stream);
-            end = std.mem.alignForward(usize, end, @alignOf(Core.Slot)) + streams * @sizeOf(Core.Slot);
+            end = mem.alignForward(usize, end, @alignOf(StreamTable.Slot)) + streams * @sizeOf(StreamTable.Slot);
+            end = mem.alignForward(usize, end, @alignOf(Conn.Stream)) + streams * @sizeOf(Conn.Stream);
+            end = mem.alignForward(usize, end, @alignOf(Core.Slot)) + streams * @sizeOf(Core.Slot);
             if (pooled == 0) return end;
 
             const size = Pool.item_size;
             const alignment = Pool.item_alignment.toByteUnits();
-            const node = std.mem.alignForward(usize, end, arena_node_alignment);
+            const node = mem.alignForward(usize, end, arena_node_alignment);
             const first = arena_header + alignment + size + 16;
-            var block = std.mem.alignForward(usize, first + first / 2, 2);
+            var block = mem.alignForward(usize, first + first / 2, 2);
             // Offsets into the block's buffer, which starts after the header.
             const buffer = node + arena_header;
-            var used = std.mem.alignForward(usize, buffer, alignment) - buffer + size;
+            var used = mem.alignForward(usize, buffer, alignment) - buffer + size;
             for (1..pooled) |_| {
-                used = std.mem.alignForward(usize, buffer + used, alignment) - buffer + size;
+                used = mem.alignForward(usize, buffer + used, alignment) - buffer + size;
                 if (arena_header + used <= block) continue;
-                used = std.mem.alignForward(usize, buffer + used, alignment) - buffer + size;
-                block = std.mem.alignForward(usize, arena_header + used, 2);
+                used = mem.alignForward(usize, buffer + used, alignment) - buffer + size;
+                block = mem.alignForward(usize, arena_header + used, 2);
             }
             return node + block;
         }
@@ -1426,10 +1423,10 @@ fn testTicket(comptime len: u32) [len]u8 {
     comptime assert(len > fixed);
     var message: [len]u8 = @splat(0x7e);
     message[0] = 4; // new_session_ticket
-    std.mem.writeInt(u24, message[1..4], len - 4, .big);
+    mem.writeInt(u24, message[1..4], len - 4, .big);
     message[4..12].* = @splat(0); // ticket_lifetime, ticket_age_add
     message[12] = 0; // ticket_nonce, empty
-    std.mem.writeInt(u16, message[13..15], len - fixed, .big);
+    mem.writeInt(u16, message[13..15], len - fixed, .big);
     message[len - 2 ..][0..2].* = .{ 0, 0 }; // extensions, empty
     return message;
 }

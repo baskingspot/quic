@@ -8,8 +8,6 @@
 const std = @import("std");
 const testing = std.testing;
 
-const stream_id = @This();
-
 /// The largest stream ID, 2^62 - 1 (§2.1).
 pub const max: u64 = (1 << 62) - 1;
 

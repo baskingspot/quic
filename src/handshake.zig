@@ -33,9 +33,8 @@
 
 const std = @import("std");
 const testing = std.testing;
-const protection = @import("protection.zig");
 
-const handshake = @This();
+const protection = @import("protection.zig");
 
 /// The encryption levels of RFC 9001 §4, as far as handshake bytes go.
 ///

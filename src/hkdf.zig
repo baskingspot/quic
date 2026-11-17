@@ -14,9 +14,8 @@
 
 const std = @import("std");
 const testing = std.testing;
-
-const hkdf = @This();
-
+const assert = std.debug.assert;
+const mem = std.mem;
 pub const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 
 /// A traffic secret for SHA-256 is 32 bytes.
@@ -40,7 +39,7 @@ pub fn expandLabel(
     label: []const u8,
     context: []const u8,
 ) [len]u8 {
-    std.debug.assert(len <= std.math.maxInt(u16));
+    assert(len <= std.math.maxInt(u16));
 
     var info: [max_encoded_length]u8 = undefined;
     const encoded = encodeLabel(&info, @intCast(len), label, context);
@@ -53,11 +52,11 @@ pub fn expandLabel(
 /// The `HkdfLabel` structure itself, which RFC 9001 Appendix A prints for each
 /// of the QUIC labels. Exposed so the test can pin those bytes.
 pub fn encodeLabel(out: []u8, length: u16, label: []const u8, context: []const u8) []const u8 {
-    std.debug.assert(label.len <= max_label_length);
-    std.debug.assert(context.len <= 255);
+    assert(label.len <= max_label_length);
+    assert(context.len <= 255);
 
     var pos: usize = 0;
-    std.mem.writeInt(u16, out[pos..][0..2], length, .big);
+    mem.writeInt(u16, out[pos..][0..2], length, .big);
     pos += 2;
 
     const full_label_length = label_prefix.len + label.len;
@@ -103,7 +102,7 @@ test "RFC 9001 Appendix A.1, the HkdfLabel bytes for every QUIC label" {
     };
 
     for (cases) |case| {
-        var out: [hkdf.max_encoded_length]u8 = undefined;
+        var out: [max_encoded_length]u8 = undefined;
         const got = encodeLabel(&out, case.length, case.label, "");
         try testing.expectEqualSlices(u8, case.expected, got);
     }

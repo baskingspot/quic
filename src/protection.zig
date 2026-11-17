@@ -23,10 +23,17 @@
 
 const std = @import("std");
 const testing = std.testing;
-const hkdf = @import("hkdf.zig");
-const packet_number = @import("packet_number.zig");
+const assert = std.debug.assert;
+const mem = std.mem;
+const crypto = std.crypto;
+const Aes128 = crypto.core.aes.Aes128;
+const ChaCha20Ietf = crypto.stream.chacha.ChaCha20IETF;
+const Aes128Gcm = crypto.aead.aes_gcm.Aes128Gcm;
+const ChaCha20Poly1305 = crypto.aead.chacha_poly.ChaCha20Poly1305;
 
-const protection = @This();
+const hkdf = @import("hkdf.zig");
+pub const secret_length = hkdf.secret_length;
+const packet_number = @import("packet_number.zig");
 
 /// The AEADs this package protects packets with today. TLS_AES_256_GCM_SHA384
 /// is not wired up; its parts are in std.
@@ -39,8 +46,7 @@ pub const Suite = enum {
     /// TLS_AES_256_GCM_SHA384, which this package does not implement, and
     /// `deriveKeys` says so by returning an error rather than reading the first
     /// 32 bytes of a longer secret.
-    pub fn secretLength(self: Suite) usize {
-        _ = self;
+    pub fn secretLength(_: Suite) usize {
         return secret_length;
     }
 
@@ -57,8 +63,6 @@ pub const tag_length = 16;
 pub const sample_length = 16;
 pub const mask_length = 5;
 pub const nonce_length = 12;
-pub const secret_length = hkdf.secret_length;
-
 /// RFC 9001 §5.2: the version 1 Initial salt.
 pub const initial_salt = [_]u8{
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
@@ -163,7 +167,7 @@ pub fn mask(keys: *const Keys, sample: [sample_length]u8) [mask_length]u8 {
     switch (keys.suite) {
         .aes_128_gcm => {
             // §5.4.3: AES-ECB over the sample.
-            const ctx = std.crypto.core.aes.Aes128.initEnc(keys.hp[0..16].*);
+            const ctx = Aes128.initEnc(keys.hp[0..16].*);
             var block: [16]u8 = undefined;
             ctx.encrypt(&block, &sample);
             @memcpy(&out, block[0..mask_length]);
@@ -172,10 +176,10 @@ pub fn mask(keys: *const Keys, sample: [sample_length]u8) [mask_length]u8 {
             // §5.4.4: raw ChaCha20, counter from the first four bytes of the
             // sample little-endian, nonce from the last twelve, over five
             // zero bytes.
-            const counter = std.mem.readInt(u32, sample[0..4], .little);
+            const counter = mem.readInt(u32, sample[0..4], .little);
             const npub: [nonce_length]u8 = sample[4..16].*;
             const zeros: [mask_length]u8 = @splat(0);
-            std.crypto.stream.chacha.ChaCha20IETF.xor(
+            ChaCha20Ietf.xor(
                 &out,
                 &zeros,
                 counter,
@@ -244,7 +248,7 @@ pub fn seal(
     const npub = nonce(keys, pn);
     var tag: [tag_length]u8 = undefined;
     switch (keys.suite) {
-        .aes_128_gcm => std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(
+        .aes_128_gcm => Aes128Gcm.encrypt(
             out[0..plaintext.len],
             &tag,
             plaintext,
@@ -252,7 +256,7 @@ pub fn seal(
             npub,
             keys.key[0..16].*,
         ),
-        .chacha20_poly1305 => std.crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(
+        .chacha20_poly1305 => ChaCha20Poly1305.encrypt(
             out[0..plaintext.len],
             &tag,
             plaintext,
@@ -278,7 +282,7 @@ pub fn open(
 
     const npub = nonce(keys, pn);
     switch (keys.suite) {
-        .aes_128_gcm => std.crypto.aead.aes_gcm.Aes128Gcm.decrypt(
+        .aes_128_gcm => Aes128Gcm.decrypt(
             out[0..ciphertext.len],
             ciphertext,
             tag,
@@ -286,7 +290,7 @@ pub fn open(
             npub,
             keys.key[0..16].*,
         ) catch return error.AuthenticationFailed,
-        .chacha20_poly1305 => std.crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(
+        .chacha20_poly1305 => ChaCha20Poly1305.decrypt(
             out[0..ciphertext.len],
             ciphertext,
             tag,
@@ -321,8 +325,8 @@ pub fn sealPacket(
     payload: []const u8,
     packet: []u8,
 ) Error!u32 {
-    std.debug.assert(pn_len >= 1);
-    std.debug.assert(pn_len <= packet_number.max_len);
+    assert(pn_len >= 1);
+    assert(pn_len <= packet_number.max_len);
 
     const header_len = @as(usize, pn_offset) + pn_len;
     const total = header_len + payload.len + tag_length;

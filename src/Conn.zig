@@ -34,29 +34,36 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Cursor = @import("Cursor.zig");
+const assert = std.debug.assert;
+const mem = std.mem;
+const math = std.math;
+
 const CryptoStream = @import("CryptoStream.zig");
+const Cursor = @import("Cursor.zig");
+const error_code = @import("error_code.zig");
 const FlowControl = @import("FlowControl.zig");
-const ReceiveStream = @import("ReceiveStream.zig");
-const SendStream = @import("SendStream.zig");
-const StreamTable = @import("StreamTable.zig");
-const stream_id = @import("stream_id.zig");
 const frame = @import("frame.zig");
-const TransportParameters = @import("TransportParameters.zig");
-const setup = @import("connection_setup.zig");
-const seam = @import("handshake.zig");
 const packet = @import("packet.zig");
 const packet_number = @import("packet_number.zig");
 const protection = @import("protection.zig");
+const ReceiveStream = @import("ReceiveStream.zig");
 const Recovery = @import("Recovery.zig");
-const Writer = @import("Writer.zig");
-const varint = @import("varint.zig");
-const error_code = @import("error_code.zig");
-
-const Conn = @This();
-
 /// Nanoseconds, from the module that measures them.
 pub const Duration = Recovery.Duration;
+/// The caller's side of the timer, which only the tests here exercise: a
+/// connection owns no timer, so "when do I wake up" is asked of `RecoveryDriver`
+/// over the spaces the machine owns.
+const RecoveryDriver = @import("RecoveryDriver.zig");
+const seam = @import("handshake.zig");
+const SendStream = @import("SendStream.zig");
+const setup = @import("connection_setup.zig");
+const stream_id = @import("stream_id.zig");
+const StreamTable = @import("StreamTable.zig");
+const TransportParameters = @import("TransportParameters.zig");
+const varint = @import("varint.zig");
+const Writer = @import("Writer.zig");
+
+const Conn = @This();
 
 const Range = struct { smallest: u64, largest: u64 };
 
@@ -247,7 +254,7 @@ pub const SentStreams = struct {
     frames: [stream_frames_per_packet]Written = undefined,
 
     pub fn written(self: *const SentStreams) []const Written {
-        std.debug.assert(self.len <= stream_frames_per_packet);
+        assert(self.len <= stream_frames_per_packet);
         return self.frames[0..self.len];
     }
 };
@@ -348,7 +355,7 @@ pub const PeerParameters = struct {
     /// lose a bit. The two millisecond values are saturated rather than
     /// wrapped: a 2^62 idle timeout is "never", not a small number.
     pub fn fromDecoded(decoded: *const TransportParameters) PeerParameters {
-        std.debug.assert(decoded.ackDelayExponent() <= TransportParameters.max_ack_delay_exponent);
+        assert(decoded.ackDelayExponent() <= TransportParameters.max_ack_delay_exponent);
         return .{
             .max_data = decoded.initial_max_data orelse 0,
             .stream_data = .{
@@ -537,9 +544,9 @@ pub const Opening = struct {
     pub fn authenticate(self: Opening, datagram: []const u8, copy: []u8, plaintext: []u8) Error!void {
         const long = try packet.parseLong(datagram);
         // Pairing the keys with another datagram is a packet that never opens.
-        std.debug.assert(long.kind == .initial);
-        std.debug.assert(long.version == .v1);
-        std.debug.assert(std.mem.eql(u8, long.destination_connection_id, self.destination_connection_id));
+        assert(long.kind == .initial);
+        assert(long.version == .v1);
+        assert(mem.eql(u8, long.destination_connection_id, self.destination_connection_id));
 
         const length = @as(usize, long.body_offset) + long.length;
         if (copy.len < length) return error.NoSpace;
@@ -748,8 +755,8 @@ pub const Space = struct {
     /// path, not to the space (RFC 9002 A.2).
     pub fn discard(self: *Space) void {
         self.recovery.discard();
-        std.crypto.secureZero(u8, std.mem.asBytes(&self.send_keys));
-        std.crypto.secureZero(u8, std.mem.asBytes(&self.receive_keys));
+        std.crypto.secureZero(u8, mem.asBytes(&self.send_keys));
+        std.crypto.secureZero(u8, mem.asBytes(&self.receive_keys));
         self.next_packet_number = 0;
         self.largest_received = null;
         self.acked_through = null;
@@ -759,7 +766,7 @@ pub const Space = struct {
     /// Note a packet number that arrived, merging it into the ranges an ACK
     /// frame is built from (§19.3.1).
     fn record(self: *Space, pn: u64) void {
-        std.debug.assert(self.range_count <= range_capacity);
+        assert(self.range_count <= range_capacity);
         var buf: [range_capacity + 1]Range = undefined;
         var count: usize = 0;
         var inserted = false;
@@ -921,30 +928,30 @@ fn atHome(home: ?*const Conn, self: *const Conn) bool {
 
 /// Record this connection's address on first use and refuse a later move.
 fn pin(self: *Conn) void {
-    std.debug.assert(atHome(self.home, self));
+    assert(atHome(self.home, self));
     if (self.home == null) self.home = self;
 }
 
 pub fn init(config: Config) Conn {
-    std.debug.assert(config.packet_number_len >= 1);
-    std.debug.assert(config.packet_number_len <= 4);
+    assert(config.packet_number_len >= 1);
+    assert(config.packet_number_len <= 4);
     // §18.2: an exponent above 20 describes a delay nobody can measure.
-    std.debug.assert(config.ack_delay_exponent <= 20);
+    assert(config.ack_delay_exponent <= 20);
     // §7.4: with a driver the peer's parameters come from the handshake, and a
     // second source for the same limits is the bug this refuses.
-    std.debug.assert(config.tls == null or config.peer == null);
+    assert(config.tls == null or config.peer == null);
 
-    std.debug.assert(streamsValid(config.stream_slots, config.streams));
-    std.debug.assert(lossTablesValid(config.loss));
+    assert(streamsValid(config.stream_slots, config.streams));
+    assert(lossTablesValid(config.loss));
     // §4.6: credit the table cannot back turns a legal peer into a connection
     // error, so it is refused at construction.
-    std.debug.assert(config.max_streams_bidi + config.max_streams_uni <= config.streams.len);
+    assert(config.max_streams_bidi + config.max_streams_uni <= config.streams.len);
 
     // §13.3's buffer length is a CRYPTO offset, and offsets are `u32` in this
     // package. A buffer that cannot be addressed is a configuration error.
-    std.debug.assert(config.crypto_sent.initial.len <= std.math.maxInt(u32));
-    std.debug.assert(config.crypto_sent.handshake.len <= std.math.maxInt(u32));
-    std.debug.assert(config.crypto_sent.app.len <= std.math.maxInt(u32));
+    assert(config.crypto_sent.initial.len <= math.maxInt(u32));
+    assert(config.crypto_sent.handshake.len <= math.maxInt(u32));
+    assert(config.crypto_sent.app.len <= math.maxInt(u32));
 
     const secrets = protection.initialSecrets(config.original_destination_connection_id);
     const suite = protection.Suite.aes_128_gcm;
@@ -957,7 +964,7 @@ pub fn init(config: Config) Conn {
         // first Initial carried, because that is what a Retry's tag covers
         // (§5.8 of RFC 9001). A server never needs it.
         .attempt = if (config.role == .client)
-            setup.Client.init(config.original_destination_connection_id)
+            .init(config.original_destination_connection_id)
         else
             null,
         .packet_number_len = config.packet_number_len,
@@ -1230,7 +1237,7 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
 
     // A packet length is a `u32` everywhere else in this package, because a
     // datagram is at most 65527 bytes (§12.2), so the narrowing is total.
-    std.debug.assert(at.bytes.len <= std.math.maxInt(u32));
+    assert(at.bytes.len <= math.maxInt(u32));
     return .{
         .id = at.id,
         .packet_number = opened.packet_number,
@@ -1250,7 +1257,7 @@ fn open(self: *Conn, at: Located, plaintext: []u8) Error!Raw {
 /// copied out of the receive buffer, which the caller reuses.
 fn nameFrom(self: *Conn, at: Located) Error!void {
     const supplied = at.source_connection_id orelse return;
-    const same = std.mem.eql(u8, supplied, self.destination_connection_id);
+    const same = mem.eql(u8, supplied, self.destination_connection_id);
 
     // A packet that already names this destination confirms the name and needs
     // nothing copied, whatever form it has.
@@ -1526,7 +1533,7 @@ fn commit(self: *Conn, id: SpaceId, number: u64) void {
         // The packet opened in this space and nothing between then and here
         // discards it: a client's Initial keys go on a Handshake send, a
         // server's on a Handshake packet, and both leave this space alone.
-        std.debug.assert(false);
+        assert(false);
         return;
     };
     space.largest_received = if (space.largest_received) |largest|
@@ -1603,8 +1610,8 @@ pub const Datagram = struct {
             const at = conn.locate(rest) catch {
                 // The packet has no readable end, so there is no boundary to
                 // find the next one at. The rest of the datagram goes with it.
-                std.debug.assert(self.dropped < std.math.maxInt(u16));
-                std.debug.assert(self.dropped < std.math.maxInt(u16));
+                assert(self.dropped < math.maxInt(u16));
+                assert(self.dropped < math.maxInt(u16));
                 self.dropped += 1;
                 self.cursor.pos = @intCast(self.bytes.len);
                 return null;
@@ -1616,7 +1623,7 @@ pub const Datagram = struct {
                 // of it is not the peer's doing: report it, do not drop it.
                 error.NoSpace => return err,
                 else => {
-                    std.debug.assert(self.dropped < std.math.maxInt(u16));
+                    assert(self.dropped < math.maxInt(u16));
                     self.dropped += 1;
                     continue;
                 },
@@ -1656,7 +1663,7 @@ pub fn installSpaces(self: *Conn) Error!void {
         // §8.2: ours go out in the first message, so the driver takes them
         // before it is asked for one.
         .pending => {
-            std.debug.assert(ownParametersAgree(self));
+            assert(ownParametersAgree(self));
             try tls.setTransportParameters(self.transport_parameters);
             self.parameters = .handed;
         },
@@ -1684,7 +1691,7 @@ pub fn installSpaces(self: *Conn) Error!void {
 /// §7.4 puts the adoption before the first stream: the limits are read when a
 /// stream opens, so the assertions state that nothing opened or sent before them.
 fn adoptPeer(self: *Conn, tls: seam.Driver) Error!void {
-    std.debug.assert(self.peer == null);
+    assert(self.peer == null);
     const bytes = (try tls.peerTransportParameters()) orelse return;
 
     // The decoder's role is the endpoint reading: a server refuses the four
@@ -1699,9 +1706,9 @@ fn adoptPeer(self: *Conn, tls: seam.Driver) Error!void {
 
     // §7.4: the limits are read at the first stream and the first byte, so
     // nothing may have used the old zeros.
-    std.debug.assert(self.send_window.sent == 0);
-    std.debug.assert(self.opened_local.bidi == 0);
-    std.debug.assert(self.opened_local.uni == 0);
+    assert(self.send_window.sent == 0);
+    assert(self.opened_local.bidi == 0);
+    assert(self.opened_local.uni == 0);
     self.adopt(.fromDecoded(&decoded));
 }
 
@@ -1717,7 +1724,7 @@ fn adoptPeer(self: *Conn, tls: seam.Driver) Error!void {
 fn checkIdentity(self: *const Conn, decoded: *const TransportParameters) Error!void {
     const initial_source = decoded.initial_source_connection_id orelse
         return error.TransportParameter;
-    if (!std.mem.eql(u8, initial_source, self.destination_connection_id)) {
+    if (!mem.eql(u8, initial_source, self.destination_connection_id)) {
         return error.TransportParameter;
     }
     if (self.role == .server) return;
@@ -1725,7 +1732,7 @@ fn checkIdentity(self: *const Conn, decoded: *const TransportParameters) Error!v
     const attempt = self.attempt.?;
     const original = decoded.original_destination_connection_id orelse
         return error.TransportParameter;
-    if (!std.mem.eql(u8, original, attempt.original_destination_connection_id)) {
+    if (!mem.eql(u8, original, attempt.original_destination_connection_id)) {
         return error.TransportParameter;
     }
 
@@ -1737,7 +1744,7 @@ fn checkIdentity(self: *const Conn, decoded: *const TransportParameters) Error!v
         return;
     }
     const echoed = retry_source orelse return error.TransportParameter;
-    if (!std.mem.eql(u8, echoed, self.retry_source_connection_id)) {
+    if (!mem.eql(u8, echoed, self.retry_source_connection_id)) {
         return error.TransportParameter;
     }
 }
@@ -1745,7 +1752,7 @@ fn checkIdentity(self: *const Conn, decoded: *const TransportParameters) Error!v
 /// Make the peer's parameters the limits this connection works under (§4.1,
 /// §4.6, §5.3 of RFC 9002). Called once, before any stream or data.
 fn adopt(self: *Conn, peer: PeerParameters) void {
-    std.debug.assert(self.peer == null);
+    assert(self.peer == null);
     self.peer = peer;
     self.send_window = .init(peer.max_data);
     self.send_streams = peer.stream_data;
@@ -1774,7 +1781,7 @@ fn ownParametersAgree(self: *const Conn) bool {
     if ((decoded.initial_max_streams_bidi orelse 0) != self.streams_advertised.bidi) return false;
     if ((decoded.initial_max_streams_uni orelse 0) != self.streams_advertised.uni) return false;
     const source = decoded.initial_source_connection_id orelse return false;
-    return std.mem.eql(u8, source, self.source_connection_id);
+    return mem.eql(u8, source, self.source_connection_id);
 }
 
 /// Drain one handshake message into a packet.
@@ -1828,7 +1835,7 @@ fn paddedInitialPayload(self: *Conn, written: u32) Error!u32 {
         }
         payload += min_initial_datagram - total;
     }
-    std.debug.assert(payload <= std.math.maxInt(u32));
+    assert(payload <= math.maxInt(u32));
     return payload;
 }
 
@@ -1879,7 +1886,7 @@ pub fn writeHandshake(self: *Conn, frames: []u8, out: []u8, now: Duration) Error
     // After the seal: a frame that never left must not be replayed as though it
     // had, or the peer would see the same offset twice with different data the
     // next time the machine composed it.
-    std.debug.assert(message.bytes.len <= std.math.maxInt(u32));
+    assert(message.bytes.len <= math.maxInt(u32));
     @memcpy(sent.bytes[sent.len..][0..message.bytes.len], message.bytes);
     sent.len += @intCast(message.bytes.len);
 
@@ -1944,7 +1951,7 @@ fn installSpace(
     secrets: seam.Secrets,
     suite: protection.Suite,
 ) Error!void {
-    std.debug.assert(id != .initial);
+    assert(id != .initial);
     const client = try protection.deriveKeys(secrets.client, suite);
     const server = try protection.deriveKeys(secrets.server, suite);
     const space: Space = .{
@@ -2190,7 +2197,7 @@ pub fn joinStream(self: *Conn, id: u64) Error!*Stream {
     if (stream_id.direction(id) != .bidi) return error.WrongDirection;
 
     const existing = streamOf(slot);
-    std.debug.assert(existing.halves == .recv_only);
+    assert(existing.halves == .recv_only);
     existing.send = SendStream.init(id, existing.send_buffer, self.send_streams.bidi_local);
     existing.halves = .both;
     slot.send = &existing.send;
@@ -2336,7 +2343,7 @@ fn onStreamFrame(
     // counter inside the stream is the only thing that may raise it, and this
     // subtraction is the one place the two meet: assert it here rather than
     // trusting a reordering inside `ReceiveStream` never to lower it.
-    std.debug.assert(entry.recv.highest >= before);
+    assert(entry.recv.highest >= before);
     try self.receive_window.onStreamProgress(entry.recv.highest - before);
 
     const news: StreamEvent = .{
@@ -2658,7 +2665,7 @@ pub fn writeStreams(self: *Conn, packing: Packing) Error!?Packet {
     // acknowledgment.
     const space = try self.spaceFor(.app);
     if (packing.offers.len == 0) return null;
-    std.debug.assert(packing.written.len > 0);
+    assert(packing.written.len > 0);
 
     // Every offer is checked before any segment is taken, so an error cannot
     // leave one stream's cursor ahead of a packet that never left.
@@ -2765,7 +2772,7 @@ fn packOffer(self: *Conn, packer: *Packer, offer: Offer, written: []Written) Err
         // §19.8: FIN rides only the frame that reaches the final size, which is
         // why trimming an offer can drop the flag and `nextSegment` decides.
         const segment = entry.send.nextSegment(length) orelse unreachable;
-        std.debug.assert(segment.retransmit == offered.retransmit);
+        assert(segment.retransmit == offered.retransmit);
         // The overhead above is an upper bound on the frame's own bytes, and the
         // data was clamped to what is left after it, so this cannot run out.
         frame.write(&packer.writer, .{ .stream = .{
@@ -2808,7 +2815,7 @@ fn appPayloadRoom(self: *const Conn, out: []u8) u32 {
     const overhead = 1 + self.destination_connection_id.len +
         @as(usize, self.packet_number_len) + protection.tag_length;
     if (out.len <= overhead) return 0;
-    return @intCast(@min(out.len - overhead, std.math.maxInt(u32)));
+    return @intCast(@min(out.len - overhead, math.maxInt(u32)));
 }
 
 /// §4.2: apply a MAX_DATA the peer sent, raising the connection-wide allowance.
@@ -2874,7 +2881,7 @@ fn maxDataOwed(self: *Conn) ?u64 {
 /// while the peer can still use it: §13.3 stops at Size Known, and so does
 /// `nextMaxStreamData`.
 fn maxStreamDataOwed(entry: *const Stream) ?u64 {
-    std.debug.assert(entry.canRecv());
+    assert(entry.canRecv());
     if (entry.recv.nextMaxStreamData()) |limit| return limit;
     if (entry.max_stream_data == .lost and entry.recv.state == .recv) return entry.recv.limit;
     return null;
@@ -2991,7 +2998,7 @@ pub fn onRetry(self: *Conn, retry: *const packet.Retry, raw: []const u8) Error!s
     // §17.2.5.2: a Retry that does not name this endpoint's own connection ID is
     // discarded. Checked before the integrity tag, like the state checks in
     // `Client.onRetry`, because it costs nothing and settles the question.
-    if (!std.mem.eql(u8, retry.destination_connection_id, self.source_connection_id)) return .ignored;
+    if (!mem.eql(u8, retry.destination_connection_id, self.source_connection_id)) return .ignored;
 
     // The connection ID and token point into the datagram, which the caller will
     // reuse. Refused before anything is adopted, so a configuration too small for
@@ -3030,7 +3037,7 @@ fn rekeyInitial(self: *Conn, destination_connection_id: []const u8) void {
     // the server, and its Initial keys only go once it has sent a Handshake
     // packet, which needs that flight first. So the space is always here, and the
     // assert says so rather than letting a rejected Retry resurrect dead keys.
-    std.debug.assert(self.initial != null);
+    assert(self.initial != null);
 
     // §17.2.5.3: "A client MUST NOT reset the packet number for any packet
     // number space after processing a Retry packet." The counter is the one
@@ -3138,7 +3145,7 @@ fn sealFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8, write: Wr
     const pn = space.next_packet_number;
     const pn_len = self.packet_number_len;
 
-    std.debug.assert(frames.len <= std.math.maxInt(u32));
+    assert(frames.len <= math.maxInt(u32));
     const tracked = write.ack_eliciting or write.in_flight;
 
     var writer: Writer = .init(out);
@@ -3170,7 +3177,7 @@ fn sealFrames(self: *Conn, id: SpaceId, frames: []const u8, out: []u8, write: Wr
     if (tracked and !space.recovery.hasRoom()) return error.NoSpace;
 
     const sealed = try protection.sealPacket(&space.send_keys, pn, pn_offset, pn_len, frames, out);
-    std.debug.assert(sealed == total);
+    assert(sealed == total);
 
     if (tracked) try space.recovery.onPacketSent(
         pn,
@@ -3290,7 +3297,7 @@ fn ackPayload(space: *const Space, payload: []u8) Error![]const u8 {
     var index: usize = 1;
     while (index < space.range_count) : (index += 1) {
         const range = space.ranges[index];
-        std.debug.assert(previous_smallest >= range.largest + 2);
+        assert(previous_smallest >= range.largest + 2);
         // Each value is below 2^62, so eight bytes hold it and the scratch,
         // sized for every pair at eight bytes, cannot run out.
         varint.write(&scratch_writer, previous_smallest - range.largest - 2) catch unreachable;
@@ -4348,11 +4355,6 @@ test "RFC 9000 §4.1, a window with no room is a different answer from a used on
     try testing.expect((try client.writeStreams(roomy)) != null);
     try testing.expectEqual(@as(u64, 5), entry.send.sent);
 }
-
-/// The caller's side of the timer, which only the tests here exercise: a
-/// connection owns no timer, so "when do I wake up" is asked of `RecoveryDriver`
-/// over the spaces the machine owns.
-const RecoveryDriver = @import("RecoveryDriver.zig");
 
 /// One endpoint's loss state, where a caller keeps it: outside `Conn`.
 ///
@@ -5469,7 +5471,7 @@ test "RFC 9000 §18.2, the peer's parameters carry their defaults and units" {
 
     // A timeout too large for nanoseconds is "never", not a small number.
     const huge: TransportParameters = .{ .max_idle_timeout = (1 << 62) - 1 };
-    try testing.expectEqual(std.math.maxInt(u64), PeerParameters.fromDecoded(&huge).max_idle_timeout);
+    try testing.expectEqual(math.maxInt(u64), PeerParameters.fromDecoded(&huge).max_idle_timeout);
 }
 
 test "RFC 9000 §18.2, the parameters this endpoint sends must agree with its configuration" {
@@ -8143,7 +8145,7 @@ test "RFC 9000 §19.3, a received ACK delay is scaled by the peer's exponent, no
     // The unit conversion itself, including the operator that keeps a hostile
     // 2^62 from wrapping into a small delay.
     try testing.expectEqual(Recovery.ms(8), client.ackDelay(1000));
-    try testing.expectEqual(std.math.maxInt(u64), client.ackDelay(std.math.maxInt(u64)));
+    try testing.expectEqual(math.maxInt(u64), client.ackDelay(math.maxInt(u64)));
 
     var acked: [8]Recovery.SentPacket = undefined;
     var lost: [8]Recovery.SentPacket = undefined;
@@ -8378,7 +8380,7 @@ fn encodeParameters(
 /// keys crossed the way its role needs them. Tests that run the seam use
 /// `handshake.Stub` instead and let the machine install the space.
 fn plantSpace(conn: *Conn, id: SpaceId, send: protection.Keys, receive: protection.Keys) void {
-    std.debug.assert(id != .initial);
+    assert(id != .initial);
     // What a driver fills in: the keys for the level, and nothing else. The
     // counters, the ranges, and the loss handle start where the connection
     // leaves them: a reinstall keeps the table the caller gave for the space.

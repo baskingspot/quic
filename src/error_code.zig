@@ -8,9 +8,8 @@
 
 const std = @import("std");
 const testing = std.testing;
-const frame = @import("frame.zig");
 
-const error_code = @This();
+const frame = @import("frame.zig");
 
 /// The transport error codes, plus anything a peer sends that this build does
 /// not know.

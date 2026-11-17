@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const assert = std.debug.assert;
 
 const ReceiveStream = @This();
 
@@ -82,7 +83,7 @@ reset_code: ?u64 = null,
 stop_sending_code: ?u64 = null,
 
 pub fn init(id: u64, buffer: []u8, limit: u64) ReceiveStream {
-    std.debug.assert(buffer.len > 0);
+    assert(buffer.len > 0);
     return .{ .id = id, .buffer = buffer, .limit = limit };
 }
 
@@ -113,7 +114,7 @@ pub fn nextMaxStreamData(self: *const ReceiveStream) ?u64 {
 
     // §4.1: the limit is an absolute offset, and it only ever grows, so the
     // read position can never be past it.
-    std.debug.assert(self.limit >= self.read_offset);
+    assert(self.limit >= self.read_offset);
 
     const target = self.window();
     if (target <= self.limit) return null;

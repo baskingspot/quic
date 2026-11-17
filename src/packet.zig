@@ -14,11 +14,14 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Cursor = @import("Cursor.zig");
-const Writer = @import("Writer.zig");
-const varint = @import("varint.zig");
+const expect = testing.expect;
+const expectEqual = testing.expectEqual;
+const mem = std.mem;
+const assert = std.debug.assert;
 
-const packet = @This();
+const Cursor = @import("Cursor.zig");
+const varint = @import("varint.zig");
+const Writer = @import("Writer.zig");
 
 /// The longest connection ID version 1 allows (§17.2). Another version may
 /// allow more, and version negotiation has to be able to echo it.
@@ -140,9 +143,9 @@ pub const VersionNegotiation = struct {
     }
 
     pub fn at(self: *const VersionNegotiation, index: u32) Version {
-        std.debug.assert(index < self.count());
+        assert(index < self.count());
         const start = @as(usize, index) * 4;
-        return @fromBackingInt(@intCast(std.mem.readInt(u32, self.versions[start..][0..4], .big)));
+        return @fromBackingInt(@intCast(mem.readInt(u32, self.versions[start..][0..4], .big)));
     }
 };
 
@@ -220,7 +223,7 @@ pub fn parseInvariant(bytes: []const u8) Error!Invariant {
     if (first[0] & 0x80 == 0) return error.NotLongHeader;
 
     const version_bytes = cursor.take(4) orelse return error.Truncated;
-    const version: Version = @fromBackingInt(@intCast(std.mem.readInt(u32, version_bytes[0..4], .big)));
+    const version: Version = @fromBackingInt(@intCast(mem.readInt(u32, version_bytes[0..4], .big)));
 
     // §17.2: the fixed bit is set unless this is a Version Negotiation packet,
     // whose unused bits are arbitrary. A packet with the bit clear is not valid
@@ -511,7 +514,7 @@ fn writeConnectionId(writer: *Writer, bytes: []const u8) Error!void {
 
 fn writeVersion(writer: *Writer, version: Version) Error!void {
     var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, @backingInt(version), .big);
+    mem.writeInt(u32, &buf, @backingInt(version), .big);
     try writer.put(&buf);
 }
 
@@ -529,9 +532,6 @@ fn writeVarint(writer: *Writer, value: u64) Error!void {
         error.Overflow => unreachable,
     };
 }
-
-const expect = testing.expect;
-const expectEqual = testing.expectEqual;
 
 test "RFC 9000 §17.2.2, a client Initial parses field by field" {
     const bytes = [_]u8{

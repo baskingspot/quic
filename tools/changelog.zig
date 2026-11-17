@@ -26,6 +26,8 @@
 
 const std = @import("std");
 const Io = std.Io;
+const mem = std.mem;
+const print = std.debug.print;
 
 /// Keep a Changelog's six sections, and the only `###` headings this file may
 /// have inside a release.
@@ -52,10 +54,10 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--self-test")) return selfTest();
+    if (args.len > 1 and mem.eql(u8, args[1], "--self-test")) return selfTest();
 
     const text = Io.Dir.cwd().readFileAlloc(init.io, "CHANGELOG.md", arena, .limited(1 << 20)) catch |err| {
-        std.debug.print("changelog: cannot read CHANGELOG.md: {t}\n", .{err});
+        print("changelog: cannot read CHANGELOG.md: {t}\n", .{err});
         std.process.exit(1);
     };
 
@@ -63,8 +65,8 @@ pub fn main(init: std.process.Init) !void {
     const report = check(text, &log_buffer);
     if (report.failures == 0) return;
 
-    std.debug.print("{s}", .{report.log});
-    std.debug.print("changelog: {d} structure failure(s)\n", .{report.failures});
+    print("{s}", .{report.log});
+    print("changelog: {d} structure failure(s)\n", .{report.failures});
     std.process.exit(1);
 }
 
@@ -75,15 +77,15 @@ fn check(text: []const u8, log: []u8) Report {
     var seen: [sections.len]bool = @splat(false);
     var release: u32 = 1;
 
-    var lines = std.mem.splitScalar(u8, text, '\n');
+    var lines = mem.splitScalar(u8, text, '\n');
     var previous: []const u8 = "";
     var number: u32 = 0;
     while (lines.next()) |line| {
         number += 1;
-        const trimmed = std.mem.trimEnd(u8, line, " \r");
+        const trimmed = mem.trimEnd(u8, line, " \r");
 
         // A new release starts a new set of sections.
-        if (std.mem.startsWith(u8, trimmed, "## ")) {
+        if (mem.startsWith(u8, trimmed, "## ")) {
             seen = @splat(false);
             release += 1;
         }
@@ -93,18 +95,18 @@ fn check(text: []const u8, log: []u8) Report {
         // happened rather than "unknown section".
         for (sections) |section| {
             var buffer: [32]u8 = undefined;
-            const heading = std.mem.print(&buffer, "### {s}", .{section}) catch unreachable;
-            if (std.mem.find(u8, trimmed, heading) == null) continue;
-            if (std.mem.eql(u8, trimmed, heading)) break;
+            const heading = mem.print(&buffer, "### {s}", .{section}) catch unreachable;
+            if (mem.find(u8, trimmed, heading) == null) continue;
+            if (mem.eql(u8, trimmed, heading)) break;
             failures += 1;
             used += append(log[used..], "changelog: {d}: '{s}' does not own its line\n", .{ number, heading });
             break;
         }
 
-        if (std.mem.startsWith(u8, trimmed, "### ")) {
+        if (mem.startsWith(u8, trimmed, "### ")) {
             const name = trimmed[4..];
             const known = for (sections, 0..) |section, index| {
-                if (std.mem.eql(u8, name, section)) break index;
+                if (mem.eql(u8, name, section)) break index;
             } else null;
             if (known) |index| {
                 if (seen[index]) {
@@ -145,7 +147,7 @@ fn check(text: []const u8, log: []u8) Report {
 /// Format one message into `log`, or drop it when the report is full. A cut
 /// report still fails; the count is what the exit code depends on.
 fn append(log: []u8, comptime format: []const u8, args: anytype) usize {
-    const written = std.mem.print(log, format, args) catch return 0;
+    const written = mem.print(log, format, args) catch return 0;
     return written.len;
 }
 
@@ -172,16 +174,16 @@ fn selfTest() void {
         var log_buffer: [log_capacity]u8 = undefined;
         const report = check(case.text, &log_buffer);
         if (report.failures == case.failures) continue;
-        std.debug.print(
+        print(
             "changelog --self-test: '{s}' produced {d} failure(s), expected {d}\n",
             .{ case.name, report.failures, case.failures },
         );
-        std.debug.print("{s}", .{report.log});
+        print("{s}", .{report.log});
         failed += 1;
     }
 
     if (failed != 0) {
-        std.debug.print("changelog --self-test: {d} case(s) wrong\n", .{failed});
+        print("changelog --self-test: {d} case(s) wrong\n", .{failed});
         std.process.exit(1);
     }
 }

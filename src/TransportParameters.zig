@@ -16,9 +16,13 @@
 
 const std = @import("std");
 const testing = std.testing;
+const expect = testing.expect;
+const expectEqual = testing.expectEqual;
+const mem = std.mem;
+
 const Cursor = @import("Cursor.zig");
-const Writer = @import("Writer.zig");
 const varint = @import("varint.zig");
+const Writer = @import("Writer.zig");
 
 const TransportParameters = @This();
 
@@ -348,8 +352,8 @@ fn readPreferredAddress(value: []const u8) Error!PreferredAddress {
     @memcpy(&address.ipv4, ipv4);
     @memcpy(&address.ipv6, ipv6);
     @memcpy(&address.reset_token, token);
-    address.ipv4_port = std.mem.readInt(u16, ipv4_port[0..2], .big);
-    address.ipv6_port = std.mem.readInt(u16, ipv6_port[0..2], .big);
+    address.ipv4_port = mem.readInt(u16, ipv4_port[0..2], .big);
+    address.ipv6_port = mem.readInt(u16, ipv6_port[0..2], .big);
     address.connection_id = connection_id;
     return address;
 }
@@ -398,7 +402,7 @@ fn writeInt(writer: *Writer, id: Id, value: u64) Error!void {
 
 fn writeU16(writer: *Writer, value: u16) Error!void {
     var buf: [2]u8 = undefined;
-    std.mem.writeInt(u16, &buf, value, .big);
+    mem.writeInt(u16, &buf, value, .big);
     try writer.put(&buf);
 }
 
@@ -410,9 +414,6 @@ fn writeVarint(writer: *Writer, value: u64) Error!void {
         error.Overflow => unreachable,
     };
 }
-
-const expect = testing.expect;
-const expectEqual = testing.expectEqual;
 
 /// Append one parameter to `writer`.
 fn putParam(writer: *Writer, id: u64, value: []const u8) !void {

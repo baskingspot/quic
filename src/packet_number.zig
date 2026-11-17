@@ -11,9 +11,10 @@
 
 const std = @import("std");
 const testing = std.testing;
-const Writer = @import("Writer.zig");
+const assert = std.debug.assert;
+const mem = std.mem;
 
-const packet_number = @This();
+const Writer = @import("Writer.zig");
 
 /// The largest packet number, 2^62 - 1 (§12.3).
 pub const max: u64 = (1 << 62) - 1;
@@ -30,12 +31,12 @@ pub const max_len: u3 = 4;
 /// §17.1 asks for one bit more than the base-2 logarithm of the unacknowledged
 /// range, which is the bit length of `pn - largest_acked`.
 pub fn encodeLength(pn: u64, largest_acked: ?u64, limit: u3) u3 {
-    std.debug.assert(pn <= max);
-    std.debug.assert(limit >= 1);
-    std.debug.assert(limit <= max_len);
+    assert(pn <= max);
+    assert(limit >= 1);
+    assert(limit <= max_len);
 
     const unacked = if (largest_acked) |acked| blk: {
-        std.debug.assert(pn > acked);
+        assert(pn > acked);
         break :blk pn - acked;
     } else pn + 1;
 
@@ -47,12 +48,12 @@ pub fn encodeLength(pn: u64, largest_acked: ?u64, limit: u3) u3 {
 
 /// Write the low `len` bytes of `pn`, big-endian.
 pub fn write(writer: *Writer, pn: u64, len: u3) Writer.Error!void {
-    std.debug.assert(pn <= max);
-    std.debug.assert(len >= 1);
-    std.debug.assert(len <= max_len);
+    assert(pn <= max);
+    assert(len >= 1);
+    assert(len <= max_len);
 
     var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, @truncate(pn), .big);
+    mem.writeInt(u32, &buf, @truncate(pn), .big);
     try writer.put(buf[4 - len ..]);
 }
 
@@ -63,13 +64,13 @@ pub fn write(writer: *Writer, pn: u64, len: u3) Writer.Error!void {
 /// basis for the search; `null` means none was received and the truncated
 /// value is the number itself, because the sender must have sent it whole.
 pub fn decode(truncated: u64, bits: u6, largest: ?u64) u64 {
-    std.debug.assert(bits >= 8);
-    std.debug.assert(bits <= 32);
-    std.debug.assert(bits % 8 == 0);
+    assert(bits >= 8);
+    assert(bits <= 32);
+    assert(bits % 8 == 0);
 
     const largest_received = largest orelse return truncated;
     const window: u64 = @as(u64, 1) << @intCast(bits);
-    std.debug.assert(truncated < window);
+    assert(truncated < window);
 
     const expected = largest_received + 1;
     const half = window / 2;
