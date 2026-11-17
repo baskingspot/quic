@@ -7,6 +7,14 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `quic.Storage(limits)`, the machine layer's twin of `quic-io`'s `Sizing`:
+  every buffer a `Conn` points into, sized at compile time from
+  `quic.StorageLimits` (streams, stream_ring, sent_packets, crypto, datagram),
+  with no allocator. `config(.{ .role, .connection_id, .tls, .parameters })`
+  returns a complete `Conn.Config`, transport parameters encoded with the
+  windows the limits decide; `opening(datagram)` reads a server's identity
+  into it and `recoveryDriver()` times its loss state. It must not move once
+  `config` is called.
 - `Conn.allowStreams(direction, count)`: the caller grants the peer more
   streams (§4.6) beyond the credit `Conn.closeStream` gives back. The raise is
   owed as MAX_STREAMS and owed again if the packet carrying it is lost (§13.3).

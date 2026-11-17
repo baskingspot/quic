@@ -43,6 +43,12 @@ pub const ReceiveStream = @import("ReceiveStream.zig");
 pub const FlowControl = @import("FlowControl.zig");
 pub const StreamTable = @import("StreamTable.zig");
 
+/// Every buffer one `Conn` points into, sized at compile time: the machine
+/// layer's twin of `quic-io`'s `Sizing`.
+pub const Storage = storage.Storage;
+pub const StorageLimits = storage.Limits;
+pub const storage = @import("storage.zig");
+
 test {
     _ = @import("Cursor.zig");
     _ = CryptoStream;
@@ -66,4 +72,5 @@ test {
     _ = ReceiveStream;
     _ = FlowControl;
     _ = StreamTable;
+    _ = storage;
 }
