@@ -195,8 +195,9 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(hq_tests).step);
     }
 
-    // The echo example: the machine called the way an application would. It is
-    // an executable rather than a test because its value is in being read.
+    // The echo example: the machine driven directly, with a stub handshake and no
+    // socket shell. It is an executable rather than a test because its value is
+    // in being read.
     const echo_mod = b.createModule(.{
         .root_source_file = b.path("examples/echo.zig"),
         .target = target,

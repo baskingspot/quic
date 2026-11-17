@@ -15,7 +15,7 @@ test:
 test-no-tls:
     zig build test -Dno-tls --summary all
 
-[doc("Build and run the echo example: the machine called as an application would")]
+[doc("Build and run the echo example: `quic.Conn` driven directly with a stub handshake, no sockets and no crypto. examples/hq_server.zig is the real thing")]
 [group("test")]
 example:
     zig build example-bin

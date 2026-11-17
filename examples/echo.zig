@@ -1,12 +1,27 @@
-//! An echo endpoint on top of `quic.Conn`: one process, a client and a server,
-//! and a handshake faked by `handshake.Stub`.
+//! The machine driven directly: a client and a server in one process, calling
+//! `quic.Conn` with no socket shell around it and a handshake faked by
+//! `handshake.Stub`.
 //!
-//! This is not QUIC done well; it is the first code in the tree that calls the
-//! machine the way an application would. The handshake is a lie (two stub
-//! drivers agree on secrets and on nothing else), there is no congestion
-//! controller, and the loop is a fixed ping-pong rather than a reactor. What it
-//! does do is exercise the real contract: buffers the caller owns, a clock the
-//! caller reads, events the caller acts on, and packets the caller frames.
+//! This is the path to take to embed `Conn` in another I/O layer, to write a
+//! different driver, or to test a connection without crypto. The caller owns
+//! every buffer, reads the clock, acts on the events `feed` returns, and frames
+//! the packets itself. Nothing here is a reactor: the loop is a fixed
+//! ping-pong, and the clock is real except where a wait is skipped by telling
+//! the machine that time went by.
+//!
+//! What it shows: the stub's secrets and transport parameters becoming the
+//! spaces and limits of both peers, the server's HANDSHAKE_DONE confirming the
+//! client, and a lost packet that the machine sends again from the stream's own
+//! buffer once the caller's loss timer declares it.
+//!
+//! What it does not prove: the handshake is a lie (two stubs agree on secrets
+//! and on nothing else, so no certificate, no ALPN, no key schedule and no
+//! authentication are exercised), nothing crosses a network, and there is no
+//! congestion controller, pacing or idle timer. A passing run says the
+//! machine's contract holds, not that this is a working QUIC peer.
+//!
+//! For the real thing, a TLS 1.3 handshake over UDP through `quic-io`'s
+//! `Endpoint`, read `examples/hq_server.zig`.
 //!
 //! Run it with `just example`.
 
@@ -18,6 +33,7 @@ const assert = std.debug.assert;
 const quic = @import("quic");
 const Conn = quic.Conn;
 const Recovery = quic.Recovery;
+const RecoveryDriver = quic.RecoveryDriver;
 const frame = quic.frame;
 const handshake = quic.handshake;
 const protection = quic.protection;
@@ -27,9 +43,9 @@ const TransportParameters = quic.TransportParameters;
 /// One sent-packet table per space, and the report storage the machine fills.
 const tables_max = 16;
 
-/// One endpoint's caller-owned state. It is created in the arena and never
+/// One peer's caller-owned state. It is created in the arena and never
 /// moved, because `Conn` holds pointers into it.
-const Endpoint = struct {
+const Node = struct {
     recovery: Recovery = .{},
     /// The per-space loss state, outside the connection so a `RecoveryDriver`
     /// can hold it without holding a pointer into the connection.
@@ -66,7 +82,7 @@ const Endpoint = struct {
     /// Where the client copies the server's name out of its first packet.
     adopted_cid: [20]u8 = undefined,
 
-    fn loss(self: *Endpoint) Conn.Loss {
+    fn loss(self: *Node) Conn.Loss {
         return .{
             .shared = &self.recovery,
             .spaces = &self.spaces,
@@ -79,7 +95,7 @@ const Endpoint = struct {
 
     /// Storage whose address the connection will point at, set up before the
     /// configuration can name it.
-    fn prepare(self: *Endpoint) void {
+    fn prepare(self: *Node) void {
         self.events = .init(&self.acked, &self.lost);
         self.streams = .{
             .{ .send_buffer = &self.send_a, .recv_buffer = &self.ring_a, .recv_limit_bytes = 1024 },
@@ -87,13 +103,13 @@ const Endpoint = struct {
         };
     }
 
-    fn start(self: *Endpoint, config: Conn.Config) void {
+    fn start(self: *Node, config: Conn.Config) void {
         self.conn = .init(config);
     }
 
     /// One call per packet, which is the whole of what a caller must give the
     /// machine to read one.
-    fn feed(self: *Endpoint, bytes: []u8, at: u64) !Conn.Opened {
+    fn feed(self: *Node, bytes: []u8, at: u64) !Conn.Opened {
         return self.conn.feed(
             bytes,
             &self.plaintext,
@@ -106,6 +122,9 @@ const Endpoint = struct {
 };
 
 var clock_start: Io.Timestamp = undefined;
+/// Time the example skips instead of sleeping, added to every reading so the
+/// clock the machine sees never runs backwards.
+var clock_skipped: u64 = 0;
 
 /// What an endpoint tells the other in the handshake (RFC 9000 §18.2), as bytes
 /// a driver carries. The numbers are this example's own configuration: the
@@ -128,7 +147,7 @@ fn encodeParameters(
 
 fn now(io: Io) u64 {
     const elapsed = clock_start.durationTo(.now(io, .awake));
-    return @intCast(@max(elapsed.nanoseconds, 0));
+    return @as(u64, @intCast(@max(elapsed.nanoseconds, 0))) + clock_skipped;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -178,8 +197,8 @@ pub fn main(init: std.process.Init) !void {
         .peer_parameters = client_parameters,
     };
 
-    const client = try arena.create(Endpoint);
-    const server = try arena.create(Endpoint);
+    const client = try arena.create(Node);
+    const server = try arena.create(Node);
     client.prepare();
     server.prepare();
     // The client's identity is the name it makes up for the server, which is
@@ -235,9 +254,12 @@ pub fn main(init: std.process.Init) !void {
     server.start(server_config);
 
     // The server reads the flight and installs the spaces its driver reported
-    // secrets for; that is what makes its 1-RTT keys exist.
+    // secrets for; that is what makes its 1-RTT keys exist. The stub also says
+    // the handshake is complete, which is what a server's confirmation is
+    // (§4.1.2 of RFC 9001) and what owes the client a HANDSHAKE_DONE.
     const first_server_packet = try server.feed(wire[0..flight], now(io));
     assert(first_server_packet.space == .initial);
+    server_stub.confirmed = true;
     try server.conn.installSpaces();
     print("server: 1-RTT keys from the faked handshake: {}\n", .{server.conn.app != null});
 
@@ -259,9 +281,25 @@ pub fn main(init: std.process.Init) !void {
         client.conn.peer.?.max_data,
         client.conn.peer.?.max_streams.bidi,
     });
+    print("server: the client allows {d} bytes and {d} stream\n", .{
+        server.conn.peer.?.max_data,
+        server.conn.peer.?.max_streams.bidi,
+    });
+    // The adopted limit is enforced, not just printed: the second client
+    // stream, id 4, is past the one the server allows (§4.6).
+    assert(client.conn.openStream(4) == error.NoStreamCredit);
     print("client: sends to {d} bytes named by the server\n", .{
         client.conn.destination_connection_id.len,
     });
+
+    // §4.1.2 of RFC 9001: the client is not confirmed until the server says so,
+    // and the server's frame is a packet of its own.
+    assert(!client.conn.handshakeConfirmed());
+    const done = (try server.conn.writeConfirmation(&wire, now(io))) orelse
+        return error.NothingToSend;
+    _ = try client.feed(wire[0..done], now(io));
+    print("client: handshake confirmed by HANDSHAKE_DONE: {}\n", .{client.conn.handshakeConfirmed()});
+    assert(client.conn.handshakeConfirmed());
 
     // The client asks for a stream, writes, and offers it to the packetizer. The
     // offer is how much this packet may carry, not how much was written.
@@ -287,9 +325,49 @@ pub fn main(init: std.process.Init) !void {
         sent.consumed.taken,
     });
 
+    // The datagram is lost: it is never delivered. The machine cannot tell, and
+    // it is not told until a later packet is acknowledged and the caller's loss
+    // timer fires (RFC 9002 §6.1.2). A PING that does arrive is that packet.
+    const ping = [_]u8{0x01};
+    const ping_number = client.conn.app.?.next_packet_number;
+    const later = try client.conn.writeFrames(.app, &ping, &wire, .data(now(io)));
+    _ = try server.feed(wire[0..later], now(io));
+    const ack = try server.conn.writeAck(.app, &wire, now(io));
+
+    // Instead of sleeping through the loss delay, say that it passed.
+    clock_skipped += Recovery.ms(100);
+    _ = try client.feed(wire[0..ack], now(io));
+    var recovery_spaces = [_]*Recovery.Space{ &client.spaces[0], &client.spaces[1], &client.spaces[2] };
+    var timers: RecoveryDriver = .init(&client.recovery, &recovery_spaces);
+    const options = client.conn.recoveryOptions();
+    const due = timers.deadline(options);
+    assert(due.kind == .loss);
+    const fired = (try timers.poll(due.at, options, .client, &client.events)) orelse
+        return error.NoTimerFired;
+    assert(fired.kind == .loss);
+    assert(client.events.lostPackets()[0].packet_number == sent.number);
+    print("client: packet {d} declared lost after the ack of packet {d}\n", .{
+        sent.number,
+        ping_number,
+    });
+
+    // A timer's losses are the caller's to hand over. The machine then owes the
+    // stream's bytes again, and the same offer sends them in a new packet.
+    client.conn.onPacketsLost(.app, client.events.lostPackets());
+    const resent = (try client.conn.writeStreams(.{
+        .offers = &.{.{ .stream_id = 0, .length = 1024 }},
+        .frames = &frames,
+        .out = &wire,
+        .written = &client_written,
+        .max_payload = 1200,
+        .now = now(io),
+    })) orelse return error.NothingToSend;
+    assert(resent.number != sent.number);
+    print("client: resent the same bytes in packet {d}\n", .{resent.number});
+
     // The server reads the packet. The machine says which streams the packet
     // made readable, so the application does not scan its own table.
-    const at_server = try server.feed(wire[0..sent.length], now(io));
+    const at_server = try server.feed(wire[0..resent.length], now(io));
     var echoed: u32 = 0;
     for (at_server.streams) |changed| {
         const incoming = server.conn.stream(changed.stream_id) orelse continue;
@@ -326,9 +404,10 @@ pub fn main(init: std.process.Init) !void {
         print("client: read back \"{s}\"\n", .{read_back[0..count]});
     }
 
-    // Nothing here ever acknowledged a packet, so both ends still hold
-    // everything in flight. A real loop asks `ackOwed`/`writeAck` and runs
-    // `RecoveryDriver`; this one just shows the bill.
+    // Only the client's PING was ever acknowledged, so both ends still hold the
+    // rest in flight: the client the echo, the server its HANDSHAKE_DONE and the
+    // echo. A real loop asks `ackOwed`/`writeAck` and polls `RecoveryDriver` on
+    // every wake; this one just shows the bill.
     print("client: {d} in flight, server: {d} in flight\n", .{
         client.conn.app.?.recovery.inFlight().len,
         server.conn.app.?.recovery.inFlight().len,
