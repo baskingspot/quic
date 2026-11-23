@@ -1,5 +1,5 @@
-//! QUIC in Zig: sans-I/O packet and frame codecs, transport parameters, and
-//! the loss recovery a connection needs.
+//! QUIC in Zig: packet and frame codecs, a sans-I/O connection machine, and
+//! loss recovery, with a std.Io driver on top.
 //!
 //! A parser takes the bytes you read off the wire and returns borrowed slices
 //! or hands back offsets into your own storage. A writer fills a buffer you
