@@ -17,8 +17,8 @@
         // directions, a server's application secrets, and a public `KeyPairs`.
         // It goes back to a baskingspot.dev tarball with the next tls tag.
         .tls = .{
-            .url = "https://baskingspot.dev/tls/v0.4.2.tar.gz",
-            .hash = "tls-0.4.2-nf2MKCo_KgDB15SD_SVGfhzP6TDbvrdoFjFoFyPiH3g3",
+            .url = "https://baskingspot.dev/tls/v0.4.5.tar.gz",
+            .hash = "tls-0.4.5-nf2MKKCiQgAx99zm0DJ4B2euY021-XyCcKgKZQK6ws89",
         },
     },
     .paths = .{
