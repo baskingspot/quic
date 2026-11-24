@@ -5,7 +5,7 @@
 default:
     @just --list
 
-[doc("Unit tests, including the TLS driver, loopback, and seam suites over baskingspot/tls. The default native backend needs no OpenSSL; the libcrypto backends use the devshell's openssl and pkg-config")]
+[doc("Unit tests, including the TLS driver, loopback, and seam suites over baskingspot/tls. Unset follows tls's backend; -Dcrypto=native needs no OpenSSL, and the libcrypto backends use the devshell's openssl and pkg-config")]
 [group("test")]
 test:
     zig build test --summary all
