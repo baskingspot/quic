@@ -796,7 +796,12 @@ pub const Connection = struct {
     }
 
     fn stream(self: Connection, held: Core.Held) Stream {
-        return .{ .core = self.core, .index = held.index, .generation = held.generation };
+        return .{
+            .core = self.core,
+            .index = held.index,
+            .generation = held.generation,
+            .id = held.id,
+        };
     }
 };
 
@@ -807,6 +812,9 @@ pub const Stream = struct {
     core: *Core,
     index: u16,
     generation: u32,
+    /// §2.1: the wire stream id. A protocol above QUIC keys its streams by this
+    /// number, so it is part of the handle rather than hidden in the machine.
+    id: u64,
 
     pub const ReadError = ConnectionError || error{
         /// The peer reset the stream (§3.2).

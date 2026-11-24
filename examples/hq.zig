@@ -155,6 +155,9 @@ const Pair = PairOf(Endpoint, &test_client, &test_server);
 fn serveOne(io: Io) !void {
     const connection = try test_server.accept(io);
     const stream = try connection.acceptStream(io);
+    // §2.1: the first client-initiated bidirectional stream is 0, and the
+    // server's accepted handle names the same stream.
+    try testing.expectEqual(@as(u64, 0), stream.id);
     defer stream.close(io);
     var request: [64]u8 = undefined;
     try testing.expectEqualStrings("GET /index.html\r\n", try readAll(stream, io, &request));
