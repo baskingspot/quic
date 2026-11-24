@@ -7,6 +7,9 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `quic_io.Stream.id` exposes the QUIC stream id. A protocol above QUIC
+  (HTTP/3) keys its streams by that number. The machine already had it; the
+  I/O handle did not.
 - `quic-tls` and `quic-io` are registered before the consumer early return, so
   a package can import `quic-io` from the quic dependency. `-Dno-tls` still
   exports only `quic`.

@@ -304,13 +304,20 @@ pub fn held(self: *Core, index: u16, generation: u32) error{StreamClosed}!*Conn.
 }
 
 /// A slot a handle now names, and the generation that names it.
-pub const Held = struct { index: u16, generation: u32 };
+pub const Held = struct {
+    index: u16,
+    generation: u32,
+    /// §2.1: the wire stream id, the number the protocol above QUIC keys by.
+    id: u64,
+};
 
 fn hold(self: *Core, index: u16) Held {
     const slot = &self.storage.slots[index];
     assert(slot.handle == .none or slot.handle == .pending);
     slot.handle = .held;
-    return .{ .index = index, .generation = slot.generation };
+    const entry = &self.conn.streams[index];
+    const id = if (entry.canSend()) entry.send.id else entry.recv.id;
+    return .{ .index = index, .generation = slot.generation, .id = id };
 }
 
 /// The next stream the peer opened, lowest ID first, waiting for one. Taking
