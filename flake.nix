@@ -33,9 +33,9 @@
             ];
 
             # Project-specific tools. The quic-tls module builds
-            # baskingspot/tls. The default native crypto backend needs neither
-            # OpenSSL headers nor pkg-config; `-Dcrypto=openssl`, `aws-lc`, or
-            # `boringssl` selects a libcrypto family and needs them.
+            # baskingspot/tls. Unset follows tls's crypto backend default;
+            # `-Dcrypto=native` needs neither OpenSSL headers nor pkg-config,
+            # and `-Dcrypto=openssl`, `aws-lc`, or `boringssl` needs them.
             # `-Dno-tls` builds without tls at all.
             packages = with pkgs; [
               openssl
