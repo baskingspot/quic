@@ -24,14 +24,14 @@ pub fn build(b: *std.Build) void {
     // `-Dno-tls` is the escape hatch for a codec-only build, which fetches no
     // tls and needs no crypto library at all.
     //
-    // Unset follows tls's own default, so quic and a consumer that also
-    // depends on tls resolve one shared package. Setting a backend passes
-    // `crypto` to tls and deliberately forks the package; a consumer that
-    // also depends on tls must pass the same value or the build has two tls
-    // packages. On the native backend a server needs ECDSA P-256 or P-384
-    // credentials; native has no RSA signing. Ed25519 is a chain-signature
-    // scheme in tls, not a CertificateVerify scheme, so it cannot sign the
-    // server's handshake.
+    // Unset uses the pinned native-default tls commit, so quic and a consumer
+    // that also depends on tls resolve one shared package. Setting a backend
+    // passes `crypto` to tls and deliberately forks the package; a consumer
+    // that also depends on tls must pin the same commit and pass the same
+    // value or the build has two tls packages. On the native backend a server
+    // needs ECDSA P-256 or P-384 credentials; native has no RSA signing.
+    // Ed25519 is a chain-signature scheme in tls, not a CertificateVerify
+    // scheme, so it cannot sign the server's handshake.
     const no_tls = b.option(
         bool,
         "no-tls",
@@ -40,8 +40,8 @@ pub fn build(b: *std.Build) void {
     const crypto_backend = b.option(
         CryptoBackend,
         "crypto",
-        "TLS crypto backend: unset follows tls's default; auto, native, openssl, " ++
-            "aws-lc, or boringssl forks the tls package",
+        "TLS crypto backend: unset uses the pinned native default; auto, native, " ++
+            "openssl, aws-lc, or boringssl forks the tls package",
     );
     const tls_dep: ?*std.Build.Dependency = if (no_tls)
         null

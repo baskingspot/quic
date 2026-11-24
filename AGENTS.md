@@ -12,12 +12,12 @@ Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix deve
 
 TLS is built by default: `zig build test` runs the `quic-tls` driver, loopback,
 and handshake seam suites (`tests/tls_seam.zig`) over `baskingspot/tls`. The
-`-Dcrypto` is forwarded to tls only when set. Unset follows tls's own default,
-so quic and a consumer that also depends on tls resolve one shared tls package.
-Setting `auto`, `native`, `openssl`, `aws-lc`, or `boringssl` forks the tls
-package; a consumer that also depends on tls must pass the same value. On
-native, a clean build needs no OpenSSL headers, pkg-config, or libcrypto, and a
-server needs ECDSA P-256 or P-384 credentials. `-Dno-tls` is the codec-only build, with no tls,
+The tls pin is the merged native-default commit `83f5630`, so an unset build
+is native. `-Dcrypto` is forwarded to tls only when set; setting a backend
+forks the tls package, and a consumer that also depends on tls must pin the
+same commit and pass the same value. On native, a clean build needs no OpenSSL
+headers, pkg-config, or libcrypto, and a server needs ECDSA P-256 or P-384
+credentials. `-Dno-tls` is the codec-only build, with no tls,
 no `quic-tls`, no `quic-io`, and no C toolchain; `just test-no-tls` runs it, and
 CI runs it once. The module graph runs `tls`, then `quic` and `quic-tls`, then
 `quic-io`: `quic` never imports crypto, and `quic-io` builds the handshake from
