@@ -9,8 +9,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // The one exported module. Everything below is a developer step, so a
-    // consumer's fetch graph stops here.
+    // The exported modules. A consumer of `quic` gets the codecs; a consumer
+    // that builds TLS also gets the driver and the I/O shell. Everything else
+    // below is a developer step.
     const mod = b.addModule("quic", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -47,6 +48,35 @@ pub fn build(b: *std.Build) void {
             .crypto = crypto_backend,
         });
 
+    // The driver imports tls; `quic` never does. Both modules are registered
+    // before the consumer return so a package like http can reach `quic-io`.
+    // The test artifacts, fixtures, and examples that need tls's files stay
+    // below the return.
+    const modules: ?struct {
+        driver: *std.Build.Module,
+        io: *std.Build.Module,
+    } = if (tls_dep) |dependency| blk: {
+        const driver = b.addModule("quic-tls", .{
+            .root_source_file = b.path("src/tls.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "tls", .module = dependency.module("tls") },
+            },
+        });
+        const io = b.addModule("quic-io", .{
+            .root_source_file = b.path("src/io.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "quic", .module = mod },
+                .{ .name = "quic-tls", .module = driver },
+            },
+        });
+        break :blk .{ .driver = driver, .io = io };
+    } else null;
+
     if (b.pkg_hash.len != 0) return;
 
     const test_step = b.step("test", "Run the unit tests");
@@ -67,24 +97,12 @@ pub fn build(b: *std.Build) void {
     const run_vector_tests = b.addRunArtifact(vector_tests);
     test_step.dependOn(&run_vector_tests.step);
 
-    // The driver itself, and a second module because it imports tls: `quic`
-    // never imports crypto, so `quic-tls` is the one module that does. It
-    // exists unless `-Dno-tls` asks for the codecs alone.
-    //
     // The seam tests below check what the seam asks of a TLS driver against the
     // package that has to provide it. They exist to fail when baskingspot/tls
     // closes a gap: each one pins a place the two packages do not meet today,
     // so the day it meets them the work resumes instead of being forgotten.
     if (tls_dep) |dependency| {
-        const driver_mod = b.addModule("quic-tls", .{
-            .root_source_file = b.path("src/tls.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "quic", .module = mod },
-                .{ .name = "tls", .module = dependency.module("tls") },
-            },
-        });
+        const driver_mod = modules.?.driver;
         // The driver's tests need a certificate and key, which are tls's
         // fixtures and not copies this repository could let go stale.
         const driver_test_mod = b.createModule(.{
@@ -110,15 +128,7 @@ pub fn build(b: *std.Build) void {
         // inside it. Separate from `quic` so a caller that never opens a socket
         // never compiles std.Io, and the machine stays free of crypto: the
         // dependencies run tls, then quic and quic-tls, then quic-io.
-        const io_mod = b.addModule("quic-io", .{
-            .root_source_file = b.path("src/io.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "quic", .module = mod },
-                .{ .name = "quic-tls", .module = driver_mod },
-            },
-        });
+        const io_mod = modules.?.io;
         // Its tests listen with tls's fixture certificate, as the driver's do.
         const io_test_mod = b.createModule(.{
             .root_source_file = b.path("src/io.zig"),

@@ -7,6 +7,9 @@ All notable changes to quic are recorded here. The format follows
 
 ### Added
 
+- `quic-tls` and `quic-io` are registered before the consumer early return, so
+  a package can import `quic-io` from the quic dependency. `-Dno-tls` still
+  exports only `quic`.
 - `quic.Storage(limits)`, the machine layer's twin of `quic-io`'s `Sizing`:
   every buffer a `Conn` points into, sized at compile time from
   `quic.StorageLimits` (streams, stream_ring, sent_packets, crypto, datagram),
