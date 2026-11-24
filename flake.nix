@@ -33,10 +33,10 @@
             ];
 
             # Project-specific tools. The quic-tls module builds
-            # baskingspot/tls, which translates its libcrypto bindings at
-            # compile time and links libcrypto: the default build needs them,
-            # and without these the translate step cannot find a header.
-            # Only `-Dno-tls` builds without them.
+            # baskingspot/tls. The default native crypto backend needs neither
+            # OpenSSL headers nor pkg-config; `-Dcrypto=openssl`, `aws-lc`, or
+            # `boringssl` selects a libcrypto family and needs them.
+            # `-Dno-tls` builds without tls at all.
             packages = with pkgs; [
               openssl
               pkg-config

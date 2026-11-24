@@ -25,8 +25,9 @@ pub fn build(b: *std.Build) void {
     // `native` is the default: tls's pure-Zig backend needs no OpenSSL
     // headers, pkg-config, or libcrypto. A consumer that needs a libcrypto
     // family names it here and the same choice reaches tls. A server on the
-    // native backend needs ECDSA or Ed25519 credentials; native has no RSA
-    // signing.
+    // native backend needs ECDSA P-256 or P-384 credentials; native has no
+    // RSA signing. Ed25519 is a chain-signature scheme in tls, not a
+    // CertificateVerify scheme, so it cannot sign the server's handshake.
     const no_tls = b.option(
         bool,
         "no-tls",

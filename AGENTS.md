@@ -16,7 +16,7 @@ default crypto backend is `native`, tls's pure-Zig path, so a clean build needs
 no OpenSSL headers, pkg-config, or libcrypto. `-Dcrypto` passes `native`,
 `auto`, `openssl`, `aws-lc`, or `boringssl` to tls; a consumer that needs a
 libcrypto family names it there. Native has no RSA signing, so a server needs
-ECDSA or Ed25519 credentials. `-Dno-tls` is the codec-only build, with no tls,
+ECDSA P-256 or P-384 credentials. `-Dno-tls` is the codec-only build, with no tls,
 no `quic-tls`, no `quic-io`, and no C toolchain; `just test-no-tls` runs it, and
 CI runs it once. The module graph runs `tls`, then `quic` and `quic-tls`, then
 `quic-io`: `quic` never imports crypto, and `quic-io` builds the handshake from
