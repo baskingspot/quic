@@ -358,7 +358,10 @@ All notable changes to quic are recorded here. The format follows
   `boringssl` deliberately forks it; a consumer that also depends on tls must
   pass the same value. On native, `quic-io` builds with no libcrypto, OpenSSL
   headers, or pkg-config; a server needs ECDSA P-256 or P-384 credentials.
-  The tls pin moves to v0.4.6.
+  The tls pin is the merged native-default commit
+  `git+https://github.com/baskingspot/tls#83f5630114cf624f12d26d3877720c7e4e02dda9`,
+  a commit pin until the next tls release, so an unset build is native. A
+  consumer that also depends on tls must pin the same commit.
 - `quic-io`'s TLS handshake buffers come from the allocator `listen` and
   `connect` take, and `Sizing(.{})` drops from 61,256 to 44,192 bytes. The
   flights (`quic-tls`'s `Flight`: what the driver composes, the peer's Initial
