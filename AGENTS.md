@@ -11,11 +11,14 @@ QUIC in Zig: sans-I/O packet and frame codecs, transport parameters, and the los
 Zig 0.17 only. The flake is the tool contract, from `baskingspot/nix`: `nix develop` provides Zig, `ziglint`, and the base tools, and nothing comes from the system PATH. The justfile is the command interface: `just test`, `just lint`, `just fuzz`, `just ci`. Run `just fmt` before you commit.
 
 TLS is built by default: `zig build test` runs the `quic-tls` driver, loopback,
-and handshake seam suites (`tests/tls_seam.zig`) over `baskingspot/tls`, and a
-clean build needs the dev shell's openssl and pkg-config because tls translates
-and links libcrypto. `-Dno-tls` is the codec-only build, with no tls, no
-`quic-tls`, no `quic-io`, and no C toolchain; `just test-no-tls` runs it, and CI
-runs it once. The module graph runs `tls`, then `quic` and `quic-tls`, then
+and handshake seam suites (`tests/tls_seam.zig`) over `baskingspot/tls`. The
+default crypto backend is `native`, tls's pure-Zig path, so a clean build needs
+no OpenSSL headers, pkg-config, or libcrypto. `-Dcrypto` passes `native`,
+`auto`, `openssl`, `aws-lc`, or `boringssl` to tls; a consumer that needs a
+libcrypto family names it there. Native has no RSA signing, so a server needs
+ECDSA or Ed25519 credentials. `-Dno-tls` is the codec-only build, with no tls,
+no `quic-tls`, no `quic-io`, and no C toolchain; `just test-no-tls` runs it, and
+CI runs it once. The module graph runs `tls`, then `quic` and `quic-tls`, then
 `quic-io`: `quic` never imports crypto, and `quic-io` builds the handshake from
 a certificate and key.
 

@@ -1,5 +1,10 @@
 const std = @import("std");
 
+/// The crypto backend `baskingspot/tls` builds with. The names match its own
+/// `-Dcrypto` option, so a consumer of this package can pass the same value
+/// through `b.dependency("quic", .{ .crypto = ... })`.
+const CryptoBackend = enum { auto, native, openssl, @"aws-lc", boringssl };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -15,18 +20,31 @@ pub fn build(b: *std.Build) void {
     // The TLS driver over baskingspot/tls is built by default: QUIC requires
     // TLS 1.3, so a package that cannot connect is not much of a package.
     // `-Dno-tls` is the escape hatch for a codec-only build, which fetches no
-    // tls and needs neither OpenSSL headers nor pkg-config, because tls
-    // translates and links libcrypto from source.
+    // tls and needs no crypto library at all.
+    //
+    // `native` is the default: tls's pure-Zig backend needs no OpenSSL
+    // headers, pkg-config, or libcrypto. A consumer that needs a libcrypto
+    // family names it here and the same choice reaches tls. A server on the
+    // native backend needs ECDSA or Ed25519 credentials; native has no RSA
+    // signing.
     const no_tls = b.option(
         bool,
         "no-tls",
-        "Build the codecs only, with no quic-tls driver and no baskingspot/tls build, " ++
-            "so OpenSSL headers and pkg-config are not needed",
+        "Build the codecs only, with no quic-tls driver and no baskingspot/tls build",
     ) orelse false;
+    const crypto_backend = b.option(
+        CryptoBackend,
+        "crypto",
+        "TLS crypto backend: native (default), auto, openssl, aws-lc, or boringssl",
+    ) orelse .native;
     const tls_dep: ?*std.Build.Dependency = if (no_tls)
         null
     else
-        b.dependency("tls", .{ .target = target, .optimize = optimize });
+        b.dependency("tls", .{
+            .target = target,
+            .optimize = optimize,
+            .crypto = crypto_backend,
+        });
 
     if (b.pkg_hash.len != 0) return;
 
