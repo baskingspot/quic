@@ -349,6 +349,11 @@ All notable changes to quic are recorded here. The format follows
 
 ### Changed
 
+- The default TLS crypto backend is `native`, tls's pure-Zig path: `quic-io`
+  builds with no libcrypto, OpenSSL headers, or pkg-config. `-Dcrypto` passes
+  `native`, `auto`, `openssl`, `aws-lc`, or `boringssl` to `baskingspot/tls`,
+  so a consumer that needs libcrypto names it. Native has no RSA signing; a
+  server needs ECDSA P-256 or P-384 credentials. The tls pin moves to v0.4.6.
 - `quic-io`'s TLS handshake buffers come from the allocator `listen` and
   `connect` take, and `Sizing(.{})` drops from 61,256 to 44,192 bytes. The
   flights (`quic-tls`'s `Flight`: what the driver composes, the peer's Initial
