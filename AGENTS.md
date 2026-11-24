@@ -20,7 +20,8 @@ ECDSA P-256 or P-384 credentials. `-Dno-tls` is the codec-only build, with no tl
 no `quic-tls`, no `quic-io`, and no C toolchain; `just test-no-tls` runs it, and
 CI runs it once. The module graph runs `tls`, then `quic` and `quic-tls`, then
 `quic-io`: `quic` never imports crypto, and `quic-io` builds the handshake from
-a certificate and key.
+a certificate and key. A consumer imports `quic`, or `quic-io` when it wants
+the socket shell; the driver and TLS come with it.
 
 ## Design
 
